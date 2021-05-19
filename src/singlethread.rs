@@ -13,6 +13,7 @@ mod graph2;
 mod test;
 
 use graph2::{Graph2, Graph2Guard, NodeGuard, NodeKey, RecalcState};
+use tracing::trace;
 
 pub use graph2::AnchorHandle;
 pub use graph2::NodeKey as AnchorToken;
@@ -483,10 +484,12 @@ impl<I: AnchorInner<Engine> + 'static> GenericAnchor for I {
         AnchorInner::output(self, ctx)
     }
     fn debug_info(&self) -> AnchorDebugInfo {
-        AnchorDebugInfo {
+        let ad = AnchorDebugInfo {
             location: self.debug_location(),
             type_info: std::any::type_name::<I>(),
-        }
+        };
+        trace!("debug_info: {:?}", &ad._to_string());
+        ad
     }
 }
 

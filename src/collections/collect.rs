@@ -1,18 +1,24 @@
+use crate::expert::{
+    Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
+};
 use std::panic::Location;
-use crate::expert::{Engine, AnchorInner, UpdateContext, AnchorHandle, OutputContext, Anchor, Poll};
 
-impl <I: 'static + Clone, E: Engine> std::iter::FromIterator<Anchor<I, E>> for Anchor<Vec<I>, E> {
+impl<I: 'static + Clone, E: Engine> std::iter::FromIterator<Anchor<I, E>> for Anchor<Vec<I>, E> {
     fn from_iter<T>(iter: T) -> Self
-        where
-            T: IntoIterator<Item = Anchor<I, E>> {
+    where
+        T: IntoIterator<Item = Anchor<I, E>>,
+    {
         VecCollect::new(iter.into_iter().collect())
     }
 }
 
-impl <'a, I: 'static + Clone, E: Engine> std::iter::FromIterator<&'a Anchor<I, E>> for Anchor<Vec<I>, E> {
+impl<'a, I: 'static + Clone, E: Engine> std::iter::FromIterator<&'a Anchor<I, E>>
+    for Anchor<Vec<I>, E>
+{
     fn from_iter<T>(iter: T) -> Self
-        where
-            T: IntoIterator<Item = &'a Anchor<I, E>> {
+    where
+        T: IntoIterator<Item = &'a Anchor<I, E>>,
+    {
         VecCollect::new(iter.into_iter().cloned().collect())
     }
 }
@@ -34,18 +40,13 @@ impl<T: 'static + Clone, E: Engine> VecCollect<T, E> {
     }
 }
 
-impl<T: 'static + Clone, E: Engine> AnchorInner<E>
-    for VecCollect<T, E>
-{
+impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VecCollect<T, E> {
     type Output = Vec<T>;
     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
         self.vals = None;
     }
 
-    fn poll_updated<G: UpdateContext<Engine = E>>(
-        &mut self,
-        ctx: &mut G,
-    ) -> Poll {
+    fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         if self.vals.is_none() {
             let pending_exists = self
                 .anchors
@@ -79,7 +80,6 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E>
     }
 }
 
-
 #[cfg(test)]
 mod test {
     use crate::singlethread::*;
@@ -91,6 +91,7 @@ mod test {
         let c = Var::new(5);
         let nums: Anchor<Vec<_>> = vec![a.watch(), b.watch(), c.watch()].into_iter().collect();
         let sum: Anchor<usize> = nums.map(|nums| nums.iter().sum());
+        let ns: Anchor<usize> = nums.map(|nums: &Vec<_>| nums.len());
 
         assert_eq!(engine.get(&sum), 8);
 
@@ -99,5 +100,6 @@ mod test {
 
         c.set(1);
         assert_eq!(engine.get(&sum), 5);
+        println!("ns {}", engine.get(&ns));
     }
 }

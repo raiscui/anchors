@@ -1,6 +1,6 @@
 use anchors::expert::{MultiAnchor, Var};
 use anchors::singlethread::*;
-use std::cell::RefCell;
+use std::{cell::RefCell, ops::Deref, rc::Rc};
 
 fn main() {
     let mut engine = Engine::new();
@@ -27,4 +27,14 @@ fn main() {
     fish_count.set(2);
     println!("stabilizing...");
     engine.stabilize();
+
+    let a = Rc::new(String::from("ff"));
+    let b = a.deref();
+    let c = a.as_ref();
+    let d = String::from("fff");
+    let dd = d.deref();
+    let ddd = &d;
+    let dddd = ddd.deref();
+    println!("{} {} {}", a, b, c);
+    println!("{} {} {} {} ", d, dd, ddd, dddd);
 }

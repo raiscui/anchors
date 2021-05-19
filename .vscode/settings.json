@@ -1,0 +1,15 @@
+{
+    "workbench.colorCustomizations": {
+        "activityBar.activeBackground": "#4df8cd",
+        "activityBar.activeBorder": "#d466f9",
+        "activityBar.background": "#4df8cd",
+        "activityBar.foreground": "#15202b",
+        "activityBar.inactiveForeground": "#15202b99",
+        "activityBarBadge.background": "#d466f9",
+        "activityBarBadge.foreground": "#15202b"
+    },
+    "peacock.color": "#1cf6bf",
+    "cSpell.words": [
+        "vals"
+    ]
+}
