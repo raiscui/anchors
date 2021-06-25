@@ -172,6 +172,34 @@ impl Engine {
                 .clone()
         })
     }
+    pub fn get_with<O: Clone + 'static, F: FnOnce(&O) -> R, R>(
+        &mut self,
+        anchor: &Anchor<O>,
+        func: F,
+    ) -> R {
+        // stabilize once before, since the stabilization process may mark our requested node
+        // as dirty
+        self.stabilize();
+        self.graph.with(|graph| {
+            let anchor_node = graph.get(anchor.token()).unwrap();
+            if graph2::recalc_state(anchor_node) != RecalcState::Ready {
+                graph.queue_recalc(anchor_node);
+                // stabilize again, to make sure our target node that is now in the queue is up-to-date
+                // use stabilize0 because no dirty marks have occured since last stabilization, and we want
+                // to make sure we don't unnecessarily increment generation number
+                self.stabilize0();
+            }
+            let target_anchor = &graph.get(anchor.token()).unwrap().anchor;
+            let borrow = target_anchor.borrow();
+            let o = borrow
+                .as_ref()
+                .unwrap()
+                .output(&mut EngineContext { engine: &self })
+                .downcast_ref::<O>()
+                .unwrap();
+            func(o)
+        })
+    }
 
     pub(crate) fn update_dirty_marks(&mut self) {
         self.graph.with(|graph| {
