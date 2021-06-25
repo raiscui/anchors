@@ -120,7 +120,8 @@ impl Clone for AnchorHandle {
             count.set(count.get() + 1);
         }
         AnchorHandle {
-            num: self.num.clone(),
+            num: self.num,
+            // num: self.num.clone(),
             still_alive: self.still_alive.clone(),
         }
     }
@@ -132,7 +133,7 @@ impl Drop for AnchorHandle {
             let count = &unsafe { self.num.ptr.lookup_unchecked() }.ptrs.handle_count;
             let new_count = count.get() - 1;
             count.set(new_count);
-            std::mem::drop(count);
+            drop(count);
             if new_count == 0 {
                 unsafe { free(self.num.ptr) };
             }

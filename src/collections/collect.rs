@@ -72,7 +72,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VecCollect<T, E> {
     where
         'slf: 'out,
     {
-        &self.vals.as_ref().unwrap()
+        self.vals.as_ref().unwrap()
     }
 
     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {

@@ -84,4 +84,30 @@ fn main() {
     // assert_eq!(engine.get(&dynamic_name), "Lazybum");
     // my_unread_updater.set(50);
     // assert_eq!(engine.get(&dynamic_name), "Robo");
+
+    let ss = Var::new(1);
+    let ssx = Var::new(1);
+    let sw = ss.watch();
+    let ffcut = (&ss.watch(), &ssx.watch()).cutoff(|s, x| {
+        true;
+    });
+    let ss2 = sw.map(|x| {
+        println!("re calc2");
+        x.clone()
+    });
+    let ss3 = ss2.map(|x| {
+        println!("re calc3");
+        x.clone()
+    });
+
+    println!("{:?}", engine.get(&ss3));
+    ss.set(2);
+
+    println!("{:?}", engine.get(&ss3));
+    ss.set(2);
+
+    println!("{:?}", engine.get(&ss3));
+    ss.set(2);
+
+    println!("{:?}", engine.get(&ss3));
 }

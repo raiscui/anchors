@@ -71,7 +71,7 @@ impl<T: 'static, E: Engine> Var<T, E> {
 impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
     type Output = T;
     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
+        // panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {

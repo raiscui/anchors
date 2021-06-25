@@ -74,7 +74,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
     where
         'slf: 'out,
     {
-        &self.vals.as_ref().unwrap()
+        self.vals.as_ref().unwrap()
     }
 
     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
@@ -94,9 +94,24 @@ mod test {
         let a = Var::new(1);
         let b = Var::new(2);
         let c = Var::new(5);
-        let nums: Anchor<Vector<_>> = vector![a.watch(), b.watch(), c.watch()]
-            .into_iter()
-            .collect();
+        let bcut = {
+            let mut old_num_opt: Option<usize> = None;
+            b.watch().cutoff(move |num| {
+                if let Some(old_num) = old_num_opt {
+                    if old_num == *num {
+                        return false;
+                    }
+                }
+                old_num_opt = Some(*num);
+                true
+            })
+        };
+
+        let bw = bcut.map(|v| {
+            println!("b change");
+            *v
+        });
+        let nums: Anchor<Vector<_>> = vector![a.watch(), bw, c.watch()].into_iter().collect();
         let sum: Anchor<usize> = nums.map(|nums| nums.iter().sum());
         let ns: Anchor<usize> = nums.map(|nums: &Vector<_>| nums.len());
 
@@ -108,5 +123,9 @@ mod test {
         c.set(1);
         assert_eq!(engine.get(&sum), 5);
         println!("ns {}", engine.get(&ns));
+        b.set(9);
+        println!("after b set: {}", engine.get(&sum));
+        b.set(9);
+        println!("after b set2: {}", engine.get(&sum));
     }
 }
