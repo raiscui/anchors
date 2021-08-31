@@ -13,7 +13,7 @@ bench = false
 
 [dependencies]
 typed-arena = { version = "2.0.1" }
-im = { version = "15.0.0" }
+im-rc = { version = "15.0.0" }
 
 arena-graph = { version = "0.1.0" }
 

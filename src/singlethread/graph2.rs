@@ -133,7 +133,7 @@ impl Drop for AnchorHandle {
             let count = &unsafe { self.num.ptr.lookup_unchecked() }.ptrs.handle_count;
             let new_count = count.get() - 1;
             count.set(new_count);
-            drop(count);
+            // drop(count);
             if new_count == 0 {
                 unsafe { free(self.num.ptr) };
             }
@@ -383,8 +383,8 @@ impl Graph2 {
         )
     }
 
-    pub(super) fn insert<'a>(
-        &'a self,
+    pub(super) fn insert(
+        &'_ self,
         anchor: Box<dyn GenericAnchor>,
         debug_info: AnchorDebugInfo,
     ) -> AnchorHandle {
@@ -467,7 +467,7 @@ pub fn ensure_height_increases<'a>(
     res.map(|()| false)
 }
 
-fn set_min_height<'a>(node: NodeGuard<'a>, min_height: usize) -> Result<(), ()> {
+fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     if node.visited.get() {
         return Err(());
     }
@@ -488,7 +488,7 @@ fn set_min_height<'a>(node: NodeGuard<'a>, min_height: usize) -> Result<(), ()> 
     Ok(())
 }
 
-fn dequeue_calc<'a>(graph: &Graph2, node: NodeGuard<'a>) {
+fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
     if node.ptrs.recalc_state.get() != RecalcState::Pending {
         return;
     }
@@ -540,11 +540,11 @@ unsafe fn free(ptr: NodePtr) {
     *guard.anchor.borrow_mut() = None;
 }
 
-pub fn height<'a>(node: NodeGuard<'a>) -> usize {
+pub fn height(node: NodeGuard<'_>) -> usize {
     node.ptrs.height.get()
 }
 
-pub fn needs_recalc<'a>(node: NodeGuard<'a>) {
+pub fn needs_recalc(node: NodeGuard<'_>) {
     if node.ptrs.recalc_state.get() != RecalcState::Ready {
         // already in recalc queue, or already pending recalc
         return;
@@ -552,7 +552,7 @@ pub fn needs_recalc<'a>(node: NodeGuard<'a>) {
     node.ptrs.recalc_state.set(RecalcState::Needed);
 }
 
-pub fn recalc_state<'a>(node: NodeGuard<'a>) -> RecalcState {
+pub fn recalc_state(node: NodeGuard<'_>) -> RecalcState {
     node.ptrs.recalc_state.get()
 }
 

@@ -38,7 +38,7 @@ impl<T: 'static> Constant<T> {
 
 impl<T: 'static, E: Engine> AnchorInner<E> for Constant<T> {
     type Output = T;
-    fn dirty(&mut self, child: &<E::AnchorHandle as AnchorHandle>::Token) {
+    fn dirty(&mut self, _child: &<E::AnchorHandle as AnchorHandle>::Token) {
         // panic!(
         //     "Constant never has any inputs; dirty should not have been called. alleged child: {:?}",
         //     child

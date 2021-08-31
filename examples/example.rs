@@ -44,70 +44,44 @@ fn main() {
     println!("xn {}", engine.get(&xn));
     println!("xn {}", engine.get(&xn));
     // // `my_name` is a `Var`, our first type of `Anchor`. we can pull an `Anchor`'s value out with our `engine`:
-    // assert_eq!(&engine.get(&my_name), "Bob");
-    // assert_eq!(engine.get(&my_unread), 999);
+    assert_eq!(&engine.get(&my_name), "Bob");
+    assert_eq!(engine.get(&my_unread), 999);
 
-    // // we can create a new `Anchor` from another one using `map`. The function won't actually run until absolutely necessary.
-    // // also feel free to clone an `Anchor` — the clones will all refer to the same inner state
-    // let my_greeting = my_name.clone().map(|name| {
-    //     println!("calculating name!");
-    //     format!("Hello, {}!", name)
-    // });
-    // assert_eq!(engine.get(&my_greeting), "Hello, Bob!"); // prints "calculating name!"
-
-    // // we can update a `Var` with its updater. values are cached unless one of its dependencies changes
-    // assert_eq!(engine.get(&my_greeting), "Hello, Bob!"); // doesn't print anything
-    // my_name_updater.set("Robo".to_string());
-    // assert_eq!(engine.get(&my_greeting), "Hello, Robo!"); // prints "calculating name!"
-
-    // // a `map` can take values from multiple `Anchor`s. just use tuples:
-    // let header = (&my_greeting, &my_unread)
-    //     .map(|greeting, unread| format!("{} You have {} new messages.", greeting, unread));
-    // assert_eq!(
-    //     engine.get(&header),
-    //     "Hello, Robo! You have 999 new messages."
-    // );
-
-    // // just like a future, you can dynamically decide which `Anchor` to use with `then`:
-    // let (insulting_name, _) = {
-    //     let var = Var::new("Lazybum".to_string());
-    //     (var.watch(), var)
-    // };
-    // let dynamic_name = my_unread.then(move |unread| {
-    //     // only use the user's real name if the have less than 100 messages in their inbox
-    //     if *unread < 100 {
-    //         my_name.clone()
-    //     } else {
-    //         insulting_name.clone()
-    //     }
-    // });
-    // assert_eq!(engine.get(&dynamic_name), "Lazybum");
-    // my_unread_updater.set(50);
-    // assert_eq!(engine.get(&dynamic_name), "Robo");
-
-    let ss = Var::new(1);
-    let ssx = Var::new(1);
-    let sw = ss.watch();
-    let ffcut = (&ss.watch(), &ssx.watch()).cutoff(|s, x| {
-        true;
+    // we can create a new `Anchor` from another one using `map`. The function won't actually run until absolutely necessary.
+    // also feel free to clone an `Anchor` — the clones will all refer to the same inner state
+    let my_greeting = my_name.clone().map(|name| {
+        println!("calculating name!");
+        format!("Hello, {}!", name)
     });
-    let ss2 = sw.map(|x| {
-        println!("re calc2");
-        x.clone()
+    assert_eq!(engine.get(&my_greeting), "Hello, Bob!"); // prints "calculating name!"
+
+    // we can update a `Var` with its updater. values are cached unless one of its dependencies changes
+    assert_eq!(engine.get(&my_greeting), "Hello, Bob!"); // doesn't print anything
+    my_name_updater.set("Robo".to_string());
+    assert_eq!(engine.get(&my_greeting), "Hello, Robo!"); // prints "calculating name!"
+
+    // a `map` can take values from multiple `Anchor`s. just use tuples:
+    let header = (&my_greeting, &my_unread)
+        .map(|greeting, unread| format!("{} You have {} new messages.", greeting, unread));
+    assert_eq!(
+        engine.get(&header),
+        "Hello, Robo! You have 999 new messages."
+    );
+
+    // just like a future, you can dynamically decide which `Anchor` to use with `then`:
+    let (insulting_name, _) = {
+        let var = Var::new("Lazybum".to_string());
+        (var.watch(), var)
+    };
+    let dynamic_name = my_unread.then(move |unread| {
+        // only use the user's real name if the have less than 100 messages in their inbox
+        if *unread < 100 {
+            my_name.clone()
+        } else {
+            insulting_name.clone()
+        }
     });
-    let ss3 = ss2.map(|x| {
-        println!("re calc3");
-        x.clone()
-    });
-
-    println!("{:?}", engine.get(&ss3));
-    ss.set(2);
-
-    println!("{:?}", engine.get(&ss3));
-    ss.set(2);
-
-    println!("{:?}", engine.get(&ss3));
-    ss.set(2);
-
-    println!("{:?}", engine.get(&ss3));
+    assert_eq!(engine.get(&dynamic_name), "Lazybum");
+    my_unread_updater.set(50);
+    assert_eq!(engine.get(&dynamic_name), "Robo");
 }

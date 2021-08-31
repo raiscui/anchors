@@ -135,7 +135,7 @@ impl Engine {
         })
     }
 
-    fn update_necessary_children<'a>(node: NodeGuard<'a>) {
+    fn update_necessary_children(node: NodeGuard<'_>) {
         if Self::check_observed_raw(node) != ObservedState::Unnecessary {
             // we have another parent still observed, so skip this
             return;
@@ -148,7 +148,7 @@ impl Engine {
 
     /// Retrieves the value of an Anchor, recalculating dependencies as necessary to get the
     /// latest value.
-    pub fn get<'out, O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
+    pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
         // stabilize once before, since the stabilization process may mark our requested node
         // as dirty
         self.stabilize();
@@ -166,7 +166,7 @@ impl Engine {
             borrow
                 .as_ref()
                 .unwrap()
-                .output(&mut EngineContext { engine: &self })
+                .output(&mut EngineContext { engine: self })
                 .downcast_ref::<O>()
                 .unwrap()
                 .clone()
@@ -194,7 +194,7 @@ impl Engine {
             let o = borrow
                 .as_ref()
                 .unwrap()
-                .output(&mut EngineContext { engine: &self })
+                .output(&mut EngineContext { engine: self })
                 .downcast_ref::<O>()
                 .unwrap();
             func(o)
@@ -203,7 +203,7 @@ impl Engine {
 
     pub(crate) fn update_dirty_marks(&mut self) {
         self.graph.with(|graph| {
-            let dirty_marks = std::mem::replace(&mut *self.dirty_marks.borrow_mut(), Vec::new());
+            let dirty_marks = std::mem::take(&mut *self.dirty_marks.borrow_mut());
             for dirty in dirty_marks {
                 let node = graph.get(dirty).unwrap();
                 mark_dirty(graph, node, false);
@@ -243,7 +243,7 @@ impl Engine {
     fn recalculate<'a>(&self, graph: Graph2Guard<'a>, node: NodeGuard<'a>) -> bool {
         let this_anchor = &node.anchor;
         let mut ecx = EngineContextMut {
-            engine: &self,
+            engine: self,
             node,
             graph,
             pending_on_anchor_get: false,
@@ -320,7 +320,7 @@ impl Engine {
     }
 
     /// Returns whether an Anchor is Observed, Necessary, or Unnecessary.
-    pub fn check_observed_raw<'a>(node: NodeGuard<'a>) -> ObservedState {
+    pub fn check_observed_raw(node: NodeGuard<'_>) -> ObservedState {
         if node.observed.get() {
             return ObservedState::Observed;
         }
@@ -531,7 +531,7 @@ impl AnchorDebugInfo {
     fn _to_string(&self) -> String {
         match self.location {
             Some((name, location)) => format!("{} ({})", location, name),
-            None => format!("{}", self.type_info),
+            None => self.type_info.to_string(),
         }
     }
 }

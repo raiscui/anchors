@@ -1,4 +1,4 @@
-use im::Vector;
+use im_rc::Vector;
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
@@ -85,8 +85,8 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
 #[cfg(test)]
 mod test {
     use crate::singlethread::*;
-    use im::vector;
-    use im::Vector;
+    use im_rc::vector;
+    use im_rc::Vector;
 
     #[test]
     fn collect() {

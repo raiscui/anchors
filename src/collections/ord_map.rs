@@ -1,6 +1,6 @@
-use crate::expert::{Anchor, Engine, MultiAnchor};
-use im::ordmap::DiffItem;
-use im::OrdMap;
+use crate::expert::{Anchor, Engine};
+use im_rc::ordmap::DiffItem;
+use im_rc::OrdMap;
 
 pub type Dict<K, V> = OrdMap<K, V>;
 
