@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use anchors::singlethread::*;
 
 fn main() {
@@ -84,4 +86,16 @@ fn main() {
     assert_eq!(engine.get(&dynamic_name), "Lazybum");
     my_unread_updater.set(50);
     assert_eq!(engine.get(&dynamic_name), "Robo");
+    // ────────────────────────────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────────────────
+    let sss = Rc::new("Lazybum".to_string());
+    let strvar = Var::new(sss.clone());
+    let sw = strvar.watch().map(|s| {
+        println!("!!!!!!!!!!str change {}", s);
+        s.clone()
+    });
+    println!("==== sw:{:?}", engine.get(&sw));
+    strvar.set(sss.clone());
+    println!("==== sw:{:?}", engine.get(&sw));
+    println!("==== sw:{:?}", engine.get(&sw));
 }
