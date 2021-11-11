@@ -27,6 +27,6 @@ macro_rules! dict {
 mod test {
     #[test]
     fn test() {
-        let cc = dict! {1=>1};
+        let _cc = dict! {1=>1};
     }
 }

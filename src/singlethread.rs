@@ -283,7 +283,6 @@ impl Engine {
 
     /// Returns a debug string containing the current state of the recomputation graph.
     pub fn debug_state(&self) -> String {
-        let debug = "".to_string();
         // for (node_id, _) in nodes.iter() {
         //     let node = self.graph.get(node_id).unwrap();
         //     let necessary = if self.graph.is_necessary(node_id) {
@@ -309,7 +308,8 @@ impl Engine {
         //         state
         //     );
         // }
-        debug
+        // debug
+        "".to_string()
     }
 
     pub fn check_observed<T>(&self, anchor: &Anchor<T>) -> ObservedState {

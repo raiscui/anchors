@@ -6,7 +6,11 @@
         "activityBar.foreground": "#15202b",
         "activityBar.inactiveForeground": "#15202b99",
         "activityBarBadge.background": "#d466f9",
-        "activityBarBadge.foreground": "#15202b"
+        "activityBarBadge.foreground": "#15202b",
+        "editorGroup.border": "#4df8cd",
+        "panel.border": "#4df8cd",
+        "sash.hoverBorder": "#4df8cd",
+        "sideBar.border": "#4df8cd"
     },
     "peacock.color": "#1cf6bf",
     "cSpell.words": [

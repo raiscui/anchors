@@ -20,7 +20,7 @@ impl<E: Engine, K: Ord + Clone + PartialEq + 'static, V: Clone + PartialEq + 'st
         &self,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        self.inner_filter_map(move |k, v| Some(f(k, v)))
+        self.filter_map(move |k, v| Some(f(k, v)))
     }
 
     /// FOOBAR
@@ -29,7 +29,7 @@ impl<E: Engine, K: Ord + Clone + PartialEq + 'static, V: Clone + PartialEq + 'st
         &self,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        self.inner_unordered_fold(Dict::new(), move |out, diff_item| {
+        self.unordered_fold(Dict::new(), move |out, diff_item| {
             match diff_item {
                 DiffItem::Add(k, v) => {
                     if let Some(new) = f(k, v) {
@@ -67,10 +67,10 @@ impl<E: Engine, K: Ord + Clone + PartialEq + 'static, V: Clone + PartialEq + 'st
         mut f: F,
     ) -> Anchor<T, E> {
         let mut last_observation = Dict::new();
-        self.map_mut(initial_state, move |mut out, this| {
+        self.map_mut(initial_state, move |out, this| {
             let mut did_update = false;
             for item in last_observation.diff(this) {
-                if f(&mut out, item) {
+                if f(out, item) {
                     did_update = true;
                 }
             }
@@ -88,7 +88,7 @@ mod test {
         let mut engine = crate::singlethread::Engine::new();
         let mut dict = Dict::new();
         let a = crate::expert::Var::new(dict.clone());
-        let b = a.watch().inner_filter(|_, n| *n > 10);
+        let b = a.watch().filter(|_, n| *n > 10);
         let b_out = engine.get(&b);
         assert_eq!(0, b_out.len());
 
@@ -118,7 +118,7 @@ mod test {
         let mut engine = crate::singlethread::Engine::new();
         let mut dict = Dict::new();
         let a = crate::expert::Var::new(dict.clone());
-        let b = a.watch().inner_map(|_, n| *n + 1);
+        let b = a.watch().map_(|_, n| *n + 1);
         let b_out = engine.get(&b);
         assert_eq!(0, b_out.len());
 

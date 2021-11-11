@@ -2,7 +2,7 @@
 name = "anchors"
 version = "0.6.0"
 authors = ["Robert Lord <robert@lord.io>"]
-edition = "2018"
+edition = "2021"
 description = "async incremental computations"
 license = "MIT"
 documentation = "https://docs.rs/anchors"
