@@ -1,4 +1,4 @@
-use smallvec::{Array, SmallVec};
+use emg_core::SVec::{Array, SmallVec};
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
@@ -62,8 +62,7 @@ impl<T: 'static + Clone, E: Engine, const S: usize> AnchorInner<E> for SmallVecC
             self.vals = Some(
                 self.anchors
                     .iter()
-                    .map(|anchor| ctx.get(anchor)
-                    .clone())
+                    .map(|anchor| ctx.get(anchor).clone())
                     .collect(),
             )
         }
@@ -88,7 +87,7 @@ impl<T: 'static + Clone, E: Engine, const S: usize> AnchorInner<E> for SmallVecC
 #[cfg(test)]
 mod test {
     use crate::singlethread::*;
-    use smallvec::SmallVec;
+    use emg_core::{smallvec, SmallVec};
 
     #[test]
     fn collect() {
@@ -113,7 +112,7 @@ mod test {
             println!("b change");
             *v
         });
-        let f: SmallVec<[Anchor<usize>; 3]> = smallvec::smallvec![a.watch(), bw, c.watch()];
+        let f: SmallVec<[Anchor<usize>; 3]> = smallvec![a.watch(), bw, c.watch()];
         let nums: Anchor<SmallVec<[usize; 3]>> = f.into_iter().collect();
         let sum: Anchor<usize> = nums.map(|nums| nums.iter().sum());
         let ns: Anchor<usize> = nums.map(|nums: &SmallVec<_>| nums.len());

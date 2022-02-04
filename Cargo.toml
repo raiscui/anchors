@@ -18,7 +18,8 @@ im-rc = { version = "15.0.0" }
 arena-graph = { version = "0.1.0" }
 
 tracing = { version = "^0.1" }
-
+emg_core = { path = "../iced_emg/emg_core" }
+# smallvec = { version = "1.8.0", features = ["const_generics", "union"] }
 
 [dev-dependencies]
 criterion = "0.3"
@@ -27,8 +28,8 @@ criterion = "0.3"
 name = "benchmarks"
 harness = false
 
-[profile.release]
-debug = true
+# [profile.release]
+# debug = true
 
 [profile.bench]
 lto = true
