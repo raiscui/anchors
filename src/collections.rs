@@ -3,3 +3,4 @@ mod ord_set;
 mod rope;
 mod vector;
 mod collect;
+mod smallvec;
