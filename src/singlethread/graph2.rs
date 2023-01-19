@@ -74,7 +74,7 @@ pub struct Node {
     pub ptrs: NodePtrs,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 pub struct NodeKey {
     ptr: NodePtr,
     token: u32,
@@ -107,7 +107,7 @@ pub struct NodePtrs {
 }
 
 /// Singlethread's implementation of Anchors' `AnchorHandle`, the engine-specific handle that sits inside an `Anchor`.
-#[derive(Debug)]
+#[derive(Debug,PartialEq, Eq, PartialOrd, Ord)]
 pub struct AnchorHandle {
     num: NodeKey,
     still_alive: Rc<Cell<bool>>,
@@ -330,7 +330,11 @@ impl<'gg> Graph2Guard<'gg> {
         let node_height = height(node);
         let mut recalc_queues = self.graph.recalc_queues.borrow_mut();
         if node_height >= recalc_queues.len() {
-            panic!("too large height error");
+            panic!(
+                "too large height error {} \n debug_info:{:?}",
+                &node_height,
+                node.debug_info.get()
+            );
         }
         if let Some(old) = recalc_queues[node_height] {
             unsafe { self.nodes.lookup_ptr(old) }

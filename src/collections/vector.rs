@@ -57,6 +57,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
             if pending_exists {
                 return Poll::Pending;
             }
+
             self.vals = Some(
                 self.anchors
                     .iter()
@@ -84,9 +85,10 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
 
 #[cfg(test)]
 mod test {
+
+    use im_rc::{vector, Vector};
+
     use crate::singlethread::*;
-    use im_rc::vector;
-    use im_rc::Vector;
 
     #[test]
     fn collect() {

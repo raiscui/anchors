@@ -1,11 +1,13 @@
-use crate::expert::{Anchor, Engine};
-use im_rc::ordmap::DiffItem;
-use im_rc::OrdMap;
+use im_rc::{ordmap::DiffItem, OrdMap};
 
+use crate::expert::{Anchor, Engine};
 pub type Dict<K, V> = OrdMap<K, V>;
 
 impl<E: Engine, K: Ord + Clone + PartialEq + 'static, V: Clone + PartialEq + 'static>
     Anchor<Dict<K, V>, E>
+where
+    // (K, V): PartialEq,
+    Dict<K, V>: PartialEq,
 {
     #[track_caller]
     pub fn filter<F: FnMut(&K, &V) -> bool + 'static>(&self, mut f: F) -> Anchor<Dict<K, V>, E> {
@@ -29,7 +31,14 @@ impl<E: Engine, K: Ord + Clone + PartialEq + 'static, V: Clone + PartialEq + 'st
         &self,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        self.unordered_fold(Dict::new(), move |out, diff_item| {
+        self.unordered_fold(Dict::new(), move |out, diff_item, len| {
+            let out_is_empty = out.is_empty();
+            if len == 0 && !out_is_empty {
+                out.clear();
+                return true;
+            } else if len == 0 && out_is_empty {
+                return false;
+            }
             match diff_item {
                 DiffItem::Add(k, v) => {
                     if let Some(new) = f(k, v) {
@@ -38,50 +47,162 @@ impl<E: Engine, K: Ord + Clone + PartialEq + 'static, V: Clone + PartialEq + 'st
                     }
                 }
                 DiffItem::Update {
-                    new: (k, v),
                     old: _,
+                    new: (k, v),
                 } => {
+                    //TODO  if key change , v not?
                     if let Some(new) = f(k, v) {
                         out.insert(k.clone(), new);
                         return true;
-                    } else if out.contains_key(k) {
-                        out.remove(k);
+                    // } else if out.contains_key(k) {
+                    } else if out.remove(k).is_some() {
                         return true;
                     }
                 }
                 DiffItem::Remove(k, _v) => {
-                    out.remove(k);
-                    return true;
+                    if out.remove(k).is_some() {
+                        return true;
+                    };
                 }
             }
             false
         })
     }
+
+    /// Dict 增加/更新 K V 会增量执行 function f , 用于更新 out,
+    /// Dict 移除 K V 并不会触发 out 的更新,
+    #[track_caller]
+    pub fn increment_reduction<F, T>(&self, initial_state: T, mut f: F) -> Anchor<T, E>
+    where
+        F: FnMut(&mut T, &K, &V) + 'static,
+        T: Clone + PartialEq + 'static,
+    {
+        self.unordered_fold(initial_state, move |out, diff_item, len| {
+            if len == 0 {
+                return false;
+            }
+            match diff_item {
+                DiffItem::Add(k, v) => {
+                    f(out, k, v);
+
+                    true
+                }
+                DiffItem::Update {
+                    old: _,
+                    new: (k, v),
+                } => {
+                    //TODO  if key change , v not?
+                    f(out, k, v);
+                    true
+                }
+                DiffItem::Remove(_k, _v) => false,
+            }
+        })
+    }
+
+    /// Dict 增加/更新 K V 会增量执行 function f , 用于更新 out,
+    /// Dict 移除 K V 也会执行 remove f,
+    #[track_caller]
+    pub fn reduction<F, T>(
+        &self,
+        initial_state: T,
+        mut add_or_update: F,
+        mut remove: F,
+    ) -> Anchor<T, E>
+    where
+        F: FnMut(&mut T, &K, &V) -> bool + 'static,
+        T: Clone + PartialEq + 'static,
+    {
+        self.unordered_fold(initial_state, move |out, diff_item, len| {
+            if len == 0 {
+                return false;
+            }
+            match diff_item {
+                DiffItem::Add(k, v) => add_or_update(out, k, v),
+                DiffItem::Update {
+                    old: _,
+                    new: (k, v),
+                } => add_or_update(out, k, v),
+                DiffItem::Remove(k, v) => remove(out, k, v),
+            }
+        })
+    }
+
     #[track_caller]
     pub fn unordered_fold<
         T: PartialEq + Clone + 'static,
-        F: for<'a> FnMut(&mut T, DiffItem<'a, K, V>) -> bool + 'static,
+        F: for<'a> FnMut(&mut T, DiffItem<'a, K, V>, usize) -> bool + 'static,
     >(
         &self,
         initial_state: T,
         mut f: F,
     ) -> Anchor<T, E> {
-        let mut last_observation = Dict::new();
-        self.map_mut(initial_state, move |out, this| {
-            let mut did_update = false;
-            for item in last_observation.diff(this) {
-                if f(out, item) {
-                    did_update = true;
-                }
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "pool")]{
+                let mut last_observation = Dict::new();
+                let mut initd = false;
+                self.map_mut(initial_state, move |out, this| {
+                    if !initd {
+                        last_observation = Dict::with_pool(this.pool());
+                        initd = true;
+                    }
+
+                    let mut did_update = false;
+                    let len = this.len();
+                    // if last_observation.len() == 0 && len==0 {
+                    //     return false
+                    // }
+
+                    // if len == 0 && last_observation.len() != 0{
+                    //     out.clear();
+                    //     last_observation.clear();
+                    //     return true;
+                    // }
+
+                    for item in last_observation.diff(this) {
+                        if f(out, item, len) {
+                            did_update = true;
+                        }
+                    }
+                    last_observation = this.clone();
+                    did_update
+                })
+            }else{
+
+                let mut last_observation = Dict::new();
+                self.map_mut(initial_state, move |out, this| {
+
+
+                    let mut did_update = false;
+                    let len = this.len();
+                    // if last_observation.len() == 0 && len==0 {
+                    //     return false
+                    // }
+
+                    // if len == 0 && last_observation.len() != 0{
+                    //     out.clear();
+                    //     last_observation.clear();
+                    //     return true;
+                    // }
+
+                    for item in last_observation.diff(this) {
+                        if f(out, item, len) {
+                            did_update = true;
+                        }
+                    }
+                    last_observation = this.clone();
+                    did_update
+                })
+
             }
-            last_observation = this.clone();
-            did_update
-        })
+
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
+
     use super::*;
     #[test]
     fn test_filter() {

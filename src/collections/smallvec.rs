@@ -1,4 +1,4 @@
-use emg_core::SVec::{Array, SmallVec};
+use smallvec::SmallVec;
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
@@ -86,8 +86,9 @@ impl<T: 'static + Clone, E: Engine, const S: usize> AnchorInner<E> for SmallVecC
 
 #[cfg(test)]
 mod test {
+    use smallvec::{smallvec, SmallVec};
+
     use crate::singlethread::*;
-    use emg_core::{smallvec, SmallVec};
 
     #[test]
     fn collect() {

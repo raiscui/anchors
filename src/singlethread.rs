@@ -148,20 +148,26 @@ impl Engine {
 
     /// Retrieves the value of an Anchor, recalculating dependencies as necessary to get the
     /// latest value.
-    pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
+    pub fn get<O: Clone + 'static + std::cmp::PartialEq>(&mut self, anchor: &Anchor<O>) -> O {
         // stabilize once before, since the stabilization process may mark our requested node
         // as dirty
         self.stabilize();
         self.graph.with(|graph| {
             let anchor_node = graph.get(anchor.token()).unwrap();
             if graph2::recalc_state(anchor_node) != RecalcState::Ready {
+                trace!(
+                    "graph2::recalc_state(anchor_node) != RecalcState::Ready ,{:?}",
+                    anchor_node.debug_info.get()
+                );
                 graph.queue_recalc(anchor_node);
                 // stabilize again, to make sure our target node that is now in the queue is up-to-date
                 // use stabilize0 because no dirty marks have occured since last stabilization, and we want
                 // to make sure we don't unnecessarily increment generation number
                 self.stabilize0();
             }
-            let target_anchor = &graph.get(anchor.token()).unwrap().anchor;
+            // let target_anchor_old = &graph.get(anchor.token()).unwrap().anchor;
+
+            let target_anchor = &anchor_node.anchor;
             let borrow = target_anchor.borrow();
             borrow
                 .as_ref()
@@ -202,6 +208,7 @@ impl Engine {
     }
 
     pub(crate) fn update_dirty_marks(&mut self) {
+        trace!("update_dirty_marks");
         self.graph.with(|graph| {
             let dirty_marks = std::mem::take(&mut *self.dirty_marks.borrow_mut());
             for dirty in dirty_marks {
@@ -214,16 +221,21 @@ impl Engine {
     /// Ensure any Observed nodes are up-to-date, recalculating dependencies as necessary. You
     /// should rarely need to call this yourself; `Engine::get` calls it automatically.
     pub fn stabilize(&mut self) {
+        trace!("stabilize");
         self.update_dirty_marks();
         self.generation.increment();
         self.stabilize0();
+        trace!("....stabilize");
     }
 
     /// internal function for stabilization. does not update dirty marks or increment the stabilization number
     fn stabilize0(&self) {
+        trace!("stabilize0");
         self.graph.with(|graph| {
             while let Some((height, node)) = graph.recalc_pop_next() {
                 let calculation_complete = if graph2::height(node) == height {
+                    trace!("recalculate height");
+
                     // TODO with new graph we can automatically relocate nodes if their height changes
                     // this nodes height is current, so we can recalculate
                     self.recalculate(graph, node)
@@ -236,7 +248,8 @@ impl Engine {
                     graph.queue_recalc(node);
                 }
             }
-        })
+        });
+        trace!("...stabilize0");
     }
 
     /// returns false if calculation is still pending
@@ -335,6 +348,7 @@ impl Engine {
 // skip_self = true indicates output has *definitely* changed, but node has been recalculated
 // skip_self = false indicates node has not yet been recalculated
 fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) {
+    trace!("mark_dirty {:?} ", node.debug_info.get(),);
     if skip_self {
         let parents = node.drain_clean_parents();
         for parent in parents {
@@ -353,6 +367,7 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
 }
 
 fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
+    trace!("mark_dirty0 {:?}", next);
     let id = next.key();
     if Engine::check_observed_raw(next) != ObservedState::Unnecessary {
         graph.queue_recalc(next);

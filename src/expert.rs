@@ -30,6 +30,40 @@ pub struct Anchor<O, E: Engine + ?Sized> {
     phantom: PhantomData<O>,
 }
 
+impl<O, E: Engine> Ord for Anchor<O, E>
+where
+    <E as Engine>::AnchorHandle: std::cmp::PartialOrd + Ord,
+{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.data.cmp(&other.data)
+    }
+}
+
+impl<O, E: Engine> PartialOrd for Anchor<O, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match self.data.partial_cmp(&other.data) {
+            Some(core::cmp::Ordering::Equal) => {}
+            ord => return ord,
+        }
+        self.phantom.partial_cmp(&other.phantom)
+    }
+}
+
+impl<O, E: Engine + ?Sized> std::fmt::Debug for Anchor<O, E>
+where
+    <E as Engine>::AnchorHandle: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Anchor")
+            .field("data", &self.data)
+            .field("phantom", &self.phantom)
+            .finish()
+    }
+}
+
 impl<O, E: Engine> Anchor<O, E> {
     #[track_caller]
     pub fn constant(val: O) -> Self
