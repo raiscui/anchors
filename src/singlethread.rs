@@ -148,7 +148,7 @@ impl Engine {
 
     /// Retrieves the value of an Anchor, recalculating dependencies as necessary to get the
     /// latest value.
-    pub fn get<O: Clone + 'static + std::cmp::PartialEq>(&mut self, anchor: &Anchor<O>) -> O {
+    pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
         // stabilize once before, since the stabilization process may mark our requested node
         // as dirty
         self.stabilize();
