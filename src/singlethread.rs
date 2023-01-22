@@ -165,7 +165,7 @@ impl Engine {
                 // to make sure we don't unnecessarily increment generation number
                 self.stabilize0();
             }
-            // let target_anchor_old = &graph.get(anchor.token()).unwrap().anchor;
+            // let target_anchor = &graph.get(anchor.token()).unwrap().anchor;
 
             let target_anchor = &anchor_node.anchor;
             let borrow = target_anchor.borrow();

@@ -39,6 +39,8 @@ where
             } else if len == 0 && out_is_empty {
                 return false;
             }
+            // ─────────────────────────────────────────────────────
+
             match diff_item {
                 DiffItem::Add(k, v) => {
                     if let Some(new) = f(k, v) {
@@ -47,15 +49,22 @@ where
                     }
                 }
                 DiffItem::Update {
-                    old: _,
+                    old: (ok, ov),
                     new: (k, v),
                 } => {
+                    #[cfg(debug_assertions)]
+                    {
+                        if ok != k {
+                            panic!("key mismatch");
+                        }
+                    }
+
                     //TODO  if key change , v not?
                     if let Some(new) = f(k, v) {
                         out.insert(k.clone(), new);
                         return true;
                     // } else if out.contains_key(k) {
-                    } else if out.remove(k).is_some() {
+                    } else if out.remove(ok).is_some() {
                         return true;
                     }
                 }
@@ -103,14 +112,16 @@ where
     /// Dict 增加/更新 K V 会增量执行 function f , 用于更新 out,
     /// Dict 移除 K V 也会执行 remove f,
     #[track_caller]
-    pub fn reduction<F, T>(
+    pub fn reduction<F, Fu, T>(
         &self,
         initial_state: T,
-        mut add_or_update: F,
+        mut add: F,
+        mut update: Fu,
         mut remove: F,
     ) -> Anchor<T, E>
     where
         F: FnMut(&mut T, &K, &V) -> bool + 'static,
+        Fu: FnMut(&mut T, (&K, &V), &K, &V) -> bool + 'static,
         T: Clone + PartialEq + 'static,
     {
         self.unordered_fold(initial_state, move |out, diff_item, len| {
@@ -118,11 +129,8 @@ where
                 return false;
             }
             match diff_item {
-                DiffItem::Add(k, v) => add_or_update(out, k, v),
-                DiffItem::Update {
-                    old: _,
-                    new: (k, v),
-                } => add_or_update(out, k, v),
+                DiffItem::Add(k, v) => add(out, k, v),
+                DiffItem::Update { old, new: (k, v) } => update(out, old, k, v),
                 DiffItem::Remove(k, v) => remove(out, k, v),
             }
         })

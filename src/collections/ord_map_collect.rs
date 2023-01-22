@@ -137,7 +137,7 @@ mod test {
 
     use im_rc::OrdMap;
 
-    use crate::{collections::ord_map::Dict, dict, singlethread::*};
+    use crate::{collections::ord_map_methods::Dict, dict, singlethread::*};
 
     #[test]
     fn collect() {

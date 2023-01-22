@@ -1,4 +1,6 @@
 #![feature(negative_impls)]
+#![feature(exact_size_is_empty)]
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub mod collections;
 pub mod expert;

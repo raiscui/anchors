@@ -1,7 +1,8 @@
-pub mod ord_map;
-mod ord_set;
-mod ord_map_collect;
-mod rope;
-mod vector;
 mod collect;
+mod ord_map_collect;
+pub mod ord_map_methods;
+mod ord_set_collect;
+pub mod ord_set_methods;
+mod rope;
 mod smallvec;
+mod vector;

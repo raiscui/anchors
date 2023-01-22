@@ -96,6 +96,10 @@ impl<O, E: Engine> Clone for Anchor<O, E> {
 
 impl<O, E: Engine> PartialEq for Anchor<O, E> {
     fn eq(&self, other: &Self) -> bool {
+        let _span = debug_span!("PartialEq",).entered();
+        debug!("Anchor PartialEq:{:?} == {:?}", self.token(), other.token());
+        #[cfg(debug_assertions)]
+        debug!("---- is {}", self.token() == other.token());
         self.token() == other.token()
     }
 }
@@ -215,4 +219,5 @@ pub use ext::MultiAnchor;
 pub(crate) mod constant;
 mod var;
 pub use constant::Constant;
+use tracing::{debug, debug_span, trace, trace_span};
 pub use var::Var;
