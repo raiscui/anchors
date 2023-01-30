@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-07-11 22:12:01
- * @LastEditTime: 2023-01-19 16:19:40
+ * @LastEditTime: 2023-01-25 19:02:14
  * @LastEditors: Rais
  * @Description:
  */
@@ -40,7 +40,7 @@ where
     }
 }
 
-struct OrdSetCollect<T, E: Engine> {
+pub struct OrdSetCollect<T, E: Engine> {
     anchors: OrdSet<Anchor<T, E>>,
     vals: Option<OrdSet<T>>,
     dirty: bool,
@@ -69,7 +69,7 @@ where
     type Output = OrdSet<T>;
     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
         // self.vals = None;
-        self.dirty = true
+        self.dirty = true;
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {

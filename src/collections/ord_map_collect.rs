@@ -1,14 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-01-19 16:19:47
- * @LastEditors: Rais
- * @Description:
- */
-/*
- * @Author: Rais
- * @Date: 2022-07-11 22:12:01
- * @LastEditTime: 2022-07-11 22:59:29
+ * @LastEditTime: 2023-01-25 19:48:21
  * @LastEditors: Rais
  * @Description:
  */
@@ -52,7 +45,27 @@ where
     }
 }
 
-struct OrdMapCollect<I, V, E: Engine> {
+impl<'a, I, V, E> std::iter::FromIterator<(&'a I, &'a Anchor<V, E>)> for Anchor<OrdMap<I, V>, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    V: std::clone::Clone + 'static,
+    I: 'static + Clone + std::cmp::Ord,
+    E: Engine,
+    OrdMap<I, V>: std::cmp::Eq,
+{
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = (&'a I, &'a Anchor<V, E>)>,
+    {
+        OrdMapCollect::new(
+            iter.into_iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
+}
+
+pub struct OrdMapCollect<I, V, E: Engine> {
     anchors: OrdMap<I, Anchor<V, E>>,
     vals: Option<OrdMap<I, V>>,
     dirty: bool,
@@ -89,7 +102,7 @@ where
     type Output = OrdMap<I, V>;
     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
         // self.vals = None;
-        self.dirty = true
+        self.dirty = true;
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
@@ -128,7 +141,7 @@ where
     }
 
     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
-        Some(("VectorCollect", self.location))
+        Some(("DictCollect", self.location))
     }
 }
 
@@ -137,7 +150,7 @@ mod test {
 
     use im_rc::OrdMap;
 
-    use crate::{collections::ord_map_methods::Dict, dict, singlethread::*};
+    use crate::{dict, singlethread::*};
 
     #[test]
     fn collect() {
@@ -163,7 +176,7 @@ mod test {
             *v
         });
         let f = dict!(1usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch());
-        let nums: Anchor<OrdMap<_, _>> = f.into_iter().collect();
+        let nums: Anchor<OrdMap<_, _>> = (&f).into_iter().collect();
         let sum: Anchor<usize> = nums.map(|nums| nums.values().sum());
         let ns: Anchor<usize> = nums.map(|nums: &OrdMap<_, _>| nums.len());
 
