@@ -8,9 +8,9 @@ license = "MIT"
 documentation = "https://docs.rs/anchors"
 repository = "https://github.com/lord/anchors"
 
-[lib]
-bench = false
-crate-type = ["dylib", "rlib"]
+# [lib]
+# bench = false
+# crate-type = ["dylib", "rlib"]
 
 [features]
 default = []

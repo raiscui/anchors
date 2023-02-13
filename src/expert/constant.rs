@@ -18,6 +18,7 @@ impl<T: 'static> Constant<T> {
         Self::new_internal(val)
     }
 
+    #[track_caller]
     pub(crate) fn new_internal<E: Engine>(val: T) -> Anchor<T, E> {
         E::mount(Self {
             val,
@@ -40,8 +41,9 @@ impl<T: 'static, E: Engine> AnchorInner<E> for Constant<T> {
     type Output = T;
     fn dirty(&mut self, _child: &<E::AnchorHandle as AnchorHandle>::Token) {
         panic!(
-            "Constant never has any inputs; dirty should not have been called. alleged child: {:?} ,type: {:?}",
-            _child,std::any::type_name::<T>()
+            "Constant never has any inputs; dirty should not have been called. alleged child: {:?} ,type: {:?},\nloc{:?}",
+            _child,std::any::type_name::<T>(),
+            self.location
         )
     }
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, _ctx: &mut G) -> Poll {
