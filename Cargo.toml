@@ -22,7 +22,7 @@ cfg-if = "1.0.0"
 
 im-rc = { version = "15.1.0" }
 
-typed-arena = { version = "2.0.1" }
+# typed-arena = { version = "2.0.1" }
 arena-graph = { version = "0.1.0", path = "../arena-graph" }
 
 tracing = { version = "^0.1" }
