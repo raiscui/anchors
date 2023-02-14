@@ -30,6 +30,13 @@ pub struct Anchor<O, E: Engine + ?Sized> {
     phantom: PhantomData<O>,
 }
 
+// impl<O, E: Engine + ?Sized> Drop for Anchor<O, E> {
+//     fn drop(&mut self) {
+//         let _span = trace_span!("anchors-drop").entered();
+//         trace!("drop Anchor<{}>", std::any::type_name::<O>());
+//     }
+// }
+
 impl<O, E: Engine> Ord for Anchor<O, E>
 where
     <E as Engine>::AnchorHandle: std::cmp::PartialOrd + Ord,

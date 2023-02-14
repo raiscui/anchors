@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-07-11 22:12:01
- * @LastEditTime: 2023-01-25 19:02:14
+ * @LastEditTime: 2023-02-14 15:29:25
  * @LastEditors: Rais
  * @Description:
  */
@@ -81,6 +81,9 @@ where
             if pending_exists {
                 return Poll::Pending;
             }
+
+            self.dirty = false;
+
             let new_vals = Some(
                 self.anchors
                     .iter()
@@ -93,7 +96,6 @@ where
                 return Poll::Updated;
             }
         }
-        self.dirty = false;
         trace!("Anchor<OrdSet> Unchanged");
         Poll::Unchanged
     }

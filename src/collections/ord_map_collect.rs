@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-01-25 19:48:21
+ * @LastEditTime: 2023-02-14 15:36:50
  * @LastEditors: Rais
  * @Description:
  */
@@ -106,28 +106,51 @@ where
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
+        let mut changed = false;
+
         if self.dirty {
-            let pending_exists = self
+            let polls = self
                 .anchors
                 .iter()
-                .any(|(_i, anchor)| ctx.request(anchor, true) == Poll::Pending);
-            if pending_exists {
+                .try_fold(vec![], |mut acc, (i, anchor)| {
+                    let s = ctx.request(anchor, true);
+                    if s != Poll::Pending {
+                        acc.push((s, (i, anchor)));
+                        Some(acc)
+                    } else {
+                        None
+                    }
+                });
+
+            if polls.is_none() {
                 return Poll::Pending;
             }
-            let new_vals: Option<OrdMap<I, V>> = Some(
-                self.anchors
-                    .iter()
-                    .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
-                    .collect(),
-            );
 
-            if self.vals != new_vals {
-                self.vals = new_vals;
-                return Poll::Updated;
+            self.dirty = false;
+
+            if let Some(ref mut old_vals) = self.vals {
+                for (poll, (&ref i, &ref anchor)) in polls.unwrap().iter() {
+                    if &Poll::Updated == poll {
+                        old_vals.insert(i.clone(), ctx.get(anchor).clone());
+                        changed = true;
+                    }
+                }
+            } else {
+                self.vals = Some(
+                    self.anchors
+                        .iter()
+                        .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
+                        .collect(),
+                );
+                changed = true;
             }
         }
-        self.dirty = false;
-        Poll::Unchanged
+
+        if changed {
+            Poll::Updated
+        } else {
+            Poll::Unchanged
+        }
     }
 
     fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
@@ -151,6 +174,29 @@ mod test {
     use im_rc::OrdMap;
 
     use crate::{dict, singlethread::*};
+    #[test]
+    fn collect_k_change() {
+        let mut engine = Engine::new();
+        let a = Var::new(1);
+        let b = Var::new(2);
+        let c = Var::new(5);
+        let d = Var::new(10);
+        let f = Var::new(dict!(1usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        let nums = f.watch().then(|d| {
+            let nums: Anchor<OrdMap<_, _>> = d.into_iter().collect();
+            nums
+        });
+        let sum: Anchor<usize> = nums.map(|nums| nums.values().sum());
+        assert_eq!(engine.get(&sum),8);
+        f.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        assert_eq!(engine.get(&sum),8);
+        f.set(dict!(10usize=>d.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        assert_eq!(engine.get(&sum),17);
+
+
+
+
+    }
 
     #[test]
     fn collect() {
@@ -176,7 +222,7 @@ mod test {
             *v
         });
         let f = dict!(1usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch());
-        let nums: Anchor<OrdMap<_, _>> = (&f).into_iter().collect();
+        let nums: Anchor<OrdMap<_, _>> = f.into_iter().collect();
         let sum: Anchor<usize> = nums.map(|nums| nums.values().sum());
         let ns: Anchor<usize> = nums.map(|nums: &OrdMap<_, _>| nums.len());
 

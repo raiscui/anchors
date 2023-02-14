@@ -1,4 +1,4 @@
-use im_rc::Vector;
+use im_rc::{vector, Vector};
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
@@ -29,6 +29,7 @@ struct VectorCollect<T, E: Engine> {
     anchors: Vector<Anchor<T, E>>,
     vals: Option<Vector<T>>,
     location: &'static Location<'static>,
+    dirty: bool,
 }
 
 impl<T: 'static + Clone, E: Engine> VectorCollect<T, E> {
@@ -38,6 +39,7 @@ impl<T: 'static + Clone, E: Engine> VectorCollect<T, E> {
             anchors,
             vals: None,
             location: Location::caller(),
+            dirty: true,
         })
     }
 }
@@ -45,27 +47,69 @@ impl<T: 'static + Clone, E: Engine> VectorCollect<T, E> {
 impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
     type Output = Vector<T>;
     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        self.vals = None;
+        // self.vals = None;
+        self.dirty = true;
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
-        if self.vals.is_none() {
-            let pending_exists = self
-                .anchors
-                .iter()
-                .any(|anchor| ctx.request(anchor, true) == Poll::Pending);
-            if pending_exists {
+        let mut changed = false;
+        if self.dirty {
+            let polls = self.anchors.iter().try_fold(vec![], |mut acc, anchor| {
+                let s = ctx.request(anchor, true);
+                if s != Poll::Pending {
+                    acc.push((s, anchor));
+                    Some(acc)
+                } else {
+                    None
+                }
+            });
+
+            if polls.is_none() {
                 return Poll::Pending;
             }
+            self.dirty = false;
 
-            self.vals = Some(
-                self.anchors
-                    .iter()
-                    .map(|anchor| ctx.get(anchor).clone())
-                    .collect(),
-            )
+            // ─────────────────────────────────────────────────────────────────────────────
+            // self.anchors.iter().for_each(|a| {
+            //     let s = ctx.request(a, true);
+            //     println!("{s:?}")
+            // });
+            // ─────────────────────────────────────────────────────
+
+            if let Some(ref mut old_vals) = self.vals {
+                for (old_val, (poll, anchor)) in old_vals.iter_mut().zip(polls.unwrap().iter()) {
+                    if &Poll::Updated == poll {
+                        *old_val = ctx.get(anchor).clone();
+                        changed = true;
+                    }
+                }
+            } else {
+                self.vals = Some(
+                    self.anchors
+                        .iter()
+                        .map(|anchor| ctx.get(anchor).clone())
+                        .collect(),
+                );
+                changed = true;
+            }
+
+            // ─────────────────────────────────────────────────────
+
+            // self.vals = Some(
+            //     self.anchors
+            //         .iter()
+            //         .map(|anchor| ctx.get(anchor).clone())
+            //         .collect(),
+            // );
+
+            // changed = true;
         }
-        Poll::Updated
+
+        if changed {
+            Poll::Updated
+        } else {
+            Poll::Unchanged
+        }
     }
 
     fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(

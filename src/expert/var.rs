@@ -1,4 +1,4 @@
-use tracing::{debug, trace};
+use tracing::{debug, trace, trace_span};
 
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext,
@@ -12,12 +12,26 @@ struct VarAnchor<T, E: Engine> {
     val: Rc<T>,
 }
 
+// impl<T, E: Engine> Drop for VarAnchor<T, E> {
+//     fn drop(&mut self) {
+//         let _span = trace_span!("anchors-drop").entered();
+//         trace!("drop VarAnchor<{}>", std::any::type_name::<T>());
+//     }
+// }
+
 #[derive(Clone)]
 struct VarShared<T, E: Engine> {
     dirty_handle: Option<E::DirtyHandle>,
     val: Rc<T>,
     value_changed: bool,
 }
+
+// impl<T, E: Engine> Drop for VarShared<T, E> {
+//     fn drop(&mut self) {
+//         let _span = trace_span!("anchors-drop").entered();
+//         trace!("drop VarShared<{}>", std::any::type_name::<T>());
+//     }
+// }
 
 impl<T: Debug, E: Engine> Debug for VarShared<T, E>
 where
@@ -38,6 +52,13 @@ pub struct Var<T, E: Engine> {
     inner: Rc<RefCell<VarShared<T, E>>>,
     anchor: Anchor<T, E>,
 }
+
+// impl<T, E: Engine> Drop for Var<T, E> {
+//     fn drop(&mut self) {
+//         let _span = trace_span!("anchors-drop").entered();
+//         trace!("drop Var<{}>", std::any::type_name::<T>());
+//     }
+// }
 #[cfg(test)]
 mod test {
 

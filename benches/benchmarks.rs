@@ -1,6 +1,12 @@
-use anchors::singlethread::{Anchor, Engine, MultiAnchor, Var};
+use anchors::{
+    collections::ord_map_methods::Dict,
+    singlethread::{Anchor, Engine, MultiAnchor, Var},
+};
+
+use smallvec::{smallvec, SmallVec};
+
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use im_rc::{vector, Vector};
+use im_rc::{ordmap, vector, Vector};
 
 fn stabilize_linear_nodes_simple(c: &mut Criterion) {
     for node_count in &[10, 100, 1000] {
@@ -181,6 +187,99 @@ fn vector_anchor(c: &mut Criterion) {
     }
 }
 
+fn sm_vector_anchor(c: &mut Criterion) {
+    for node_count in &[10, 100, 1000] {
+        for observed in &[true, false] {
+            c.bench_with_input(
+                BenchmarkId::new(
+                    "sm_vector_anchor",
+                    format!(
+                        "{}/{}",
+                        node_count,
+                        if *observed { "observed" } else { "unobserved" }
+                    ),
+                ),
+                &(*node_count, *observed),
+                |b, (node_count, observed)| {
+                    let mut engine = Engine::new_with_max_height(1003);
+                    let first_num = Var::new(0u64);
+                    let node = first_num.watch();
+
+                    let mut v: SmallVec<[Anchor<u64>; 11]> = smallvec![node];
+                    for _ in 0..*node_count {
+                        let node_x = Var::new(1);
+                        v.push(node_x.watch());
+                    }
+                    let va: Anchor<SmallVec<[u64; 11]>> = v.into_iter().collect();
+
+                    let count_va: Anchor<u64> = va.map(|ns| ns.iter().sum());
+                    if *observed {
+                        engine.mark_observed(&count_va);
+                    }
+                    assert_eq!(engine.get(&count_va), *node_count);
+                    // println!(
+                    //     "node count: {}  count_va {}",
+                    //     node_count,
+                    //     engine.get(&count_va)
+                    // );
+                    let mut update_number = 0;
+                    b.iter(|| {
+                        update_number += 1;
+                        first_num.set(update_number);
+                        assert_eq!(engine.get(&count_va), update_number + *node_count);
+                    });
+                },
+            );
+        }
+    }
+}
+fn ord_map_anchor(c: &mut Criterion) {
+    for node_count in &[10, 100, 1000] {
+        for observed in &[true, false] {
+            c.bench_with_input(
+                BenchmarkId::new(
+                    "ord_map_anchor",
+                    format!(
+                        "{}/{}",
+                        node_count,
+                        if *observed { "observed" } else { "unobserved" }
+                    ),
+                ),
+                &(*node_count, *observed),
+                |b, (node_count, observed)| {
+                    let mut engine = Engine::new_with_max_height(1003);
+                    let first_num = Var::new(0u64);
+                    let node = first_num.watch();
+
+                    let mut v = ordmap! {"-1".to_string()=> node};
+                    for i in 0..*node_count {
+                        let node_x = Var::new(1);
+                        v.insert(i.to_string(), node_x.watch());
+                    }
+                    let va: Anchor<Dict<_, _>> = v.into_iter().collect();
+
+                    let count_va: Anchor<u64> = va.map(|ns| ns.values().sum());
+                    if *observed {
+                        engine.mark_observed(&count_va);
+                    }
+                    assert_eq!(engine.get(&count_va), *node_count);
+                    // println!(
+                    //     "node count: {}  count_va {}",
+                    //     node_count,
+                    //     engine.get(&count_va)
+                    // );
+                    let mut update_number = 0;
+                    b.iter(|| {
+                        update_number += 1;
+                        first_num.set(update_number);
+                        assert_eq!(engine.get(&count_va), update_number + *node_count);
+                    });
+                },
+            );
+        }
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
@@ -189,6 +288,18 @@ criterion_group! {
 criterion_group! {
     name = benches_vector;
     config = Criterion::default();
-    targets = vector_anchor
+    targets = vector_anchor,sm_vector_anchor
 }
-criterion_main!(benches_vector);
+criterion_group! {
+    name = benches_ordmap;
+    config = Criterion::default();
+    targets = ord_map_anchor
+}
+
+criterion_group! {
+    name = all;
+    config = Criterion::default();
+    targets = stabilize_linear_nodes_cutoff, stabilize_linear_nodes_not_cutoff,stabilize_linear_nodes_simple,vector_anchor,sm_vector_anchor,ord_map_anchor
+}
+
+criterion_main!(all);
