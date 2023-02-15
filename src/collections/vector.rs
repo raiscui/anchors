@@ -1,4 +1,4 @@
-use im_rc::{vector, Vector};
+use im_rc::Vector;
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,

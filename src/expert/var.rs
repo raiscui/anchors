@@ -1,9 +1,11 @@
-use tracing::{debug, trace, trace_span};
+use tracing::{debug, error, trace, trace_span, warn};
+
+use crate::singlethread::AnchorToken;
 
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext,
 };
-use std::{cell::RefCell, fmt::Debug};
+use std::{any::Any, cell::RefCell, fmt::Debug};
 use std::{fmt::Display, rc::Rc};
 
 /// An Anchor type for values that are mutated by calling a setter function from outside of the Anchors recomputation graph.
@@ -171,8 +173,18 @@ impl<T: 'static, E: Engine> Var<T, E> {
 
 impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
     type Output = T;
-    fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
+    fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+        let e = edge as &dyn Any;
+        let ee = e.downcast_ref::<AnchorToken>().unwrap();
+        let ng = unsafe { ee.ptr.lookup_unchecked() };
+
+        warn!(
+            "VarAnchor dirty, debug_info=\n=========={:?}\ntype T:\n=========={}",
+            ng.debug_info.get(),
+            std::any::type_name::<T>()
+        );
+
+        // panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {

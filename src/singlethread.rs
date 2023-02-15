@@ -395,11 +395,11 @@ impl crate::expert::DirtyHandle for DirtyHandle {
     }
 }
 
-struct EngineContext<'eng> {
+pub struct EngineContext<'eng> {
     engine: &'eng Engine,
 }
 
-struct EngineContextMut<'eng, 'gg> {
+pub struct EngineContextMut<'eng, 'gg> {
     engine: &'eng Engine,
     graph: Graph2Guard<'gg>,
     node: NodeGuard<'gg>,
@@ -505,7 +505,7 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
     }
 }
 
-trait GenericAnchor {
+pub trait GenericAnchor {
     fn dirty(&mut self, child: &NodeKey);
     fn poll_updated<'eng, 'gg>(&mut self, ctx: &mut EngineContextMut<'eng, 'gg>) -> Poll;
     fn output<'slf, 'out>(&'slf self, ctx: &mut EngineContext<'out>) -> &'out dyn Any
@@ -537,7 +537,7 @@ impl<I: AnchorInner<Engine> + 'static> GenericAnchor for I {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AnchorDebugInfo {
+pub struct AnchorDebugInfo {
     location: Option<(&'static str, &'static Location<'static>)>,
     type_info: &'static str,
 }

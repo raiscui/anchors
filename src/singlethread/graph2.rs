@@ -61,7 +61,7 @@ pub struct Node {
 
     pub token: u32,
 
-    pub(super) debug_info: Cell<AnchorDebugInfo>,
+    pub debug_info: Cell<AnchorDebugInfo>,
 
     /// tracks the generation when this Node last polled as Updated or Unchanged
     pub(super) last_ready: Cell<Option<Generation>>,
@@ -69,14 +69,14 @@ pub struct Node {
     pub(super) last_update: Cell<Option<Generation>>,
 
     /// Some() if this node is still active, None otherwise
-    pub(super) anchor: RefCell<Option<Box<dyn GenericAnchor>>>,
+    pub anchor: RefCell<Option<Box<dyn GenericAnchor>>>,
 
     pub ptrs: NodePtrs,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 pub struct NodeKey {
-    ptr: NodePtr,
+    pub ptr: NodePtr,
     token: u32,
 }
 
@@ -107,7 +107,7 @@ pub struct NodePtrs {
 }
 
 /// Singlethread's implementation of Anchors' `AnchorHandle`, the engine-specific handle that sits inside an `Anchor`.
-#[derive(Debug,PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AnchorHandle {
     num: NodeKey,
     still_alive: Rc<Cell<bool>>,
