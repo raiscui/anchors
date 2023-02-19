@@ -1,4 +1,4 @@
-use tracing::{debug, error, trace, trace_span, warn};
+use tracing::{debug_span, trace, warn};
 
 use crate::singlethread::AnchorToken;
 
@@ -174,17 +174,17 @@ impl<T: 'static, E: Engine> Var<T, E> {
 impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
     type Output = T;
     fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+        let _span = debug_span!("anchors-dirty").entered();
         let e = edge as &dyn Any;
         let ee = e.downcast_ref::<AnchorToken>().unwrap();
         let ng = unsafe { ee.ptr.lookup_unchecked() };
-
         warn!(
             "VarAnchor dirty, debug_info=\n=========={:?}\ntype T:\n=========={}",
             ng.debug_info.get(),
             std::any::type_name::<T>()
         );
 
-        // panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
+        panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {

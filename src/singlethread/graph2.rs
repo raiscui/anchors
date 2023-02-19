@@ -12,17 +12,12 @@ pub struct NodeGuard<'gg>(ag::NodeGuard<'gg, Node>);
 
 type NodePtr = ag::NodePtr<Node>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RecalcState {
+    #[default]
     Needed,
     Pending,
     Ready,
-}
-
-impl Default for RecalcState {
-    fn default() -> Self {
-        RecalcState::Needed
-    }
 }
 
 thread_local! {
@@ -150,7 +145,7 @@ impl crate::expert::AnchorHandle for AnchorHandle {
 impl<'a> std::ops::Deref for NodeGuard<'a> {
     type Target = Node;
     fn deref(&self) -> &Node {
-        &*self.0
+        &self.0
     }
 }
 
@@ -377,7 +372,7 @@ impl Graph2 {
     }
 
     #[cfg(test)]
-    pub fn insert_testing<'a>(&'a self) -> AnchorHandle {
+    pub fn insert_testing(&self) -> AnchorHandle {
         self.insert(
             Box::new(crate::expert::constant::Constant::new_raw_testing(123)),
             AnchorDebugInfo {
@@ -425,7 +420,7 @@ impl Graph2 {
                     ptrs: NodePtrs {
                         clean_parent0: Cell::new(None),
                         clean_parents: RefCell::new(vec![]),
-                        graph: &*self,
+                        graph: self,
                         next: Cell::new(None),
                         prev: Cell::new(None),
                         recalc_state: Cell::new(RecalcState::Needed),
@@ -528,7 +523,7 @@ unsafe fn free(ptr: NodePtr) {
     let guard = NodeGuard(ptr.lookup_unchecked());
     let _ = guard.drain_necessary_children();
     let _ = guard.drain_clean_parents();
-    let graph = &*(*guard).ptrs.graph;
+    let graph = &*guard.ptrs.graph;
     dequeue_calc(graph, guard);
     // TODO clear out this node with default empty data
     // TODO add node to chain of free nodes
@@ -580,8 +575,8 @@ mod test {
             assert_eq!(empty, to_vec(a.clean_parents()));
             assert_eq!(empty, to_vec(b.necessary_children()));
             assert_eq!(empty, to_vec(b.clean_parents()));
-            assert_eq!(false, a.necessary_count.get() > 0);
-            assert_eq!(false, b.necessary_count.get() > 0);
+            assert!(a.necessary_count.get() == 0);
+            assert!(b.necessary_count.get() == 0);
 
             assert_eq!(Ok(false), ensure_height_increases(a, b));
             assert_eq!(Ok(true), ensure_height_increases(a, b));
@@ -591,8 +586,8 @@ mod test {
             assert_eq!(vec![b], to_vec(a.clean_parents()));
             assert_eq!(empty, to_vec(b.necessary_children()));
             assert_eq!(empty, to_vec(b.clean_parents()));
-            assert_eq!(false, a.necessary_count.get() > 0);
-            assert_eq!(false, b.necessary_count.get() > 0);
+            assert!(a.necessary_count.get() == 0);
+            assert!(b.necessary_count.get() == 0);
 
             assert_eq!(Ok(true), ensure_height_increases(a, b));
             b.add_necessary_child(a);
@@ -601,8 +596,8 @@ mod test {
             assert_eq!(vec![b], to_vec(a.clean_parents()));
             assert_eq!(vec![a], to_vec(b.necessary_children()));
             assert_eq!(empty, to_vec(b.clean_parents()));
-            assert_eq!(true, a.necessary_count.get() > 0);
-            assert_eq!(false, b.necessary_count.get() > 0);
+            assert!(a.necessary_count.get() > 0);
+            assert!(b.necessary_count.get() == 0);
 
             let _ = a.drain_clean_parents();
 
@@ -610,8 +605,8 @@ mod test {
             assert_eq!(empty, to_vec(a.clean_parents()));
             assert_eq!(vec![a], to_vec(b.necessary_children()));
             assert_eq!(empty, to_vec(b.clean_parents()));
-            assert_eq!(true, a.necessary_count.get() > 0);
-            assert_eq!(false, b.necessary_count.get() > 0);
+            assert!(a.necessary_count.get() > 0);
+            assert!(b.necessary_count.get() == 0);
 
             let _ = b.drain_necessary_children();
 
@@ -619,8 +614,8 @@ mod test {
             assert_eq!(empty, to_vec(a.clean_parents()));
             assert_eq!(empty, to_vec(b.necessary_children()));
             assert_eq!(empty, to_vec(b.clean_parents()));
-            assert_eq!(false, a.necessary_count.get() > 0);
-            assert_eq!(false, b.necessary_count.get() > 0);
+            assert!(a.necessary_count.get() == 0);
+            assert!(b.necessary_count.get() == 0);
         });
     }
 

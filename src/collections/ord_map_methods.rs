@@ -49,7 +49,7 @@ where
                     }
                 }
                 DiffItem::Update {
-                    old: (ok, ov),
+                    old: (ok, _ov),
                     new: (k, v),
                 } => {
                     #[cfg(debug_assertions)]

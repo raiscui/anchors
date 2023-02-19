@@ -345,6 +345,12 @@ impl Engine {
     }
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // skip_self = true indicates output has *definitely* changed, but node has been recalculated
 // skip_self = false indicates node has not yet been recalculated
 fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) {
@@ -507,7 +513,7 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
 
 pub trait GenericAnchor {
     fn dirty(&mut self, child: &NodeKey);
-    fn poll_updated<'eng, 'gg>(&mut self, ctx: &mut EngineContextMut<'eng, 'gg>) -> Poll;
+    fn poll_updated(&mut self, ctx: &mut EngineContextMut<'_, '_>) -> Poll;
     fn output<'slf, 'out>(&'slf self, ctx: &mut EngineContext<'out>) -> &'out dyn Any
     where
         'slf: 'out;
@@ -517,7 +523,7 @@ impl<I: AnchorInner<Engine> + 'static> GenericAnchor for I {
     fn dirty(&mut self, child: &NodeKey) {
         AnchorInner::dirty(self, child)
     }
-    fn poll_updated<'eng, 'gg>(&mut self, ctx: &mut EngineContextMut<'eng, 'gg>) -> Poll {
+    fn poll_updated(&mut self, ctx: &mut EngineContextMut<'_, '_>) -> Poll {
         AnchorInner::poll_updated(self, ctx)
     }
     fn output<'slf, 'out>(&'slf self, ctx: &mut EngineContext<'out>) -> &'out dyn Any

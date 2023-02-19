@@ -12,7 +12,7 @@ impl<I: 'static + Clone, E: Engine, const S: usize> std::iter::FromIterator<Anch
     where
         T: IntoIterator<Item = Anchor<I, E>>,
     {
-        SmallVecCollect::new(iter.into_iter().collect())
+        SmallVecCollect::new_to_anchor(iter.into_iter().collect())
     }
 }
 
@@ -23,7 +23,7 @@ impl<'a, I: 'static + Clone, E: Engine, const S: usize> std::iter::FromIterator<
     where
         T: IntoIterator<Item = &'a Anchor<I, E>>,
     {
-        SmallVecCollect::new(iter.into_iter().cloned().collect())
+        SmallVecCollect::new_to_anchor(iter.into_iter().cloned().collect())
     }
 }
 
@@ -36,7 +36,7 @@ struct SmallVecCollect<T, E: Engine, const S: usize> {
 
 impl<T: 'static + Clone, E: Engine, const S: usize> SmallVecCollect<T, E, S> {
     #[track_caller]
-    pub fn new(anchors: SmallVec<[Anchor<T, E>; S]>) -> Anchor<SmallVec<[T; S]>, E> {
+    pub fn new_to_anchor(anchors: SmallVec<[Anchor<T, E>; S]>) -> Anchor<SmallVec<[T; S]>, E> {
         E::mount(Self {
             anchors,
             vals: None,

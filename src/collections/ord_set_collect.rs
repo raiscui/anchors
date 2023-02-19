@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-07-11 22:12:01
- * @LastEditTime: 2023-02-14 15:29:25
+ * @LastEditTime: 2023-02-17 10:46:44
  * @LastEditors: Rais
  * @Description:
  */
@@ -23,7 +23,7 @@ where
     where
         T: IntoIterator<Item = Anchor<I, E>>,
     {
-        OrdSetCollect::new(iter.into_iter().collect())
+        OrdSetCollect::new_to_anchor(iter.into_iter().collect())
     }
 }
 
@@ -36,7 +36,7 @@ where
     where
         T: IntoIterator<Item = &'a Anchor<I, E>>,
     {
-        OrdSetCollect::new(iter.into_iter().cloned().collect())
+        OrdSetCollect::new_to_anchor(iter.into_iter().cloned().collect())
     }
 }
 
@@ -52,7 +52,7 @@ where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
 {
     #[track_caller]
-    pub fn new(anchors: OrdSet<Anchor<T, E>>) -> Anchor<OrdSet<T>, E> {
+    pub fn new_to_anchor(anchors: OrdSet<Anchor<T, E>>) -> Anchor<OrdSet<T>, E> {
         E::mount(Self {
             anchors,
             vals: None,
@@ -124,7 +124,7 @@ mod test {
 
     #[test]
     fn find_change() {
-        let mut engine = Engine::new();
+        let mut _engine = Engine::new();
 
         let a = Var::new(1);
         let aw = a.watch();

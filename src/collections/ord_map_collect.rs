@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-02-14 15:36:50
+ * @LastEditTime: 2023-02-17 10:45:42
  * @LastEditors: Rais
  * @Description:
  */
@@ -25,7 +25,7 @@ where
     where
         T: IntoIterator<Item = (I, Anchor<V, E>)>,
     {
-        OrdMapCollect::new(iter.into_iter().collect())
+        OrdMapCollect::new_to_anchor(iter.into_iter().collect())
     }
 }
 
@@ -41,7 +41,7 @@ where
     where
         T: IntoIterator<Item = &'a (I, Anchor<V, E>)>,
     {
-        OrdMapCollect::new(iter.into_iter().cloned().collect())
+        OrdMapCollect::new_to_anchor(iter.into_iter().cloned().collect())
     }
 }
 
@@ -57,7 +57,7 @@ where
     where
         T: IntoIterator<Item = (&'a I, &'a Anchor<V, E>)>,
     {
-        OrdMapCollect::new(
+        OrdMapCollect::new_to_anchor(
             iter.into_iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
@@ -81,7 +81,7 @@ where
     OrdMap<I, V>: std::cmp::Eq,
 {
     #[track_caller]
-    pub fn new(anchors: OrdMap<I, Anchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
+    pub fn new_to_anchor(anchors: OrdMap<I, Anchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
         E::mount(Self {
             anchors,
             vals: None,
@@ -129,9 +129,9 @@ where
             self.dirty = false;
 
             if let Some(ref mut old_vals) = self.vals {
-                for (poll, (&ref i, &ref anchor)) in polls.unwrap().iter() {
+                for (poll, (i, anchor)) in polls.unwrap().iter() {
                     if &Poll::Updated == poll {
-                        old_vals.insert(i.clone(), ctx.get(anchor).clone());
+                        old_vals.insert((**i).clone(), ctx.get(anchor).clone());
                         changed = true;
                     }
                 }
@@ -187,15 +187,11 @@ mod test {
             nums
         });
         let sum: Anchor<usize> = nums.map(|nums| nums.values().sum());
-        assert_eq!(engine.get(&sum),8);
+        assert_eq!(engine.get(&sum), 8);
         f.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
-        assert_eq!(engine.get(&sum),8);
+        assert_eq!(engine.get(&sum), 8);
         f.set(dict!(10usize=>d.watch(),2usize=>b.watch(),3usize=>c.watch()));
-        assert_eq!(engine.get(&sum),17);
-
-
-
-
+        assert_eq!(engine.get(&sum), 17);
     }
 
     #[test]
@@ -217,7 +213,7 @@ mod test {
             })
         };
 
-        let bw = bcut.map(|v| {
+        let _bw = bcut.map(|v| {
             println!("b change");
             *v
         });
