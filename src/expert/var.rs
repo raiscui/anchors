@@ -1,4 +1,3 @@
-use imbl::HashMap;
 use tracing::{debug_span, trace, warn};
 
 use crate::singlethread::AnchorToken;
@@ -265,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_var_eq() {
-        let engine = Engine::new();
+        let _engine = Engine::new();
         let a = Var::new(1);
         let b = a.clone();
         a.set(2);

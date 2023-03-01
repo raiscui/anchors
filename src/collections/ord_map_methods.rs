@@ -1,4 +1,4 @@
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::{
     expert::MultiAnchor,

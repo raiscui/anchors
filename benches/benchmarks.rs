@@ -354,6 +354,11 @@ criterion_group! {
     targets = ord_map_anchor,ord_map
 
 }
+criterion_group! {
+    name = ord_map_a;
+    config = Criterion::default();
+    targets = ord_map_anchor
 
-criterion_main!(all);
-// criterion_main!(map);
+}
+// criterion_main!(all);
+criterion_main!(ord_map_a);

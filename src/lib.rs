@@ -13,6 +13,7 @@ pub mod singlethread;
 // pub use crate::im as im;
 pub use imbl as im;
 #[cfg(test)]
+#[allow(unused_variables)]
 mod tests {
     use crate::{
         dict,

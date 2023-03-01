@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-03-01 11:44:18
+ * @LastEditTime: 2023-03-01 21:08:25
  * @LastEditors: Rais
  * @Description:
  */
@@ -32,7 +32,7 @@ where
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    OrdMap<I, V>: std::cmp::Eq,
+    // OrdMap<I, V>: std::cmp::Eq,
 {
     fn from_iter<T>(iter: T) -> Self
     where
@@ -48,7 +48,7 @@ where
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    OrdMap<I, V>: std::cmp::Eq,
+    // OrdMap<I, V>: std::cmp::Eq,
 {
     fn from_iter<T>(iter: T) -> Self
     where
@@ -64,7 +64,7 @@ where
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    OrdMap<I, V>: std::cmp::Eq,
+    // OrdMap<I, V>: std::cmp::Eq,
 {
     fn from_iter<T>(iter: T) -> Self
     where
@@ -91,7 +91,7 @@ where
     V: std::clone::Clone + 'static,
     //TODO 通过特化 制作PartialEq版本, (im_rc 在 PartialEq 的情况下 对比 ,没有Eq 性能高)
     //TODO 制作 vector smallvec 的对比版本
-    OrdMap<I, V>: std::cmp::Eq,
+    // OrdMap<I, V>: std::cmp::Eq,
 {
     #[track_caller]
     pub fn new_to_anchor(anchors: OrdMap<I, Anchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
@@ -110,7 +110,7 @@ where
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    OrdMap<I, V>: std::cmp::Eq,
+    // OrdMap<I, V>: std::cmp::Eq,
 {
     type Output = OrdMap<I, V>;
     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
@@ -224,7 +224,7 @@ mod test {
         assert_eq!(engine.get(&sum), 17);
         // ─────────────────────────────────────────────────────────────
 
-        let f2 = Var::new(dict.clone());
+        let f2 = Var::new(dict);
 
         let watch = f2.watch();
         let nums2: Anchor<OrdMap<_, _>> = watch.into();
