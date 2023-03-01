@@ -5,8 +5,8 @@ use anchors::{
 
 use smallvec::{smallvec, SmallVec};
 
+use anchors::im::{ordmap, vector, Vector};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use im_rc::{ordmap, vector, Vector};
 
 fn stabilize_linear_nodes_simple(c: &mut Criterion) {
     for node_count in &[10, 100, 1000] {
@@ -280,6 +280,52 @@ fn ord_map_anchor(c: &mut Criterion) {
     }
 }
 
+fn ord_map(c: &mut Criterion) {
+    for node_count in &[10, 100, 1000] {
+        {
+            let observed = &false;
+            c.bench_with_input(
+                BenchmarkId::new(
+                    "ord_map",
+                    format!(
+                        "{}/{}",
+                        node_count,
+                        if *observed { "observed" } else { "unobserved" }
+                    ),
+                ),
+                &(*node_count, *observed),
+                |b, (node_count, observed)| {
+                    let first_num = 0u64;
+                    let node = first_num;
+
+                    let mut v = ordmap! {"-1".to_string()=> node};
+                    for i in 0..*node_count {
+                        let node_x = 1;
+                        v.insert(i.to_string(), node_x);
+                    }
+
+                    let count_va: u64 = v.values().sum();
+
+                    assert_eq!(count_va, *node_count);
+                    // println!(
+                    //     "node count: {}  count_va {}",
+                    //     node_count,
+                    //     engine.get(&count_va)
+                    // );
+                    let mut update_number = 0;
+                    b.iter(|| {
+                        update_number += 1;
+                        *v.get_mut("-1").unwrap() = update_number;
+                        let count_va: u64 = v.values().sum();
+
+                        assert_eq!(count_va, update_number + *node_count);
+                    });
+                },
+            );
+        }
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
@@ -302,4 +348,12 @@ criterion_group! {
     targets = stabilize_linear_nodes_cutoff, stabilize_linear_nodes_not_cutoff,stabilize_linear_nodes_simple,vector_anchor,sm_vector_anchor,ord_map_anchor
 }
 
+criterion_group! {
+    name = map;
+    config = Criterion::default();
+    targets = ord_map_anchor,ord_map
+
+}
+
 criterion_main!(all);
+// criterion_main!(map);

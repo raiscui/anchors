@@ -1,3 +1,4 @@
+use imbl::HashMap;
 use tracing::{debug_span, trace, warn};
 
 use crate::singlethread::AnchorToken;
@@ -212,5 +213,62 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
         'slf: 'out,
     {
         &self.val
+    }
+}
+
+// impl<E: Engine, K, V, S> AnchorInner<E> for VarAnchor<HashMap<K, V, S>, E> {
+//     type Output = HashMap<K, V, S>;
+//     fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+//         let _span = debug_span!("anchors-dirty").entered();
+//         let e = edge as &dyn Any;
+//         let ee = e.downcast_ref::<AnchorToken>().unwrap();
+//         let ng = unsafe { ee.ptr.lookup_unchecked() };
+//         warn!(
+//             "VarAnchor dirty, debug_info=\n=========={:?}\ntype T:\n=========={}",
+//             ng.debug_info.get(),
+//             std::any::type_name::<HashMap<K, V, S>>()
+//         );
+
+//         panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
+//     }
+
+//     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
+//         trace!("poll_updated");
+//         let mut inner = self.inner.borrow_mut();
+//         let first_update = inner.dirty_handle.is_none();
+//         if first_update {
+//             inner.dirty_handle = Some(ctx.dirty_handle());
+//         }
+//         let res = if inner.value_changed {
+//             self.val = inner.val.clone();
+//             Poll::Updated
+//         } else {
+//             Poll::Unchanged
+//         };
+//         inner.value_changed = false;
+//         res
+//     }
+
+//     fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
+//         &'slf self,
+//         _ctx: &mut G,
+//     ) -> &'out Self::Output
+//     where
+//         'slf: 'out,
+//     {
+//         &self.val
+//     }
+// }
+#[cfg(test)]
+mod tests {
+    use crate::singlethread::{Engine, Var};
+
+    #[test]
+    fn test_var_eq() {
+        let engine = Engine::new();
+        let a = Var::new(1);
+        let b = a.clone();
+        a.set(2);
+        assert_eq!(a, b);
     }
 }

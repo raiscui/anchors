@@ -1,9 +1,36 @@
-use im_rc::Vector;
+use crate::im::Vector;
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
 };
 use std::panic::Location;
+
+use super::ord_map_methods::Dict;
+
+impl<I, V, E> From<Anchor<Dict<I, Anchor<V, E>>, E>> for Anchor<Vector<V>, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    V: std::clone::Clone + 'static,
+    I: 'static + Clone + std::cmp::Ord,
+    E: Engine,
+    // OrdMap<I, V>: std::cmp::Eq,
+{
+    fn from(value: Anchor<Dict<I, Anchor<V, E>>, E>) -> Self {
+        value.then(|v| VectorCollect::new_to_anchor(v.values().cloned().collect()))
+    }
+}
+
+impl<V, E> From<Anchor<Vector<Anchor<V, E>>, E>> for Anchor<Vector<V>, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    V: std::clone::Clone + 'static,
+    E: Engine,
+    // OrdMap<I, V>: std::cmp::Eq,
+{
+    fn from(value: Anchor<Vector<Anchor<V, E>>, E>) -> Self {
+        value.then(|v| VectorCollect::new_to_anchor(v.clone()))
+    }
+}
 
 impl<I: 'static + Clone, E: Engine> std::iter::FromIterator<Anchor<I, E>> for Anchor<Vector<I>, E> {
     fn from_iter<T>(iter: T) -> Self
@@ -25,7 +52,7 @@ impl<'a, I: 'static + Clone, E: Engine> std::iter::FromIterator<&'a Anchor<I, E>
     }
 }
 
-struct VectorCollect<T, E: Engine> {
+pub struct VectorCollect<T, E: Engine> {
     anchors: Vector<Anchor<T, E>>,
     vals: Option<Vector<T>>,
     location: &'static Location<'static>,
@@ -130,7 +157,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
 #[cfg(test)]
 mod test {
 
-    use im_rc::{vector, Vector};
+    use crate::im::{vector, Vector};
 
     use crate::singlethread::*;
 

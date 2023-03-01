@@ -1,17 +1,30 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-02-17 10:45:42
+ * @LastEditTime: 2023-03-01 11:44:18
  * @LastEditors: Rais
  * @Description:
  */
 
-use im_rc::OrdMap;
+use crate::im::OrdMap;
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
 };
 use std::panic::Location;
+
+impl<I, V, E> From<Anchor<OrdMap<I, Anchor<V, E>>, E>> for Anchor<OrdMap<I, V>, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    V: std::clone::Clone + 'static,
+    I: 'static + Clone + std::cmp::Ord,
+    E: Engine,
+    // OrdMap<I, V>: std::cmp::Eq,
+{
+    fn from(value: Anchor<OrdMap<I, Anchor<V, E>>, E>) -> Self {
+        value.then(|v| OrdMapCollect::new_to_anchor(v.clone()))
+    }
+}
 
 impl<I, V, E> std::iter::FromIterator<(I, Anchor<V, E>)> for Anchor<OrdMap<I, V>, E>
 where
@@ -171,9 +184,10 @@ where
 #[cfg(test)]
 mod test {
 
-    use im_rc::OrdMap;
+    use crate::{collections::ord_map_collect::OrdMapCollect, im::OrdMap};
 
     use crate::{dict, singlethread::*};
+
     #[test]
     fn collect_k_change() {
         let mut engine = Engine::new();
@@ -181,7 +195,9 @@ mod test {
         let b = Var::new(2);
         let c = Var::new(5);
         let d = Var::new(10);
-        let f = Var::new(dict!(1usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        let dict = dict!(1usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch());
+        let f = Var::new(dict.clone());
+
         let nums = f.watch().then(|d| {
             let nums: Anchor<OrdMap<_, _>> = d.into_iter().collect();
             nums
@@ -191,6 +207,32 @@ mod test {
         f.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
         assert_eq!(engine.get(&sum), 8);
         f.set(dict!(10usize=>d.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        assert_eq!(engine.get(&sum), 17);
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        let f2 = Var::new(dict.clone());
+
+        let nums2 = f2.watch().then(|d| {
+            let nums2: Anchor<OrdMap<_, _>> = OrdMapCollect::new_to_anchor(d.clone());
+            nums2
+        });
+        let sum: Anchor<usize> = nums2.map(|nums| nums.values().sum());
+        assert_eq!(engine.get(&sum), 8);
+        f2.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        assert_eq!(engine.get(&sum), 8);
+        f2.set(dict!(10usize=>d.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        assert_eq!(engine.get(&sum), 17);
+        // ─────────────────────────────────────────────────────────────
+
+        let f2 = Var::new(dict.clone());
+
+        let watch = f2.watch();
+        let nums2: Anchor<OrdMap<_, _>> = watch.into();
+        let sum: Anchor<usize> = nums2.map(|nums| nums.values().sum());
+        assert_eq!(engine.get(&sum), 8);
+        f2.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
+        assert_eq!(engine.get(&sum), 8);
+        f2.set(dict!(10usize=>d.watch(),2usize=>b.watch(),3usize=>c.watch()));
         assert_eq!(engine.get(&sum), 17);
     }
 

@@ -10,7 +10,7 @@ pub struct Map<A, F, Out> {
     pub(super) anchors: A,
     pub(super) location: &'static Location<'static>,
 }
-
+//TODO Out: Eq  case for vector eg
 macro_rules! impl_tuple_map {
     ($([$output_type:ident, $num:tt])+) => {
         impl<$($output_type,)+ E, F, Out> AnchorInner<E> for
