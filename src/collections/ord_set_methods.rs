@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-01-20 17:00:31
- * @LastEditTime: 2023-03-01 16:53:44
+ * @LastEditTime: 2023-03-05 01:03:54
  * @LastEditors: Rais
  * @Description:
  */
@@ -129,8 +129,8 @@ impl<E: Engine, K: Clone + Ord + 'static> Anchor<OrdSet<K>, E> {
     #[track_caller]
     pub fn unordered_fold<
         T: PartialEq + Clone + 'static,
-        // F: for<'a> FnMut(&mut T, DiffItem<'a, K>, usize) -> bool + 'static,
-        F: for<'a, 'b> FnMut(&mut T, DiffItem<'a, 'b, K>, usize) -> bool + 'static,
+        F: for<'a> FnMut(&mut T, DiffItem<'a, K>, usize) -> bool + 'static,
+        // F: for<'a, 'b> FnMut(&mut T, DiffItem<'a, 'b, K>, usize) -> bool + 'static,
     >(
         &self,
         initial_state: T,

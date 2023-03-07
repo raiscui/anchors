@@ -10,8 +10,8 @@ pub mod singlethread;
 
 // ────────────────────────────────────────────────────────────────────────────────
 
-// pub use crate::im as im;
-pub use imbl as im;
+// pub use imbl as im;
+pub use im_rc as im;
 #[cfg(test)]
 #[allow(unused_variables)]
 mod tests {

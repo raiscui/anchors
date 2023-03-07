@@ -221,8 +221,8 @@ where
     #[track_caller]
     pub fn unordered_fold<
         T: PartialEq + Clone + 'static,
-        // F: for<'a> FnMut(&mut T, DiffItem<'a, K, V>, usize) -> bool + 'static,
-        F: for<'a, 'b> FnMut(&mut T, DiffItem<'a, 'b, K, V>, usize) -> bool + 'static,
+        F: for<'a> FnMut(&mut T, DiffItem<'a, K, V>, usize) -> bool + 'static,
+        // F: for<'a, 'b> FnMut(&mut T, DiffItem<'a, 'b, K, V>, usize) -> bool + 'static,
     >(
         &self,
         initial_state: T,
@@ -294,8 +294,8 @@ where
     pub fn unordered_fold_with_anchor<
         A: 'static + std::cmp::PartialEq + Clone,
         T: PartialEq + Clone + 'static,
-        // F: for<'a> FnMut(&mut T, DiffItem<'a, K, V>, usize) -> bool + 'static,
-        F: for<'a, 'b> FnMut(&A, &mut T, DiffItem<'a, 'b, K, V>, usize) -> bool + 'static,
+        // F: for<'a, 'b> FnMut(&A, &mut T, DiffItem<'a, 'b, K, V>, usize) -> bool + 'static,
+        F: for<'a, 'b> FnMut(&A, &mut T, DiffItem<'a, K, V>, usize) -> bool + 'static,
     >(
         &self,
         anchor: &Anchor<A, E>,
@@ -391,7 +391,8 @@ where
 #[cfg(test)]
 mod test {
 
-    use imbl::ordmap;
+    // use imbl::ordmap;
+    use crate::im::ordmap;
 
     use crate::singlethread::Var;
 

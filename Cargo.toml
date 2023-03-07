@@ -15,14 +15,14 @@ repository = "https://github.com/lord/anchors"
 [features]
 default = []
 # pool = ["im-rc/pool"]
-pool = []
+# pool = []
 
 
 [dependencies]
 cfg-if = "1.0.0"
+im-rc = { version = "15.1.0", features = ["pool"] }
 
-# im-rc = { version = "15.1.0" }
-imbl = "2.0.0"
+# imbl = "2.0.0"
 
 # typed-arena = { version = "2.0.1" }
 arena-graph = { version = "0.1.0", path = "../arena-graph" }
@@ -30,10 +30,10 @@ arena-graph = { version = "0.1.0", path = "../arena-graph" }
 tracing = { version = "^0.1" }
 smallvec = { version = "1.10.0", features = ["const_generics"] }
 rustc-hash = "1.1.0"
+
+
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["html_reports", "real_blackbox"] }
-
-# im-rc = { version = "15.1.0", features = ["debug"] }
 
 
 [[bench]]
