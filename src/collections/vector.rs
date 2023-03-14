@@ -1,3 +1,5 @@
+use im_rc::vector;
+
 use crate::im::Vector;
 
 use crate::expert::{
@@ -111,13 +113,25 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
                     }
                 }
             } else {
-                self.vals = Some(
-                    self.anchors
-                        .iter()
-                        .map(|anchor| ctx.get(anchor).clone())
-                        .collect(),
-                );
+                let pool = vector::RRBPool::<T>::new(self.anchors.len());
+                let mut vals = Vector::with_pool(&pool);
+                self.anchors
+                    .iter()
+                    .map(|anchor| ctx.get(anchor).clone())
+                    .collect_into(&mut vals);
+
+                self.vals = Some(vals);
                 changed = true;
+
+                // ─────────────────────────────────────────────
+
+                // self.vals = Some(
+                //     self.anchors
+                //         .iter()
+                //         .map(|anchor| ctx.get(anchor).clone())
+                //         .collect(),
+                // );
+                // changed = true;
             }
 
             // ─────────────────────────────────────────────────────

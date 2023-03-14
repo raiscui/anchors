@@ -2,7 +2,8 @@
 #![feature(exact_size_is_empty)]
 #![feature(specialization)]
 #![feature(option_result_contains)] //for with_anchor func
-                                    // ─────────────────────────────────────────────────────────────────────────────
+#![feature(iter_collect_into)]
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub mod collections;
 pub mod expert;

@@ -1,10 +1,12 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-03-01 21:08:25
+ * @LastEditTime: 2023-03-14 10:58:59
  * @LastEditors: Rais
  * @Description:
  */
+
+use im_rc::ordmap;
 
 use crate::im::OrdMap;
 
@@ -149,12 +151,23 @@ where
                     }
                 }
             } else {
-                self.vals = Some(
-                    self.anchors
-                        .iter()
-                        .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
-                        .collect(),
-                );
+                // self.vals = Some(
+                //     self.anchors
+                //         .iter()
+                //         .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
+                //         .collect(),
+                // );
+                // changed = true;
+
+                let pool = ordmap::OrdMapPool::new(self.anchors.len());
+                let mut dict = OrdMap::with_pool(&pool);
+
+                self.anchors
+                    .iter()
+                    .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
+                    .collect_into(&mut dict);
+
+                self.vals = Some(dict);
                 changed = true;
             }
         }
