@@ -5,7 +5,7 @@ use crate::im::Vector;
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
 };
-use std::panic::Location;
+use std::{any::Any, panic::Location};
 
 use super::ord_map_methods::Dict;
 
@@ -75,7 +75,7 @@ impl<T: 'static + Clone, E: Engine> VectorCollect<T, E> {
 
 impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
     type Output = Vector<T>;
-    fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+    fn dirty(&mut self, child: &<E::AnchorHandle as AnchorHandle>::Token) {
         // self.vals = None;
         self.dirty = true;
     }

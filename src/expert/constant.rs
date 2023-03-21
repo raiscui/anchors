@@ -1,7 +1,9 @@
+use tracing::error;
+
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
 };
-use std::panic::Location;
+use std::{any::Any, panic::Location};
 
 /// An Anchor type for immutable values.
 pub struct Constant<T> {
@@ -39,10 +41,18 @@ impl<T: 'static> Constant<T> {
 
 impl<T: 'static, E: Engine> AnchorInner<E> for Constant<T> {
     type Output = T;
-    fn dirty(&mut self, _child: &<E::AnchorHandle as AnchorHandle>::Token) {
-        panic!(
-            "Constant never has any inputs; dirty should not have been called. alleged child: {:?} ,type: {:?},\nloc{:?}",
-            _child,std::any::type_name::<T>(),
+    fn dirty(&mut self, child: &<E::AnchorHandle as AnchorHandle>::Token) {
+        let e = child as &dyn Any;
+        let ee = e
+            .downcast_ref::<crate::singlethread::AnchorToken>()
+            .unwrap();
+        let ng = unsafe { ee.ptr.lookup_unchecked() };
+
+        error!(
+            "Constant never has any inputs; dirty should not have been called. alleged child: {:?},child info: {:?}  ,type: {:?},\nloc{:?}",
+            child,
+            ng.debug_info.get(),
+            std::any::type_name::<T>(),
             self.location
         )
     }

@@ -15,19 +15,34 @@ where
     Dict<K, V>: PartialEq,
 {
     #[track_caller]
-    pub fn filter<F: FnMut(&K, &V) -> bool + 'static>(&self, mut f: F) -> Anchor<Dict<K, V>, E> {
-        self.filter_map(move |k, v| if f(k, v) { Some(v.clone()) } else { None })
+    pub fn filter<F: FnMut(&K, &V) -> bool + 'static>(
+        &self,
+        pool_size: usize,
+        mut f: F,
+    ) -> Anchor<Dict<K, V>, E> {
+        self.filter_map(
+            pool_size,
+            move |k, v| if f(k, v) { Some(v.clone()) } else { None },
+        )
     }
     #[track_caller]
-    pub fn filter_with_anchor<A, F>(&self, anchor: &Anchor<A, E>, mut f: F) -> Anchor<Dict<K, V>, E>
+    pub fn filter_with_anchor<A, F>(
+        &self,
+        pool_size: usize,
+        anchor: &Anchor<A, E>,
+        mut f: F,
+    ) -> Anchor<Dict<K, V>, E>
     where
         A: 'static + std::cmp::PartialEq + std::clone::Clone,
         F: FnMut(&A, &K, &V) -> bool + 'static,
     {
-        self.filter_map_with_anchor(
-            anchor,
-            move |a, k, v| if f(a, k, v) { Some(v.clone()) } else { None },
-        )
+        self.filter_map_with_anchor(pool_size, anchor, move |a, k, v| {
+            if f(a, k, v) {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
     }
 
     // TODO rlord: fix this name god
@@ -35,9 +50,10 @@ where
     #[track_caller]
     pub fn map_<F: FnMut(&K, &V) -> T + 'static, T: Clone + PartialEq + 'static>(
         &self,
+        pool_size: usize,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        self.filter_map(move |k, v| Some(f(k, v)))
+        self.filter_map(pool_size, move |k, v| Some(f(k, v)))
     }
     #[track_caller]
     pub fn map_with_anchor<
@@ -46,19 +62,24 @@ where
         T: Clone + PartialEq + 'static,
     >(
         &self,
+        pool_size: usize,
         anchor: &Anchor<A, E>,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        self.filter_map_with_anchor(anchor, move |a, k, v| Some(f(a, k, v)))
+        self.filter_map_with_anchor(pool_size, anchor, move |a, k, v| Some(f(a, k, v)))
     }
 
     /// FOOBAR
     #[track_caller]
     pub fn filter_map<F: FnMut(&K, &V) -> Option<T> + 'static, T: Clone + PartialEq + 'static>(
         &self,
+        pool_size: usize,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        self.unordered_fold(Dict::new(), move |out, diff_item, len| {
+        let pool = crate::im::ordmap::OrdMapPool::new(pool_size);
+        let dict = OrdMap::with_pool(&pool);
+
+        self.unordered_fold(dict, move |out, diff_item, len| {
             let out_is_empty = out.is_empty();
             if len == 0 && !out_is_empty {
                 out.clear();
@@ -111,10 +132,14 @@ where
         T: Clone + PartialEq + 'static,
     >(
         &self,
+        pool_size: usize,
         anchor: &Anchor<A, E>,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        self.unordered_fold_with_anchor(anchor, Dict::new(), move |a, out, diff_item, len| {
+        let pool = crate::im::ordmap::OrdMapPool::new(pool_size);
+        let dict = OrdMap::with_pool(&pool);
+
+        self.unordered_fold_with_anchor(anchor, dict, move |a, out, diff_item, len| {
             let out_is_empty = out.is_empty();
             if len == 0 && !out_is_empty {
                 out.clear();
@@ -228,66 +253,28 @@ where
         initial_state: T,
         mut f: F,
     ) -> Anchor<T, E> {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "pool")]{
-                let mut last_observation = Dict::new();
-                let mut initd = false;
-                self.map_mut(initial_state, move |out, this| {
-                    if !initd {
-                        last_observation = Dict::with_pool(this.pool());
-                        initd = true;
-                    }
+        let mut last_observation = Dict::new();
+        self.map_mut(initial_state, move |out, this| {
+            let mut did_update = false;
+            let len = this.len();
+            // if last_observation.len() == 0 && len==0 {
+            //     return false
+            // }
 
-                    let mut did_update = false;
-                    let len = this.len();
-                    // if last_observation.len() == 0 && len==0 {
-                    //     return false
-                    // }
+            // if len == 0 && last_observation.len() != 0{
+            //     out.clear();
+            //     last_observation.clear();
+            //     return true;
+            // }
 
-                    // if len == 0 && last_observation.len() != 0{
-                    //     out.clear();
-                    //     last_observation.clear();
-                    //     return true;
-                    // }
-
-                    for item in last_observation.diff(this) {
-                        if f(out, item, len) {
-                            did_update = true;
-                        }
-                    }
-                    last_observation = this.clone();
-                    did_update
-                })
-            }else{
-
-                let mut last_observation = Dict::new();
-                self.map_mut(initial_state, move |out, this| {
-
-
-                    let mut did_update = false;
-                    let len = this.len();
-                    // if last_observation.len() == 0 && len==0 {
-                    //     return false
-                    // }
-
-                    // if len == 0 && last_observation.len() != 0{
-                    //     out.clear();
-                    //     last_observation.clear();
-                    //     return true;
-                    // }
-
-                    for item in last_observation.diff(this) {
-                        if f(out, item, len) {
-                            did_update = true;
-                        }
-                    }
-                    last_observation = this.clone();
-                    did_update
-                })
-
+            for item in last_observation.diff(this) {
+                if f(out, item, len) {
+                    did_update = true;
+                }
             }
-
-        }
+            last_observation = this.clone();
+            did_update
+        })
     }
 
     ///如果 anchor 更改, 则全部元素执行func
@@ -302,89 +289,40 @@ where
         initial_state: T,
         mut f: F,
     ) -> Anchor<T, E> {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "pool")]{
-                let mut last_observation = Dict::new();
-                let mut last_observation_a = None;
-                let initial_state_save = initial_state.clone();
+        let mut last_observation = Dict::new();
+        let mut last_observation_a = None;
+        let initial_state_save = initial_state.clone();
 
-                let mut initd = false;
-                (anchor,self).map_mut(initial_state, move |mut out,a, this| {
-                    if !initd {
-                        last_observation = Dict::with_pool(this.pool());
-                        initd = true;
-                    }
+        (anchor, self).map_mut(initial_state, move |out, a, this| {
+            // debug!("a {:?}",a);
+            let mut did_update = false;
+            let len = this.len();
+            // if last_observation.len() == 0 && len==0 {
+            //     return false
+            // }
 
-                    let mut did_update = false;
-                    let len = this.len();
-                    // if last_observation.len() == 0 && len==0 {
-                    //     return false
-                    // }
+            // if len == 0 && last_observation.len() != 0{
+            //     out.clear();
+            //     last_observation.clear();
+            //     return true;
+            // }
 
-                    // if len == 0 && last_observation.len() != 0{
-                    //     out.clear();
-                    //     last_observation.clear();
-                    //     return true;
-                    // }
-
-                    if !last_observation_a.contains(a) {
-                        last_observation.clear();
-                       * out  =initial_state_save.clone();
-
-                    }
-
-                    for item in last_observation.diff(this) {
-                        if f(a,out, item, len) {
-                            did_update = true;
-                        }
-                    }
-                    last_observation = this.clone();
-                    last_observation_a = Some(a.clone());
-                    did_update
-                })
-            }else{
-
-                let mut last_observation = Dict::new();
-                let mut last_observation_a = None;
-                let initial_state_save = initial_state.clone();
-
-                (anchor,self).map_mut(initial_state, move | out, a,this| {
-
-                    // debug!("a {:?}",a);
-                    let mut did_update = false;
-                    let len = this.len();
-                    // if last_observation.len() == 0 && len==0 {
-                    //     return false
-                    // }
-
-                    // if len == 0 && last_observation.len() != 0{
-                    //     out.clear();
-                    //     last_observation.clear();
-                    //     return true;
-                    // }
-
-
-                    if !last_observation_a.contains(a) {
-
-                        last_observation.clear();
-                       * out  =initial_state_save.clone();
-                    }
-
-                    for item in last_observation.diff(this) {
-                        if f(a,out, item, len) {
-                            debug!("did Updated");
-                            did_update = true;
-                        }
-                    }
-                    last_observation = this.clone();
-                    last_observation_a = Some(a.clone());
-
-                    did_update
-                })
-
+            if !last_observation_a.contains(a) {
+                last_observation.clear();
+                *out = initial_state_save.clone();
             }
 
-        }
+            for item in last_observation.diff(this) {
+                if f(a, out, item, len) {
+                    debug!("did Updated");
+                    did_update = true;
+                }
+            }
+            last_observation = this.clone();
+            last_observation_a = Some(a.clone());
+
+            did_update
+        })
     }
 }
 
@@ -411,7 +349,7 @@ mod test {
 
         let var_1 = Var::new("b");
         let anchor1 = var_1.watch();
-        let filtered = a.watch().filter_map_with_anchor(&anchor1, |aa, k, v| {
+        let filtered = a.watch().filter_map_with_anchor(10, &anchor1, |aa, k, v| {
             debug!("k={} a={}", k, aa);
             if k != aa {
                 Some(*v)
@@ -437,7 +375,7 @@ mod test {
         let a = Var::new(dict.clone());
         let var_1 = Var::new("b");
         let anchor1 = var_1.watch();
-        let filtered = a.watch().filter_map_with_anchor(&anchor1, |aa, k, v| {
+        let filtered = a.watch().filter_map_with_anchor(8, &anchor1, |aa, k, v| {
             debug!("k={} a={}", k, aa);
             if k != aa {
                 Some(*v)
@@ -481,7 +419,7 @@ mod test {
         let mut engine = crate::singlethread::Engine::new();
         let mut dict = Dict::new();
         let a = crate::expert::Var::new(dict.clone());
-        let b = a.watch().filter(|_, n| *n > 10);
+        let b = a.watch().filter(0, |_, n| *n > 10);
         let b_out = engine.get(&b);
         assert_eq!(0, b_out.len());
 
@@ -511,7 +449,7 @@ mod test {
         let mut engine = crate::singlethread::Engine::new();
         let mut dict = Dict::new();
         let a = crate::expert::Var::new(dict.clone());
-        let b = a.watch().map_(|_, n| *n + 1);
+        let b = a.watch().map_(4, |_, n| *n + 1);
         let b_out = engine.get(&b);
         assert_eq!(0, b_out.len());
 

@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-01-20 17:00:31
- * @LastEditTime: 2023-03-05 01:03:54
+ * @LastEditTime: 2023-03-17 14:32:56
  * @LastEditors: Rais
  * @Description:
  */
@@ -236,7 +236,7 @@ mod test {
         let mut engine = crate::singlethread::Engine::new();
         let mut dict = Dict::new();
         let a = crate::expert::Var::new(dict.clone());
-        let b = a.watch().map_(|_, n| *n + 1);
+        let b = a.watch().map_(1, |_, n| *n + 1);
         let b_out = engine.get(&b);
         assert_eq!(0, b_out.len());
 

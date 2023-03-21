@@ -173,18 +173,19 @@ impl<T: 'static, E: Engine> Var<T, E> {
 
 impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
     type Output = T;
-    fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        let _span = debug_span!("anchors-dirty").entered();
-        let e = edge as &dyn Any;
-        let ee = e.downcast_ref::<AnchorToken>().unwrap();
+    fn dirty(&mut self, child: &<E::AnchorHandle as AnchorHandle>::Token) {
+        let e = child as &dyn Any;
+        let ee = e
+            .downcast_ref::<crate::singlethread::AnchorToken>()
+            .unwrap();
         let ng = unsafe { ee.ptr.lookup_unchecked() };
-        warn!(
-            "VarAnchor dirty, debug_info=\n=========={:?}\ntype T:\n=========={}",
-            ng.debug_info.get(),
-            std::any::type_name::<T>()
-        );
 
-        panic!("somehow an input was dirtied on VarAnchor; it never has any inputs to dirty")
+        println!(
+            "dirty,  child: {:?},child info: {:?}  ,type: {:?}",
+            child,
+            ng.debug_info.get(),
+            std::any::type_name::<T>(),
+        );
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
@@ -260,14 +261,47 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
 // }
 #[cfg(test)]
 mod tests {
-    use crate::singlethread::{Engine, Var};
+    use crate::{
+        expert::{Constant, MultiAnchor},
+        singlethread::{Engine, Var},
+    };
 
     #[test]
     fn test_var_eq() {
-        let _engine = Engine::new();
-        let a = Var::new(1);
-        let b = a.clone();
-        a.set(2);
-        assert_eq!(a, b);
+        let mut engine = Engine::new();
+
+        // 创建锚点 a 和 b
+        let a = Constant::new_internal(1);
+        let a2 = Var::new(2);
+        let b = (&a, &a2.watch()).map(|x, xx| x + xx);
+        let n = Var::new(1);
+        let n2 = Var::new(2);
+        let n1 = n.clone();
+        let n12 = n2.clone();
+        let n11 = n.clone();
+        let n22 = Constant::new_internal(1);
+        let n222 = n22.clone();
+
+        let c = b.then(move |x| if *x > 3 { n22.clone() } else { n11.watch() });
+
+        let c2 = c.map(move |x| if *x > 3 { n12.clone() } else { n1.clone() });
+
+        let d = c2.then(move |x| n222.clone());
+
+        let val = engine.get(&b);
+        println!("val: {:?}", val);
+
+        println!("val: {:?}", engine.get(&c));
+        println!("val: {:?}", engine.get(&c2).get());
+        println!("val: {:?}", engine.get(&c));
+        println!("val: {:?}", engine.get(&c2).get());
+
+        println!("val: {:?}", engine.get(&d));
+        n.set(7);
+        n2.set(7);
+        println!("val: {:?}", engine.get(&d));
+        println!("val: {:?}", engine.get(&d));
+        println!("val: {:?}", engine.get(&c));
+        println!("val: {:?}", engine.get(&c2).get());
     }
 }
