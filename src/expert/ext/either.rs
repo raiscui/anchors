@@ -3,7 +3,7 @@ use tracing::debug;
 /*
  * @Author: Rais
  * @Date: 2023-03-23 12:55:22
- * @LastEditTime: 2023-03-24 14:56:40
+ * @LastEditTime: 2023-03-24 16:39:10
  * @LastEditors: Rais
  * @Description:
  */
@@ -20,130 +20,257 @@ pub struct Either<A, Out, F, E: Engine> {
     pub(super) location: &'static Location<'static>,
 }
 
-impl<O0, E, F, Out> AnchorInner<E> for Either<(Anchor<O0, E>,), Out, F, E>
-where
-    F: for<'any> FnMut(&'any O0) -> EitherAnchor<Out, E>,
-    Out: PartialEq + 'static + std::fmt::Debug,
-    O0: 'static,
-    E: Engine,
-{
-    type Output = Out;
-    fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        // return self.output_stale = true;
-        debug!("either in dirty");
-        if edge == &self.anchors.0.data.token() {
-            debug!("either ---is dirty");
+macro_rules! impl_tuple_either {
+    ($([$output_type:ident, $num:tt])+) => {
+        impl<$($output_type,)+ E, F, Out> AnchorInner<E> for
+        Either<( $(Anchor<$output_type, E>,)+ ), Out, F, E>
+        where
+            F: for<'any> FnMut($(&'any $output_type),+) -> EitherAnchor<Out, E>,
+            Out: PartialEq + 'static,
+            $(
+                $output_type: 'static,
+            )+
+            E: Engine,
+        {
+            type Output = Out;
+            fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+                $(
+                    // only invalidate either_anchor if one of the lhs anchors is invalidated
+                    if edge == &self.anchors.$num.data.token() {
+                        self.output_stale = true;
+                        return;
+                    }
+                )+
 
-            self.output_stale = true;
-            return;
-        }
-    }
-    fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
-        let mut poll = Poll::Unchanged;
-        if self.either_anchor.is_none() || self.output_stale {
-            debug!("either changed");
-
-            let mut found_pending = false;
-            let mut found_updated = false;
-            match ctx.request(&self.anchors.0, true) {
-                Poll::Pending => {
-                    debug!("either parent pending");
-
-                    found_pending = true;
-                }
-                Poll::Updated => {
-                    debug!("either parent updated ");
-
-                    found_updated = true;
-                }
-                Poll::Unchanged => {
-                    debug!("either parent Unchanged");
-                }
             }
-            if found_pending {
-                return Poll::Pending;
-            }
-            self.output_stale = false;
-            if self.either_anchor.is_none() || found_updated {
-                debug!("either find update");
+            fn poll_updated<G: UpdateContext<Engine=E>>(
+                &mut self,
+                ctx: &mut G,
+            ) -> Poll {
+                let mut poll = Poll::Unchanged;
 
-                let new_either_anchor = (self.f)(ctx.get(&self.anchors.0));
-                match (&self.either_anchor, &new_either_anchor) {
-                    (None, EitherAnchor::Anchor(_)) => {
-                        // poll = Poll::Updated;
-                    }
-                    (None, EitherAnchor::Val(_)) => {
-                        poll = Poll::Updated;
-                    }
+                if self.either_anchor.is_none() || self.output_stale {
+                    let mut found_pending = false;
+                    let mut found_updated = false;
 
-                    (Some(EitherAnchor::Val(_)), EitherAnchor::Anchor(_)) => {
-                        poll = Poll::Updated;
-                    }
-                    (Some(EitherAnchor::Val(a)), EitherAnchor::Val(b)) => {
-                        if a != b {
-                            poll = Poll::Updated;
+                    $(
+                        match ctx.request(&self.anchors.$num, true) {
+                            Poll::Pending => {
+                                found_pending = true;
+                            }
+                            Poll::Updated => {
+                                found_updated = true;
+                            }
+                            Poll::Unchanged => {
+                                // do nothing
+                            }
                         }
-                    }
-                    (Some(EitherAnchor::Anchor(outdated_anchor)), EitherAnchor::Val(_)) => {
-                        debug!("either anchor - val");
+                    )+
 
-                        ctx.unrequest(outdated_anchor);
-                        poll = Poll::Updated;
+                    if found_pending {
+                        return Poll::Pending;
                     }
 
-                    (
-                        Some(EitherAnchor::Anchor(outdated_anchor)),
-                        EitherAnchor::Anchor(new_anchor),
-                    ) => {
-                        debug!("either anchor - anchor");
+                    self.output_stale = false;
 
-                        if outdated_anchor != new_anchor {
-                            ctx.unrequest(outdated_anchor);
-                            poll = Poll::Updated;
+                    if self.either_anchor.is_none() || found_updated {
+
+                        let new_either_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
+
+                        match (&self.either_anchor, &new_either_anchor) {
+                            (None, EitherAnchor::Anchor(_)) => {
+                                // poll = Poll::Updated;
+                            }
+                            (None, EitherAnchor::Val(_)) => {
+                                poll = Poll::Updated;
+                            }
+
+                            (Some(EitherAnchor::Val(_)), EitherAnchor::Anchor(_)) => {
+                                poll = Poll::Updated;
+                            }
+                            (Some(EitherAnchor::Val(a)), EitherAnchor::Val(b)) => {
+                                if a != b {
+                                    poll = Poll::Updated;
+                                }
+                            }
+                            (Some(EitherAnchor::Anchor(outdated_anchor)), EitherAnchor::Val(_)) => {
+                                debug!("either anchor - val");
+
+                                ctx.unrequest(outdated_anchor);
+                                poll = Poll::Updated;
+                            }
+
+                            (
+                                Some(EitherAnchor::Anchor(outdated_anchor)),
+                                EitherAnchor::Anchor(new_anchor),
+                            ) => {
+                                debug!("either anchor - anchor");
+
+                                if outdated_anchor != new_anchor {
+                                    ctx.unrequest(outdated_anchor);
+                                    poll = Poll::Updated;
+                                }
+                            }
                         }
+                        self.either_anchor = Some(new_either_anchor);
                     }
                 }
-                debug!("either reset either_anchor");
 
-                self.either_anchor = Some(new_either_anchor);
+                match self.either_anchor.as_ref().unwrap() {
+                    EitherAnchor::Val(_) => poll,
+                    EitherAnchor::Anchor(an) => match ctx.request(an, true) {
+                        Poll::Updated => Poll::Updated,
+                        Poll::Unchanged => poll,
+                        Poll::Pending => Poll::Pending,
+                    },
+                }
+            }
+            fn output<'slf, 'out, G: OutputContext<'out, Engine=E>>(
+                &'slf self,
+                ctx: &mut G,
+            ) -> &'out Self::Output
+            where
+                'slf: 'out,
+            {
+                match self.either_anchor.as_ref().unwrap() {
+                    EitherAnchor::Val(v) => v,
+                    EitherAnchor::Anchor(an) => ctx.get(an),
+                }
+            }
+
+            fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
+                Some(("either", self.location))
             }
         }
+    }
+}
 
-        match self.either_anchor.as_ref().unwrap() {
-            EitherAnchor::Val(_) => poll,
-            EitherAnchor::Anchor(an) => match ctx.request(an, true) {
-                Poll::Updated => Poll::Updated,
-                Poll::Unchanged => poll,
-                Poll::Pending => Poll::Pending,
-            },
-        }
-    }
-    fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
-        &'slf self,
-        ctx: &mut G,
-    ) -> &'out Self::Output
-    where
-        'slf: 'out,
-    {
-        match self.either_anchor.as_ref().unwrap() {
-            EitherAnchor::Val(v) => {
-                debug!("either output:{v:?} ");
+impl_tuple_either! {
+    [O0, 0]
+}
 
-                v
-            }
-            EitherAnchor::Anchor(an) => ctx.get(an),
-        }
-    }
-    fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
-        Some(("Either", self.location))
-    }
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+}
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+    [O2, 2]
+}
+
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+    [O2, 2]
+    [O3, 3]
+}
+
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+    [O2, 2]
+    [O3, 3]
+    [O4, 4]
+}
+
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+    [O2, 2]
+    [O3, 3]
+    [O4, 4]
+    [O5, 5]
+}
+
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+    [O2, 2]
+    [O3, 3]
+    [O4, 4]
+    [O5, 5]
+    [O6, 6]
+}
+
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+    [O2, 2]
+    [O3, 3]
+    [O4, 4]
+    [O5, 5]
+    [O6, 6]
+    [O7, 7]
+}
+
+impl_tuple_either! {
+    [O0, 0]
+    [O1, 1]
+    [O2, 2]
+    [O3, 3]
+    [O4, 4]
+    [O5, 5]
+    [O6, 6]
+    [O7, 7]
+    [O8, 8]
 }
 
 #[cfg(test)]
 mod tests {
     use tracing::debug;
 
-    use crate::singlethread::{Engine, Var, VarEA};
+    use crate::{
+        expert::MultiAnchor,
+        singlethread::{Engine, Var, VarEA},
+    };
+
+    #[test]
+    fn either_tuple() {
+        let mut engine = Engine::new();
+
+        let a = VarEA::new(1);
+        let b = Var::new(2);
+        let c = Var::new(3);
+        let d = Var::new(4);
+
+        let c2 = c.clone();
+        let d2 = d.clone();
+
+        let a2 = a.clone();
+        let b2 = b.clone();
+
+        let aw = (&a.watch(), &b.watch()).either(move |aa, bb| {
+            if aa + bb < 3 {
+                c2.watch().into()
+            } else if aa + bb == 3 {
+                100.into()
+            } else {
+                d2.watch().into()
+            }
+        });
+
+        let awthen = aw.then(move |&x| if x > 3 { a2.watch() } else { b2.watch() });
+        let awmap = aw.map(move |&x| x + 1);
+        assert_eq!(engine.get(&aw), 100);
+        assert_eq!(engine.get(&awthen), 1);
+        assert_eq!(engine.get(&awmap), 101);
+
+        a.set(2);
+        assert_eq!(engine.get(&aw), 4);
+        assert_eq!(engine.get(&awthen), 2);
+        assert_eq!(engine.get(&awmap), 5);
+
+        b.set(0);
+        assert_eq!(engine.get(&aw), 3);
+        assert_eq!(engine.get(&awthen), 0);
+        assert_eq!(engine.get(&awmap), 4);
+
+        c.set(10);
+        assert_eq!(engine.get(&aw), 10);
+        assert_eq!(engine.get(&awthen), 2);
+        assert_eq!(engine.get(&awmap), 11);
+    }
 
     #[test]
     fn aaaxx2() {
