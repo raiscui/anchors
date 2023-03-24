@@ -24,8 +24,15 @@ macro_rules! impl_tuple_map {
             E: Engine,
         {
             type Output = Out;
-            fn dirty(&mut self, _edge:  &<E::AnchorHandle as AnchorHandle>::Token) {
-                self.output_stale = true;
+            fn dirty(&mut self, edge:  &<E::AnchorHandle as AnchorHandle>::Token) {
+                // self.output_stale = true;
+                $(
+                    if edge == &self.anchors.$num.data.token() {
+                        self.output_stale = true;
+                        return;
+                    }
+                )+
+
             }
             fn poll_updated<G: UpdateContext<Engine=E>>(
                 &mut self,
@@ -59,7 +66,7 @@ macro_rules! impl_tuple_map {
                 self.output_stale = false;
 
                 if self.output.is_none() || found_updated {
-                    let new_val = Some((self.f)($(&ctx.get(&self.anchors.$num)),+));
+                    let new_val = Some((self.f)($(ctx.get(&self.anchors.$num)),+));
                     if new_val != self.output {
                         self.output = new_val;
                         return Poll::Updated

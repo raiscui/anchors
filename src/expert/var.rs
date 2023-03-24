@@ -1,4 +1,4 @@
-use tracing::{debug_span, trace, warn};
+use tracing::{debug_span, error, trace, warn};
 
 use crate::singlethread::AnchorToken;
 
@@ -180,7 +180,8 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
             .unwrap();
         let ng = unsafe { ee.ptr.lookup_unchecked() };
 
-        println!(
+        error!(
+            target:"anchors",
             "dirty,  child: {:?},child info: {:?}  ,type: {:?}",
             child,
             ng.debug_info.get(),
@@ -195,14 +196,17 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
         if first_update {
             inner.dirty_handle = Some(ctx.dirty_handle());
         }
-        let res = if inner.value_changed {
-            self.val = inner.val.clone();
-            Poll::Updated
+        if inner.value_changed {
+            inner.value_changed = false;
+            if !Rc::ptr_eq(&self.val, &inner.val) {
+                self.val = Rc::clone(&inner.val);
+                Poll::Updated
+            } else {
+                Poll::Unchanged
+            }
         } else {
             Poll::Unchanged
-        };
-        inner.value_changed = false;
-        res
+        }
     }
 
     fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
@@ -271,37 +275,22 @@ mod tests {
         let mut engine = Engine::new();
 
         // 创建锚点 a 和 b
-        let a = Constant::new_internal(1);
-        let a2 = Var::new(2);
-        let b = (&a, &a2.watch()).map(|x, xx| x + xx);
-        let n = Var::new(1);
-        let n2 = Var::new(2);
-        let n1 = n.clone();
-        let n12 = n2.clone();
-        let n11 = n.clone();
-        let n22 = Constant::new_internal(1);
-        let n222 = n22.clone();
-
-        let c = b.then(move |x| if *x > 3 { n22.clone() } else { n11.watch() });
-
-        let c2 = c.map(move |x| if *x > 3 { n12.clone() } else { n1.clone() });
-
-        let d = c2.then(move |x| n222.clone());
-
-        let val = engine.get(&b);
-        println!("val: {:?}", val);
-
-        println!("val: {:?}", engine.get(&c));
-        println!("val: {:?}", engine.get(&c2).get());
-        println!("val: {:?}", engine.get(&c));
-        println!("val: {:?}", engine.get(&c2).get());
-
-        println!("val: {:?}", engine.get(&d));
-        n.set(7);
-        n2.set(7);
-        println!("val: {:?}", engine.get(&d));
-        println!("val: {:?}", engine.get(&d));
-        println!("val: {:?}", engine.get(&c));
-        println!("val: {:?}", engine.get(&c2).get());
+        let a1 = Constant::new_internal(1);
+        let a2 = Constant::new_internal(2);
+        let aa = Var::new(a1);
+        let aw = aa.watch().then(|an| an.clone());
+        let aw2 = aa.watch().map(|an| an.map(|x| x + 1));
+        let aw3 = aa.watch().then(|an| an.clone());
+        println!("{}", engine.get(&aw));
+        let x = engine.get(&aw2);
+        let x = engine.get(&x);
+        println!("{}", x);
+        println!("{}", engine.get(&aw3));
+        aa.set(a2);
+        println!("{}", engine.get(&aw));
+        let x = engine.get(&aw2);
+        let x = engine.get(&x);
+        println!("{}", x);
+        println!("{}", engine.get(&aw3));
     }
 }

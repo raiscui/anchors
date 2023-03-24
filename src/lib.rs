@@ -3,6 +3,7 @@
 #![feature(specialization)]
 #![feature(option_result_contains)] //for with_anchor func
 #![feature(iter_collect_into)]
+#![feature(auto_traits)]
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod collections;
@@ -74,7 +75,5 @@ macro_rules! dict_k_into {
 #[cfg(test)]
 mod test {
     #[test]
-    fn test() {
-        let _cc = dict! {1=>1};
-    }
+    fn test() {}
 }

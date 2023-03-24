@@ -49,6 +49,7 @@ impl<T: 'static, E: Engine> AnchorInner<E> for Constant<T> {
         let ng = unsafe { ee.ptr.lookup_unchecked() };
 
         error!(
+            target:"anchors",
             "Constant never has any inputs; dirty should not have been called. alleged child: {:?},child info: {:?}  ,type: {:?},\nloc{:?}",
             child,
             ng.debug_info.get(),

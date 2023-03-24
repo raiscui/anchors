@@ -2,6 +2,7 @@ use super::{Anchor, AnchorInner, Engine};
 use std::panic::Location;
 
 pub mod cutoff;
+pub mod either;
 pub mod map;
 pub mod map_mut;
 pub mod refmap;
@@ -34,6 +35,12 @@ pub trait MultiAnchor<E: Engine>: Sized {
         F: 'static,
         Out: 'static,
         then::Then<Self::Target, Out, F, E>: AnchorInner<E, Output = Out>;
+
+    fn either<F, Out>(&self, f: F) -> Anchor<Out, E>
+    where
+        F: 'static,
+        Out: 'static,
+        either::Either<Self::Target, Out, F, E>: AnchorInner<E, Output = Out>;
 
     fn cutoff<F, Out>(self, _f: F) -> Anchor<Out, E>
     where
@@ -146,7 +153,23 @@ where
             f,
             f_anchor: None,
             location: Location::caller(),
-            lhs_stale: true,
+            output_stale: true,
+        })
+    }
+
+    #[track_caller]
+    pub fn either<F, Out>(&self, f: F) -> Anchor<Out, E>
+    where
+        F: 'static,
+        Out: 'static,
+        either::Either<(Anchor<O1, E>,), Out, F, E>: AnchorInner<E, Output = Out>,
+    {
+        E::mount(either::Either {
+            anchors: (self.clone(),),
+            f,
+            either_anchor: None,
+            location: Location::caller(),
+            output_stale: true,
         })
     }
 
@@ -312,9 +335,26 @@ macro_rules! impl_tuple_ext {
                     f,
                     f_anchor: None,
                     location: Location::caller(),
-                    lhs_stale: true,
+                    output_stale: true,
                 })
             }
+
+            #[track_caller]
+            fn either<F, Out>(&self, f: F) -> Anchor<Out, E>
+            where
+                F: 'static,
+                Out: 'static,
+                either::Either<Self::Target, Out, F, E>: AnchorInner<E, Output = Out>,
+            {
+                E::mount(either::Either {
+                    anchors: ($(self.$num.clone(),)+),
+                    f,
+                    either_anchor: None,
+                    location: Location::caller(),
+                    output_stale: true,
+                })
+            }
+
 
             #[track_caller]
             fn refmap<F, Out>(self, f: F) -> Anchor<Out, E>

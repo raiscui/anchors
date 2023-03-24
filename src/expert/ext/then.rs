@@ -6,7 +6,7 @@ use std::panic::Location;
 pub struct Then<A, Out, F, E: Engine> {
     pub(super) f: F,
     pub(super) f_anchor: Option<Anchor<Out, E>>,
-    pub(super) lhs_stale: bool,
+    pub(super) output_stale: bool,
     pub(super) anchors: A,
     pub(super) location: &'static Location<'static>,
 }
@@ -28,16 +28,17 @@ macro_rules! impl_tuple_then {
                 $(
                     // only invalidate f_anchor if one of the lhs anchors is invalidated
                     if edge == &self.anchors.$num.data.token() {
-                        self.lhs_stale = true;
+                        self.output_stale = true;
                         return;
                     }
                 )+
+
             }
             fn poll_updated<G: UpdateContext<Engine=E>>(
                 &mut self,
                 ctx: &mut G,
             ) -> Poll {
-                if self.f_anchor.is_none() || self.lhs_stale {
+                if self.f_anchor.is_none() || self.output_stale {
                     let mut found_pending = false;
                     let mut found_updated = false;
 
@@ -59,10 +60,10 @@ macro_rules! impl_tuple_then {
                         return Poll::Pending;
                     }
 
-                    self.lhs_stale = false;
+                    self.output_stale = false;
 
                     if self.f_anchor.is_none() || found_updated {
-                        let new_anchor = (self.f)($(&ctx.get(&self.anchors.$num)),+);
+                        let new_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
                         match self.f_anchor.as_ref() {
                             Some(outdated_anchor) if outdated_anchor != &new_anchor => {
                                 // changed, so unfollow old
@@ -75,7 +76,7 @@ macro_rules! impl_tuple_then {
                     }
                 }
 
-                ctx.request(&self.f_anchor.as_ref().unwrap(), true)
+                ctx.request(self.f_anchor.as_ref().unwrap(), true)
             }
             fn output<'slf, 'out, G: OutputContext<'out, Engine=E>>(
                 &'slf self,
@@ -84,7 +85,7 @@ macro_rules! impl_tuple_then {
             where
                 'slf: 'out,
             {
-                &ctx.get(&self.f_anchor.as_ref().unwrap())
+                ctx.get(self.f_anchor.as_ref().unwrap())
             }
 
             fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
@@ -102,7 +103,6 @@ impl_tuple_then! {
     [O0, 0]
     [O1, 1]
 }
-
 impl_tuple_then! {
     [O0, 0]
     [O1, 1]
