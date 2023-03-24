@@ -36,7 +36,7 @@ pub trait MultiAnchor<E: Engine>: Sized {
         Out: 'static,
         then::Then<Self::Target, Out, F, E>: AnchorInner<E, Output = Out>;
 
-    fn either<F, Out>(&self, f: F) -> Anchor<Out, E>
+    fn either<F, Out>(self, f: F) -> Anchor<Out, E>
     where
         F: 'static,
         Out: 'static,
@@ -340,7 +340,7 @@ macro_rules! impl_tuple_ext {
             }
 
             #[track_caller]
-            fn either<F, Out>(&self, f: F) -> Anchor<Out, E>
+            fn either<F, Out>(self, f: F) -> Anchor<Out, E>
             where
                 F: 'static,
                 Out: 'static,

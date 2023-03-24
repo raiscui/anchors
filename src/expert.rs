@@ -219,6 +219,7 @@ pub trait AnchorInner<E: Engine + ?Sized> {
 
 mod ext;
 pub use ext::cutoff;
+pub use ext::either;
 pub use ext::map;
 pub use ext::map_mut;
 pub use ext::refmap;
