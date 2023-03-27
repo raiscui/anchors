@@ -342,7 +342,7 @@ macro_rules! impl_tuple_ext {
             #[track_caller]
             fn either<F, Out>(self, f: F) -> Anchor<Out, E>
             where
-                F: 'static,
+                F:'static,
                 Out: 'static,
                 either::Either<Self::Target, Out, F, E>: AnchorInner<E, Output = Out>,
             {

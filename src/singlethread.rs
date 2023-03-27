@@ -18,16 +18,16 @@ use tracing::trace;
 pub use graph2::AnchorHandle;
 pub use graph2::NodeKey as AnchorToken;
 
-/// The main struct of the Anchors library. Represents a single value on the singlthread recomputation graph.
+/// The main struct of the Anchors library. Represents a single value on the singlethread recomputation graph.
 ///
 /// You should basically never need to create these with `Anchor::new_from_expert`; instead call functions like `Var::new` and `MultiAnchor::map`
 /// to create them.
 pub type Anchor<T> = crate::expert::Anchor<T, Engine>;
 
 /// An Anchor input that can be mutated by calling a setter function from outside of the Anchors recomputation graph.
-pub type VarEA<T> = crate::expert::VarEA<T, Engine>;
+pub type VarVOA<T> = crate::expert::VarVOA<T, Engine>;
 pub type Var<T> = crate::expert::Var<T, Engine>;
-pub type EitherAnchor<T> = crate::expert::EitherAnchor<T, Engine>;
+pub type ValOrAnchor<T> = crate::expert::ValOrAnchor<T, Engine>;
 
 pub use crate::expert::MultiAnchor;
 
@@ -38,6 +38,11 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::panic::Location;
 use std::rc::Rc;
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn into_ea<T>(x: impl Into<ValOrAnchor<T>>) -> ValOrAnchor<T> {
+    x.into()
+}
 
 thread_local! {
     static DEFAULT_MOUNTER: RefCell<Option<Mounter>> = RefCell::new(None);

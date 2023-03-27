@@ -1,6 +1,6 @@
 use anchors::{
     collections::ord_map_methods::Dict,
-    expert::VarEA,
+    expert::VarVOA,
     singlethread::{Anchor, Engine, MultiAnchor, Var},
 };
 
@@ -181,6 +181,83 @@ fn var_either_anchor3(c: &mut Criterion) {
         }
     }
 }
+fn var_either_anchor_def(c: &mut Criterion) {
+    for node_count in &[10, 100, 1000] {
+        for observed in &[true, false] {
+            c.bench_with_input(
+                BenchmarkId::new(
+                    "var_either_anchor_def",
+                    format!(
+                        "{}/{}",
+                        node_count,
+                        if *observed { "observed" } else { "unobserved" }
+                    ),
+                ),
+                &(*node_count, *observed),
+                |b, (node_count, observed)| {
+                    let mut engine = Engine::new_with_max_height(2006);
+                    let first_num = VarVOA::new(0u64);
+                    let mut node = first_num.watch();
+
+                    for _ in 0..*node_count {
+                        node = node.map(|val| val + black_box(1));
+                    }
+
+                    if *observed {
+                        engine.mark_observed(&node);
+                    }
+                    assert_eq!(engine.get(&node), *node_count);
+
+                    let mut update_number = 0;
+                    b.iter(|| {
+                        update_number += 1;
+                        first_num.set(update_number);
+                        assert_eq!(engine.get(&node), update_number + *node_count);
+                    });
+                },
+            );
+        }
+    }
+}
+fn var_either_anchor_def_either(c: &mut Criterion) {
+    for node_count in &[10, 100, 1000] {
+        for observed in &[true, false] {
+            c.bench_with_input(
+                BenchmarkId::new(
+                    "var_either_anchor_def_either",
+                    format!(
+                        "{}/{}",
+                        node_count,
+                        if *observed { "observed" } else { "unobserved" }
+                    ),
+                ),
+                &(*node_count, *observed),
+                |b, (node_count, observed)| {
+                    let mut engine = Engine::new_with_max_height(2006);
+                    let first_num = VarVOA::new(0u64);
+                    let mut node = first_num.watch();
+
+                    for _ in 0..*node_count {
+                        node = node.either(|val| (val + black_box(1)).into());
+                    }
+
+                    if *observed {
+                        engine.mark_observed(&node);
+                    }
+                    assert_eq!(engine.get(&node), *node_count);
+
+                    let mut update_number = 0;
+                    b.iter(|| {
+                        update_number += 1;
+                        first_num.set(update_number);
+                        assert_eq!(engine.get(&node), update_number + *node_count);
+                    });
+                },
+            );
+        }
+    }
+}
+
 fn var_either_anchor2(c: &mut Criterion) {
     for node_count in &[10, 100, 1000] {
         for observed in &[true, false] {
@@ -200,7 +277,7 @@ fn var_either_anchor2(c: &mut Criterion) {
                     let mut node = first_num.watch();
 
                     for _ in 0..*node_count {
-                        node = VarEA::new(node.map(|val| val + black_box(1))).watch();
+                        node = VarVOA::new(node.map(|val| val + black_box(1))).watch();
                     }
 
                     if *observed {
@@ -239,7 +316,7 @@ fn var_either_anchor(c: &mut Criterion) {
 
                     let mut v = vector![node];
                     for _ in 0..*node_count {
-                        let node_x = VarEA::new(1);
+                        let node_x = VarVOA::new(1);
                         v.push_back(node_x.watch());
                     }
                     let va: Anchor<Vector<_>> = v.into_iter().collect();
@@ -488,7 +565,7 @@ criterion_group! {
 criterion_group! {
     name = var_e_a;
     config = Criterion::default();
-    targets =stabilize_linear_nodes_simple,var_either_anchor2,var_either_anchor3
+    targets =stabilize_linear_nodes_simple,var_either_anchor_def,var_either_anchor_def_either,var_either_anchor2,var_either_anchor3
 
 }
 

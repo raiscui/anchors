@@ -3,18 +3,18 @@ use tracing::debug;
 /*
  * @Author: Rais
  * @Date: 2023-03-23 12:55:22
- * @LastEditTime: 2023-03-24 16:39:10
+ * @LastEditTime: 2023-03-27 16:35:46
  * @LastEditors: Rais
  * @Description:
  */
 use crate::expert::{
-    Anchor, AnchorHandle, AnchorInner, EitherAnchor, Engine, OutputContext, Poll, UpdateContext,
+    Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext, ValOrAnchor,
 };
 use std::panic::Location;
 
 pub struct Either<A, Out, F, E: Engine> {
     pub(super) f: F,
-    pub(super) either_anchor: Option<EitherAnchor<Out, E>>,
+    pub(super) either_anchor: Option<ValOrAnchor<Out, E>>,
     pub(super) output_stale: bool,
     pub(super) anchors: A,
     pub(super) location: &'static Location<'static>,
@@ -25,7 +25,7 @@ macro_rules! impl_tuple_either {
         impl<$($output_type,)+ E, F, Out> AnchorInner<E> for
         Either<( $(Anchor<$output_type, E>,)+ ), Out, F, E>
         where
-            F: for<'any> FnMut($(&'any $output_type),+) -> EitherAnchor<Out, E>,
+            F: for<'any> FnMut($(&'any $output_type),+) -> ValOrAnchor<Out, E>,
             Out: PartialEq + 'static,
             $(
                 $output_type: 'static,
@@ -78,22 +78,22 @@ macro_rules! impl_tuple_either {
                         let new_either_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
 
                         match (&self.either_anchor, &new_either_anchor) {
-                            (None, EitherAnchor::Anchor(_)) => {
+                            (None, ValOrAnchor::Anchor(_)) => {
                                 // poll = Poll::Updated;
                             }
-                            (None, EitherAnchor::Val(_)) => {
+                            (None, ValOrAnchor::Val(_)) => {
                                 poll = Poll::Updated;
                             }
 
-                            (Some(EitherAnchor::Val(_)), EitherAnchor::Anchor(_)) => {
+                            (Some(ValOrAnchor::Val(_)), ValOrAnchor::Anchor(_)) => {
                                 poll = Poll::Updated;
                             }
-                            (Some(EitherAnchor::Val(a)), EitherAnchor::Val(b)) => {
+                            (Some(ValOrAnchor::Val(a)), ValOrAnchor::Val(b)) => {
                                 if a != b {
                                     poll = Poll::Updated;
                                 }
                             }
-                            (Some(EitherAnchor::Anchor(outdated_anchor)), EitherAnchor::Val(_)) => {
+                            (Some(ValOrAnchor::Anchor(outdated_anchor)), ValOrAnchor::Val(_)) => {
                                 debug!("either anchor - val");
 
                                 ctx.unrequest(outdated_anchor);
@@ -101,8 +101,8 @@ macro_rules! impl_tuple_either {
                             }
 
                             (
-                                Some(EitherAnchor::Anchor(outdated_anchor)),
-                                EitherAnchor::Anchor(new_anchor),
+                                Some(ValOrAnchor::Anchor(outdated_anchor)),
+                                ValOrAnchor::Anchor(new_anchor),
                             ) => {
                                 debug!("either anchor - anchor");
 
@@ -117,8 +117,8 @@ macro_rules! impl_tuple_either {
                 }
 
                 match self.either_anchor.as_ref().unwrap() {
-                    EitherAnchor::Val(_) => poll,
-                    EitherAnchor::Anchor(an) => match ctx.request(an, true) {
+                    ValOrAnchor::Val(_) => poll,
+                    ValOrAnchor::Anchor(an) => match ctx.request(an, true) {
                         Poll::Updated => Poll::Updated,
                         Poll::Unchanged => poll,
                         Poll::Pending => Poll::Pending,
@@ -133,8 +133,8 @@ macro_rules! impl_tuple_either {
                 'slf: 'out,
             {
                 match self.either_anchor.as_ref().unwrap() {
-                    EitherAnchor::Val(v) => v,
-                    EitherAnchor::Anchor(an) => ctx.get(an),
+                    ValOrAnchor::Val(v) => v,
+                    ValOrAnchor::Anchor(an) => ctx.get(an),
                 }
             }
 
@@ -221,15 +221,15 @@ mod tests {
     use tracing::debug;
 
     use crate::{
-        expert::MultiAnchor,
-        singlethread::{Engine, Var, VarEA},
+        expert::{var_val_or_anchor::CastIntoValOrAnchor, MultiAnchor},
+        singlethread::{Engine, Var, VarVOA},
     };
 
     #[test]
     fn either_tuple() {
         let mut engine = Engine::new();
 
-        let a = VarEA::new(1);
+        let a = VarVOA::new(1);
         let b = Var::new(2);
         let c = Var::new(3);
         let d = Var::new(4);
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn aaaxx2() {
         let mut engine = Engine::new();
-        let a = VarEA::new(1);
+        let a = VarVOA::new(1);
         let c = Var::new(22);
         let d = Var::new(-1);
 
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn aaaxx() {
         let mut engine = Engine::new();
-        let a = VarEA::new(1);
+        let a = VarVOA::new(1);
         let c = Var::new(22);
         let d = Var::new(-1);
         let b = Var::new(9);
