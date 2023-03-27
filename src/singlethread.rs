@@ -27,9 +27,9 @@ pub type Anchor<T> = crate::expert::Anchor<T, Engine>;
 /// An Anchor input that can be mutated by calling a setter function from outside of the Anchors recomputation graph.
 pub type VarEA<T> = crate::expert::VarEA<T, Engine>;
 pub type Var<T> = crate::expert::Var<T, Engine>;
-pub type EitherAnchor<T> = crate::expert::EitherAnchor<T, Engine>;
-
+pub type ValOrAnchor<T> = crate::expert::ValOrAnchor<T, Engine>;
 pub use crate::expert::MultiAnchor;
+pub use crate::expert::ValOrAnchor::*;
 
 use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 
@@ -38,6 +38,11 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::panic::Location;
 use std::rc::Rc;
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn into_ea<T>(x: impl Into<ValOrAnchor<T>>) -> ValOrAnchor<T> {
+    x.into()
+}
 
 thread_local! {
     static DEFAULT_MOUNTER: RefCell<Option<Mounter>> = RefCell::new(None);

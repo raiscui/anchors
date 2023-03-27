@@ -8,13 +8,13 @@ use tracing::debug;
  * @Description:
  */
 use crate::expert::{
-    Anchor, AnchorHandle, AnchorInner, EitherAnchor, Engine, OutputContext, Poll, UpdateContext,
+    Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext, ValOrAnchor,
 };
 use std::panic::Location;
 
 pub struct Either<A, Out, F, E: Engine> {
     pub(super) f: F,
-    pub(super) either_anchor: Option<EitherAnchor<Out, E>>,
+    pub(super) either_anchor: Option<ValOrAnchor<Out, E>>,
     pub(super) output_stale: bool,
     pub(super) anchors: A,
     pub(super) location: &'static Location<'static>,
@@ -25,7 +25,7 @@ macro_rules! impl_tuple_either {
         impl<$($output_type,)+ E, F, Out> AnchorInner<E> for
         Either<( $(Anchor<$output_type, E>,)+ ), Out, F, E>
         where
-            F: for<'any> FnMut($(&'any $output_type),+) -> EitherAnchor<Out, E>,
+            F: for<'any> FnMut($(&'any $output_type),+) -> ValOrAnchor<Out, E>,
             Out: PartialEq + 'static,
             $(
                 $output_type: 'static,
@@ -78,22 +78,22 @@ macro_rules! impl_tuple_either {
                         let new_either_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
 
                         match (&self.either_anchor, &new_either_anchor) {
-                            (None, EitherAnchor::Anchor(_)) => {
+                            (None, ValOrAnchor::EAnchor(_)) => {
                                 // poll = Poll::Updated;
                             }
-                            (None, EitherAnchor::Val(_)) => {
+                            (None, ValOrAnchor::EVal(_)) => {
                                 poll = Poll::Updated;
                             }
 
-                            (Some(EitherAnchor::Val(_)), EitherAnchor::Anchor(_)) => {
+                            (Some(ValOrAnchor::EVal(_)), ValOrAnchor::EAnchor(_)) => {
                                 poll = Poll::Updated;
                             }
-                            (Some(EitherAnchor::Val(a)), EitherAnchor::Val(b)) => {
+                            (Some(ValOrAnchor::EVal(a)), ValOrAnchor::EVal(b)) => {
                                 if a != b {
                                     poll = Poll::Updated;
                                 }
                             }
-                            (Some(EitherAnchor::Anchor(outdated_anchor)), EitherAnchor::Val(_)) => {
+                            (Some(ValOrAnchor::EAnchor(outdated_anchor)), ValOrAnchor::EVal(_)) => {
                                 debug!("either anchor - val");
 
                                 ctx.unrequest(outdated_anchor);
@@ -101,8 +101,8 @@ macro_rules! impl_tuple_either {
                             }
 
                             (
-                                Some(EitherAnchor::Anchor(outdated_anchor)),
-                                EitherAnchor::Anchor(new_anchor),
+                                Some(ValOrAnchor::EAnchor(outdated_anchor)),
+                                ValOrAnchor::EAnchor(new_anchor),
                             ) => {
                                 debug!("either anchor - anchor");
 
@@ -117,8 +117,8 @@ macro_rules! impl_tuple_either {
                 }
 
                 match self.either_anchor.as_ref().unwrap() {
-                    EitherAnchor::Val(_) => poll,
-                    EitherAnchor::Anchor(an) => match ctx.request(an, true) {
+                    ValOrAnchor::EVal(_) => poll,
+                    ValOrAnchor::EAnchor(an) => match ctx.request(an, true) {
                         Poll::Updated => Poll::Updated,
                         Poll::Unchanged => poll,
                         Poll::Pending => Poll::Pending,
@@ -133,8 +133,8 @@ macro_rules! impl_tuple_either {
                 'slf: 'out,
             {
                 match self.either_anchor.as_ref().unwrap() {
-                    EitherAnchor::Val(v) => v,
-                    EitherAnchor::Anchor(an) => ctx.get(an),
+                    ValOrAnchor::EVal(v) => v,
+                    ValOrAnchor::EAnchor(an) => ctx.get(an),
                 }
             }
 

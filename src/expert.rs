@@ -231,5 +231,6 @@ mod var_either_anchor;
 pub use constant::Constant;
 use tracing::{debug, debug_span};
 pub use var::Var;
-pub use var_either_anchor::EitherAnchor;
+pub use var_either_anchor::ValOrAnchor;
+pub use var_either_anchor::ValOrAnchor::*;
 pub use var_either_anchor::VarEA;
