@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2023-03-29 16:17:05
+ * @LastEditTime: 2023-03-29 17:33:19
  * @LastEditors: Rais
  * @Description:
  */
@@ -246,15 +246,15 @@ impl<T, E: Engine> From<Anchor<T, E>> for ValOrAnchor<T, E> {
     }
 }
 
-pub trait FromValOrAnchor<T>: Sized {
+pub trait CastFromValOrAnchor<T>: Sized {
     fn cast_from(value: T) -> Self;
 }
-pub trait IntoValOrAnchor<T, E: Engine>: Sized {
+pub trait CastIntoValOrAnchor<T, E: Engine>: Sized {
     fn cast_into(self) -> ValOrAnchor<T, E>;
 }
-impl<W, T, E: Engine> IntoValOrAnchor<T, E> for W
+impl<W, T, E: Engine> CastIntoValOrAnchor<T, E> for W
 where
-    ValOrAnchor<T, E>: FromValOrAnchor<W>,
+    ValOrAnchor<T, E>: CastFromValOrAnchor<W>,
 {
     #[inline]
     fn cast_into(self) -> ValOrAnchor<T, E> {
@@ -262,7 +262,7 @@ where
     }
 }
 
-impl<T, X, E: Engine> FromValOrAnchor<Anchor<X, E>> for ValOrAnchor<T, E>
+impl<T, X, E: Engine> CastFromValOrAnchor<Anchor<X, E>> for ValOrAnchor<T, E>
 where
     X: Into<T> + Clone + 'static,
     T: PartialEq + 'static,
@@ -272,7 +272,7 @@ where
     }
 }
 
-impl<E: Engine, X, T> FromValOrAnchor<ValOrAnchor<X, E>> for ValOrAnchor<T, E>
+impl<E: Engine, X, T> CastFromValOrAnchor<ValOrAnchor<X, E>> for ValOrAnchor<T, E>
 where
     T: 'static + PartialEq,
     X: Into<T> + Clone + 'static,
@@ -302,7 +302,7 @@ where
 #[cfg(test)]
 mod voa {
     use crate::{
-        expert::IntoValOrAnchor,
+        expert::CastIntoValOrAnchor,
         singlethread::{Engine, ValOrAnchor, Var},
     };
 
