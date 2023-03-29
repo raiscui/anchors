@@ -29,7 +29,7 @@ arena-graph = { version = "0.1.0", path = "../arena-graph" }
 
 tracing = { version = "^0.1" }
 smallvec = { version = "1.10.0", features = ["const_generics"] }
-rustc-hash = "1.1.0"
+emg_hasher = { path = "../iced_emg/emg_hasher" }
 
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["html_reports", "real_blackbox"] }

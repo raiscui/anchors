@@ -222,14 +222,14 @@ mod tests {
 
     use crate::{
         expert::{var_val_or_anchor::IntoValOrAnchor, MultiAnchor},
-        singlethread::{Engine, Var, VarVoA},
+        singlethread::{Engine, Var, VarVOA},
     };
 
     #[test]
     fn either_tuple() {
         let mut engine = Engine::new();
 
-        let a = VarVoA::new(1);
+        let a = VarVOA::new(1);
         let b = Var::new(2);
         let c = Var::new(3);
         let d = Var::new(4);
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn aaaxx2() {
         let mut engine = Engine::new();
-        let a = VarVoA::new(1);
+        let a = VarVOA::new(1);
         let c = Var::new(22);
         let d = Var::new(-1);
 
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn aaaxx() {
         let mut engine = Engine::new();
-        let a = VarVoA::new(1);
+        let a = VarVOA::new(1);
         let c = Var::new(22);
         let d = Var::new(-1);
         let b = Var::new(9);

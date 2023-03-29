@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2023-03-27 17:50:20
+ * @LastEditTime: 2023-03-29 16:17:05
  * @LastEditors: Rais
  * @Description:
  */
@@ -44,29 +44,29 @@ where
 
 /// A setter that can update values inside an associated `VarAnchor`.
 
-pub struct VarVoA<T, E: Engine> {
+pub struct VarVOA<T, E: Engine> {
     inner: Rc<RefCell<VarEAShared<T, E>>>,
     anchor: Anchor<T, E>,
 }
 
-impl<T, E: Engine> Eq for VarVoA<T, E> {}
-impl<T, E: Engine> PartialEq for VarVoA<T, E> {
+impl<T, E: Engine> Eq for VarVOA<T, E> {}
+impl<T, E: Engine> PartialEq for VarVOA<T, E> {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner) && self.anchor == other.anchor
     }
 }
-impl<T: Debug + 'static> Debug for VarVoA<T, crate::singlethread::Engine> {
+impl<T: Debug + 'static> Debug for VarVOA<T, crate::singlethread::Engine> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("Var({:?}) ", &*self.get()))
     }
 }
-impl<T: Display + 'static, E: Engine> Display for VarVoA<T, E> {
+impl<T: Display + 'static, E: Engine> Display for VarVOA<T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("Var({}) ", &*self.get()))
     }
 }
 
-impl<T, E: Engine> Clone for VarVoA<T, E> {
+impl<T, E: Engine> Clone for VarVOA<T, E> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -303,11 +303,12 @@ where
 mod voa {
     use crate::{
         expert::IntoValOrAnchor,
-        singlethread::{ValOrAnchor, Var},
+        singlethread::{Engine, ValOrAnchor, Var},
     };
 
     #[test]
     fn xx() {
+        let engine = Engine::new();
         let x = Var::new(1i32);
         let xw = x.watch();
         // let a = ValOrAnchor::Val(1i32);
@@ -319,16 +320,16 @@ mod voa {
     }
 }
 
-impl<T: 'static, E: Engine> VarVoA<T, E> {
+impl<T: 'static, E: Engine> VarVOA<T, E> {
     /// Creates a new Var
-    pub fn new(val: impl Into<ValOrAnchor<T, E>>) -> VarVoA<T, E> {
+    pub fn new(val: impl Into<ValOrAnchor<T, E>>) -> VarVOA<T, E> {
         let val: Rc<ValOrAnchor<T, E>> = Rc::new(val.into());
         let inner = Rc::new(RefCell::new(VarEAShared {
             dirty_handle: None,
             val: val.clone(),
             output_stale: true,
         }));
-        VarVoA {
+        VarVOA {
             inner: inner.clone(),
             anchor: E::mount(VarEitherAnchor { inner, val }),
         }
@@ -491,7 +492,7 @@ mod tests {
 
     use crate::{
         expert::{
-            var_val_or_anchor::{ValOrAnchor, VarVoA},
+            var_val_or_anchor::{ValOrAnchor, VarVOA},
             Constant,
         },
         singlethread::{Engine, Var},
@@ -516,7 +517,7 @@ mod tests {
     fn test_var_either2() {
         let mut engine = Engine::new();
         // 创建锚点 a 和 b
-        let a1 = VarVoA::new(1);
+        let a1 = VarVOA::new(1);
 
         let aw = a1.watch().map(|x| x + 1);
 
@@ -531,7 +532,7 @@ mod tests {
         let _xx: ValOrAnchor<i32, Engine> = 2.into();
         let _xx: ValOrAnchor<i32, Engine> = Var::new(2).watch().into();
         // 创建锚点 a 和 b
-        let a1 = VarVoA::new(1);
+        let a1 = VarVOA::new(1);
 
         let aw = a1.watch();
 

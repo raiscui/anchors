@@ -1,6 +1,6 @@
 use anchors::{
     collections::ord_map_methods::Dict,
-    expert::VarVoA,
+    expert::VarVOA,
     singlethread::{Anchor, Engine, MultiAnchor, Var},
 };
 
@@ -196,7 +196,7 @@ fn var_either_anchor_def(c: &mut Criterion) {
                 &(*node_count, *observed),
                 |b, (node_count, observed)| {
                     let mut engine = Engine::new_with_max_height(2006);
-                    let first_num = VarVoA::new(0u64);
+                    let first_num = VarVOA::new(0u64);
                     let mut node = first_num.watch();
 
                     for _ in 0..*node_count {
@@ -234,7 +234,7 @@ fn var_either_anchor_def_either(c: &mut Criterion) {
                 &(*node_count, *observed),
                 |b, (node_count, observed)| {
                     let mut engine = Engine::new_with_max_height(2006);
-                    let first_num = VarVoA::new(0u64);
+                    let first_num = VarVOA::new(0u64);
                     let mut node = first_num.watch();
 
                     for _ in 0..*node_count {
@@ -277,7 +277,7 @@ fn var_either_anchor2(c: &mut Criterion) {
                     let mut node = first_num.watch();
 
                     for _ in 0..*node_count {
-                        node = VarVoA::new(node.map(|val| val + black_box(1))).watch();
+                        node = VarVOA::new(node.map(|val| val + black_box(1))).watch();
                     }
 
                     if *observed {
@@ -316,7 +316,7 @@ fn var_either_anchor(c: &mut Criterion) {
 
                     let mut v = vector![node];
                     for _ in 0..*node_count {
-                        let node_x = VarVoA::new(1);
+                        let node_x = VarVOA::new(1);
                         v.push_back(node_x.watch());
                     }
                     let va: Anchor<Vector<_>> = v.into_iter().collect();

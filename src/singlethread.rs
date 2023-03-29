@@ -25,7 +25,7 @@ pub use graph2::NodeKey as AnchorToken;
 pub type Anchor<T> = crate::expert::Anchor<T, Engine>;
 
 /// An Anchor input that can be mutated by calling a setter function from outside of the Anchors recomputation graph.
-pub type VarVoA<T> = crate::expert::VarVoA<T, Engine>;
+pub type VarVOA<T> = crate::expert::VarVOA<T, Engine>;
 pub type Var<T> = crate::expert::Var<T, Engine>;
 pub type ValOrAnchor<T> = crate::expert::ValOrAnchor<T, Engine>;
 
