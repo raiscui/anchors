@@ -3,7 +3,7 @@ use tracing::debug;
 /*
  * @Author: Rais
  * @Date: 2023-03-23 12:55:22
- * @LastEditTime: 2023-03-24 16:39:10
+ * @LastEditTime: 2023-03-27 16:35:46
  * @LastEditors: Rais
  * @Description:
  */
@@ -78,22 +78,22 @@ macro_rules! impl_tuple_either {
                         let new_either_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
 
                         match (&self.either_anchor, &new_either_anchor) {
-                            (None, ValOrAnchor::EAnchor(_)) => {
+                            (None, ValOrAnchor::Anchor(_)) => {
                                 // poll = Poll::Updated;
                             }
-                            (None, ValOrAnchor::EVal(_)) => {
+                            (None, ValOrAnchor::Val(_)) => {
                                 poll = Poll::Updated;
                             }
 
-                            (Some(ValOrAnchor::EVal(_)), ValOrAnchor::EAnchor(_)) => {
+                            (Some(ValOrAnchor::Val(_)), ValOrAnchor::Anchor(_)) => {
                                 poll = Poll::Updated;
                             }
-                            (Some(ValOrAnchor::EVal(a)), ValOrAnchor::EVal(b)) => {
+                            (Some(ValOrAnchor::Val(a)), ValOrAnchor::Val(b)) => {
                                 if a != b {
                                     poll = Poll::Updated;
                                 }
                             }
-                            (Some(ValOrAnchor::EAnchor(outdated_anchor)), ValOrAnchor::EVal(_)) => {
+                            (Some(ValOrAnchor::Anchor(outdated_anchor)), ValOrAnchor::Val(_)) => {
                                 debug!("either anchor - val");
 
                                 ctx.unrequest(outdated_anchor);
@@ -101,8 +101,8 @@ macro_rules! impl_tuple_either {
                             }
 
                             (
-                                Some(ValOrAnchor::EAnchor(outdated_anchor)),
-                                ValOrAnchor::EAnchor(new_anchor),
+                                Some(ValOrAnchor::Anchor(outdated_anchor)),
+                                ValOrAnchor::Anchor(new_anchor),
                             ) => {
                                 debug!("either anchor - anchor");
 
@@ -117,8 +117,8 @@ macro_rules! impl_tuple_either {
                 }
 
                 match self.either_anchor.as_ref().unwrap() {
-                    ValOrAnchor::EVal(_) => poll,
-                    ValOrAnchor::EAnchor(an) => match ctx.request(an, true) {
+                    ValOrAnchor::Val(_) => poll,
+                    ValOrAnchor::Anchor(an) => match ctx.request(an, true) {
                         Poll::Updated => Poll::Updated,
                         Poll::Unchanged => poll,
                         Poll::Pending => Poll::Pending,
@@ -133,8 +133,8 @@ macro_rules! impl_tuple_either {
                 'slf: 'out,
             {
                 match self.either_anchor.as_ref().unwrap() {
-                    ValOrAnchor::EVal(v) => v,
-                    ValOrAnchor::EAnchor(an) => ctx.get(an),
+                    ValOrAnchor::Val(v) => v,
+                    ValOrAnchor::Anchor(an) => ctx.get(an),
                 }
             }
 
@@ -221,15 +221,15 @@ mod tests {
     use tracing::debug;
 
     use crate::{
-        expert::MultiAnchor,
-        singlethread::{Engine, Var, VarEA},
+        expert::{var_val_or_anchor::IntoValOrAnchor, MultiAnchor},
+        singlethread::{Engine, Var, VarVoA},
     };
 
     #[test]
     fn either_tuple() {
         let mut engine = Engine::new();
 
-        let a = VarEA::new(1);
+        let a = VarVoA::new(1);
         let b = Var::new(2);
         let c = Var::new(3);
         let d = Var::new(4);
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn aaaxx2() {
         let mut engine = Engine::new();
-        let a = VarEA::new(1);
+        let a = VarVoA::new(1);
         let c = Var::new(22);
         let d = Var::new(-1);
 
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn aaaxx() {
         let mut engine = Engine::new();
-        let a = VarEA::new(1);
+        let a = VarVoA::new(1);
         let c = Var::new(22);
         let d = Var::new(-1);
         let b = Var::new(9);

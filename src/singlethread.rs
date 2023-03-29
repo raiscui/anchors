@@ -18,18 +18,18 @@ use tracing::trace;
 pub use graph2::AnchorHandle;
 pub use graph2::NodeKey as AnchorToken;
 
-/// The main struct of the Anchors library. Represents a single value on the singlthread recomputation graph.
+/// The main struct of the Anchors library. Represents a single value on the singlethread recomputation graph.
 ///
 /// You should basically never need to create these with `Anchor::new_from_expert`; instead call functions like `Var::new` and `MultiAnchor::map`
 /// to create them.
 pub type Anchor<T> = crate::expert::Anchor<T, Engine>;
 
 /// An Anchor input that can be mutated by calling a setter function from outside of the Anchors recomputation graph.
-pub type VarEA<T> = crate::expert::VarEA<T, Engine>;
+pub type VarVoA<T> = crate::expert::VarVoA<T, Engine>;
 pub type Var<T> = crate::expert::Var<T, Engine>;
 pub type ValOrAnchor<T> = crate::expert::ValOrAnchor<T, Engine>;
+
 pub use crate::expert::MultiAnchor;
-pub use crate::expert::ValOrAnchor::*;
 
 use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 

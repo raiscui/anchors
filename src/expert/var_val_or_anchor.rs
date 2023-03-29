@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2023-03-26 23:13:06
+ * @LastEditTime: 2023-03-27 17:50:20
  * @LastEditors: Rais
  * @Description:
  */
@@ -44,29 +44,29 @@ where
 
 /// A setter that can update values inside an associated `VarAnchor`.
 
-pub struct VarEA<T, E: Engine> {
+pub struct VarVoA<T, E: Engine> {
     inner: Rc<RefCell<VarEAShared<T, E>>>,
     anchor: Anchor<T, E>,
 }
 
-impl<T, E: Engine> Eq for VarEA<T, E> {}
-impl<T, E: Engine> PartialEq for VarEA<T, E> {
+impl<T, E: Engine> Eq for VarVoA<T, E> {}
+impl<T, E: Engine> PartialEq for VarVoA<T, E> {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner) && self.anchor == other.anchor
     }
 }
-impl<T: Debug + 'static> Debug for VarEA<T, crate::singlethread::Engine> {
+impl<T: Debug + 'static> Debug for VarVoA<T, crate::singlethread::Engine> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("Var({:?}) ", &*self.get()))
     }
 }
-impl<T: Display + 'static, E: Engine> Display for VarEA<T, E> {
+impl<T: Display + 'static, E: Engine> Display for VarVoA<T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("Var({}) ", &*self.get()))
     }
 }
 
-impl<T, E: Engine> Clone for VarEA<T, E> {
+impl<T, E: Engine> Clone for VarVoA<T, E> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -76,15 +76,90 @@ impl<T, E: Engine> Clone for VarEA<T, E> {
 }
 
 pub enum ValOrAnchor<T, E: Engine> {
-    EVal(T),
-    EAnchor(Anchor<T, E>),
+    Val(T),
+    Anchor(Anchor<T, E>),
+}
+
+impl<T: Eq, E: Engine> Eq for ValOrAnchor<T, E> {}
+
+impl<T: PartialEq, E: Engine> PartialEq for ValOrAnchor<T, E> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Val(l0), Self::Val(r0)) => l0 == r0,
+            (Self::Anchor(l0), Self::Anchor(r0)) => l0 == r0,
+            _ => false,
+        }
+    }
+}
+
+impl<T: PartialEq, E: Engine> PartialEq<T> for ValOrAnchor<T, E> {
+    fn eq(&self, other: &T) -> bool {
+        match self {
+            ValOrAnchor::Val(v) => v == other,
+            ValOrAnchor::Anchor(_) => false,
+        }
+    }
+}
+
+impl<T: PartialEq, E: Engine> PartialEq<Anchor<T, E>> for ValOrAnchor<T, E> {
+    fn eq(&self, other: &Anchor<T, E>) -> bool {
+        match self {
+            ValOrAnchor::Val(_) => false,
+            ValOrAnchor::Anchor(an) => an == other,
+        }
+    }
+}
+
+impl<T: std::ops::Sub<Output = T>, E: Engine> core::ops::Sub<T> for ValOrAnchor<T, E> {
+    type Output = Self;
+
+    fn sub(self, rhs: T) -> Self::Output {
+        match self {
+            ValOrAnchor::Val(v) => ValOrAnchor::Val(v - rhs),
+            ValOrAnchor::Anchor(_) => panic!("ValOrAnchor::Anchor sub not allowed"),
+        }
+    }
+}
+
+impl<T: std::ops::Add<Output = T>, E: Engine> core::ops::Add<T> for ValOrAnchor<T, E> {
+    type Output = Self;
+
+    fn add(self, rhs: T) -> Self::Output {
+        match self {
+            ValOrAnchor::Val(v) => ValOrAnchor::Val(v + rhs),
+            ValOrAnchor::Anchor(_) => panic!("ValOrAnchor::Anchor add not allowed"),
+        }
+    }
+}
+
+impl<T, E: Engine> core::ops::AddAssign<T> for ValOrAnchor<T, E>
+where
+    T: core::ops::AddAssign<T>,
+{
+    fn add_assign(&mut self, rhs: T) {
+        match self {
+            ValOrAnchor::Val(t) => *t += rhs,
+            ValOrAnchor::Anchor(_) => panic!("ValOrAnchor::Anchor add_assign not allowed"),
+        }
+    }
+}
+impl<T, E: Engine> core::ops::SubAssign<T> for ValOrAnchor<T, E>
+where
+    T: core::ops::SubAssign<T>,
+{
+    fn sub_assign(&mut self, rhs: T) {
+        match self {
+            ValOrAnchor::Val(t) => *t -= rhs,
+            ValOrAnchor::Anchor(_) => panic!("ValOrAnchor::Anchor sub_assign not allowed"),
+        }
+    }
 }
 
 impl<T: Clone, E: Engine> Clone for ValOrAnchor<T, E> {
     fn clone(&self) -> Self {
         match self {
-            Self::EVal(arg0) => Self::EVal(arg0.clone()),
-            Self::EAnchor(arg0) => Self::EAnchor(arg0.clone()),
+            Self::Val(arg0) => Self::Val(arg0.clone()),
+            Self::Anchor(arg0) => Self::Anchor(arg0.clone()),
         }
     }
 }
@@ -92,18 +167,43 @@ impl<T: Clone, E: Engine> Clone for ValOrAnchor<T, E> {
 impl<T, E: Engine> ValOrAnchor<T, E> {
     /// Returns `true` if the either anchor is [`Val`].
     ///
-    /// [`Val`]: EitherAnchor::EVal
+    /// [`Val`]: EitherAnchor::Val
     #[must_use]
     pub fn is_val(&self) -> bool {
-        matches!(self, Self::EVal(..))
+        matches!(self, Self::Val(..))
     }
 
     #[must_use]
     pub fn as_anchor(&self) -> Option<&Anchor<T, E>> {
-        if let Self::EAnchor(v) = self {
+        if let Self::Anchor(v) = self {
             Some(v)
         } else {
             None
+        }
+    }
+
+    #[must_use]
+    pub fn as_val(&self) -> Option<&T> {
+        if let Self::Val(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn try_into_val(self) -> Result<T, Self> {
+        if let Self::Val(v) = self {
+            Ok(v)
+        } else {
+            Err(self)
+        }
+    }
+
+    pub fn try_into_anchor(self) -> Result<Anchor<T, E>, Self> {
+        if let Self::Anchor(v) = self {
+            Ok(v)
+        } else {
+            Err(self)
         }
     }
 }
@@ -114,8 +214,8 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EVal(arg0) => f.debug_tuple("EitherAnchor::EVal").field(arg0).finish(),
-            Self::EAnchor(arg0) => f.debug_tuple("EitherAnchor::EAnchor").field(arg0).finish(),
+            Self::Val(arg0) => f.debug_tuple("EitherAnchor::Val").field(arg0).finish(),
+            Self::Anchor(arg0) => f.debug_tuple("EitherAnchor::Anchor").field(arg0).finish(),
         }
     }
 }
@@ -123,42 +223,112 @@ where
 impl<T: Display, E: Engine> Display for ValOrAnchor<T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EVal(arg0) => f.write_fmt(format_args!("Val({})", arg0)),
-            Self::EAnchor(_arg0) => {
+            Self::Val(arg0) => f.write_fmt(format_args!("Val({})", arg0)),
+            Self::Anchor(_arg0) => {
                 f.write_fmt(format_args!("Anchor<{}>", std::any::type_name::<T>()))
             }
         }
     }
 }
-pub auto trait NotAnchorOrEA {}
-impl<T, E> !NotAnchorOrEA for Anchor<T, E> {}
-impl<T, E> !NotAnchorOrEA for ValOrAnchor<T, E> {}
+// pub auto trait NotAnchorOrEA {}
+// impl<T, E> !NotAnchorOrEA for Anchor<T, E> {}
+// impl<T, E> !NotAnchorOrEA for ValOrAnchor<T, E> {}
 
-impl<T, E: Engine> From<T> for ValOrAnchor<T, E>
-where
-    T: NotAnchorOrEA,
-{
+impl<T, E: Engine> From<T> for ValOrAnchor<T, E> {
     fn from(value: T) -> Self {
-        Self::EVal(value)
+        Self::Val(value)
     }
 }
 
 impl<T, E: Engine> From<Anchor<T, E>> for ValOrAnchor<T, E> {
     fn from(value: Anchor<T, E>) -> Self {
-        Self::EAnchor(value)
+        Self::Anchor(value)
     }
 }
 
-impl<T: 'static, E: Engine> VarEA<T, E> {
+pub trait FromValOrAnchor<T>: Sized {
+    fn cast_from(value: T) -> Self;
+}
+pub trait IntoValOrAnchor<T, E: Engine>: Sized {
+    fn cast_into(self) -> ValOrAnchor<T, E>;
+}
+impl<W, T, E: Engine> IntoValOrAnchor<T, E> for W
+where
+    ValOrAnchor<T, E>: FromValOrAnchor<W>,
+{
+    #[inline]
+    fn cast_into(self) -> ValOrAnchor<T, E> {
+        ValOrAnchor::<T, E>::cast_from(self)
+    }
+}
+
+impl<T, X, E: Engine> FromValOrAnchor<Anchor<X, E>> for ValOrAnchor<T, E>
+where
+    X: Into<T> + Clone + 'static,
+    T: PartialEq + 'static,
+{
+    fn cast_from(value: Anchor<X, E>) -> Self {
+        ValOrAnchor::Anchor(value.map(|x| x.clone().into()))
+    }
+}
+
+impl<E: Engine, X, T> FromValOrAnchor<ValOrAnchor<X, E>> for ValOrAnchor<T, E>
+where
+    T: 'static + PartialEq,
+    X: Into<T> + Clone + 'static,
+{
+    fn cast_from(value: ValOrAnchor<X, E>) -> Self {
+        match value {
+            ValOrAnchor::Val(v) => ValOrAnchor::Val(v.into()),
+            ValOrAnchor::Anchor(av) => ValOrAnchor::Anchor(av.map(|x| x.clone().into())),
+        }
+    }
+}
+
+// default impl<T, X, E: Engine> FromValOrAnchor<ValOrAnchor<X, E>> for ValOrAnchor<T, E>
+// where
+//     T: NotAnchorOrEA + std::cmp::PartialEq + 'static,
+//     X: NotAnchorOrEA + std::cmp::PartialEq + Into<T> + Clone + 'static,
+// {
+//     fn from_voa(value: ValOrAnchor<X, E>) -> Self {
+//         println!(" use map");
+//         match value {
+//             ValOrAnchor::Val(x) => ValOrAnchor::Val(x.into()),
+//             ValOrAnchor::Anchor(ax) => ValOrAnchor::Anchor(ax.map(|x| x.clone().into())),
+//         }
+//     }
+// }
+
+#[cfg(test)]
+mod voa {
+    use crate::{
+        expert::IntoValOrAnchor,
+        singlethread::{ValOrAnchor, Var},
+    };
+
+    #[test]
+    fn xx() {
+        let x = Var::new(1i32);
+        let xw = x.watch();
+        // let a = ValOrAnchor::Val(1i32);
+        let b: ValOrAnchor<i64> = xw.cast_into();
+        // let x = 1i32;
+        // let y: i64 = x.into();
+        // println!("y {:?}", y);
+        println!("b {:?}", b);
+    }
+}
+
+impl<T: 'static, E: Engine> VarVoA<T, E> {
     /// Creates a new Var
-    pub fn new(val: impl Into<ValOrAnchor<T, E>>) -> VarEA<T, E> {
+    pub fn new(val: impl Into<ValOrAnchor<T, E>>) -> VarVoA<T, E> {
         let val: Rc<ValOrAnchor<T, E>> = Rc::new(val.into());
         let inner = Rc::new(RefCell::new(VarEAShared {
             dirty_handle: None,
             val: val.clone(),
             output_stale: true,
         }));
-        VarEA {
+        VarVoA {
             inner: inner.clone(),
             anchor: E::mount(VarEitherAnchor { inner, val }),
         }
@@ -202,7 +372,7 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
 
         // inner.output_stale = true;
 
-        if let ValOrAnchor::<T, E>::EAnchor(an) = &*inner.val {
+        if let ValOrAnchor::<T, E>::Anchor(an) = &*inner.val {
             if &an.token() == edge {
                 // debug!("dirty...output_stale=true");
                 inner.output_stale = true;
@@ -222,7 +392,7 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
             debug!("a0");
             let mut force_unchanged_no_clone = false;
             let poll = match (&*self.val, &*inner.val) {
-                (ValOrAnchor::EVal(_old), ValOrAnchor::EVal(_new_v)) => {
+                (ValOrAnchor::Val(_old), ValOrAnchor::Val(_new_v)) => {
                     debug!("a1");
                     if !Rc::ptr_eq(&self.val, &inner.val) {
                         Poll::Updated
@@ -231,18 +401,18 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
                         Poll::Unchanged
                     }
                 }
-                (ValOrAnchor::EVal(_), ValOrAnchor::EAnchor(new_a)) => {
+                (ValOrAnchor::Val(_), ValOrAnchor::Anchor(new_a)) => {
                     debug!("a2");
 
                     ctx.request(new_a, true)
                 }
-                (ValOrAnchor::EAnchor(outdated_anchor), ValOrAnchor::EVal(_v)) => {
+                (ValOrAnchor::Anchor(outdated_anchor), ValOrAnchor::Val(_v)) => {
                     debug!("a3");
 
                     ctx.unrequest(outdated_anchor);
                     Poll::Updated
                 }
-                (ValOrAnchor::EAnchor(outdated_anchor), ValOrAnchor::EAnchor(new_a)) => {
+                (ValOrAnchor::Anchor(outdated_anchor), ValOrAnchor::Anchor(new_a)) => {
                     debug!("a4");
 
                     if outdated_anchor != new_a {
@@ -282,8 +452,8 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
             debug!("in update - unchanged");
 
             match &*inner.val {
-                ValOrAnchor::EVal(_) => Poll::Unchanged,
-                ValOrAnchor::EAnchor(an) => ctx.request(an, true),
+                ValOrAnchor::Val(_) => Poll::Unchanged,
+                ValOrAnchor::Anchor(an) => ctx.request(an, true),
             }
         }
     }
@@ -296,8 +466,8 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
         'slf: 'out,
     {
         match &*self.val {
-            ValOrAnchor::EVal(v) => v,
-            ValOrAnchor::EAnchor(an) => ctx.get(an),
+            ValOrAnchor::Val(v) => v,
+            ValOrAnchor::Anchor(an) => ctx.get(an),
         }
     }
 }
@@ -321,7 +491,7 @@ mod tests {
 
     use crate::{
         expert::{
-            var_either_anchor::{ValOrAnchor, VarEA},
+            var_val_or_anchor::{ValOrAnchor, VarVoA},
             Constant,
         },
         singlethread::{Engine, Var},
@@ -346,7 +516,7 @@ mod tests {
     fn test_var_either2() {
         let mut engine = Engine::new();
         // 创建锚点 a 和 b
-        let a1 = VarEA::new(1);
+        let a1 = VarVoA::new(1);
 
         let aw = a1.watch().map(|x| x + 1);
 
@@ -361,7 +531,7 @@ mod tests {
         let _xx: ValOrAnchor<i32, Engine> = 2.into();
         let _xx: ValOrAnchor<i32, Engine> = Var::new(2).watch().into();
         // 创建锚点 a 和 b
-        let a1 = VarEA::new(1);
+        let a1 = VarVoA::new(1);
 
         let aw = a1.watch();
 

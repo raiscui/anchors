@@ -1,6 +1,4 @@
-use crate::FnMutInto;
-
-use super::{var_either_anchor::NotAnchorOrEA, Anchor, AnchorInner, Engine, ValOrAnchor};
+use super::{Anchor, AnchorInner, Engine};
 use std::panic::Location;
 
 pub mod cutoff;
