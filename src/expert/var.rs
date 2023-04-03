@@ -1,7 +1,5 @@
 use tracing::{debug_span, error, trace, warn};
 
-use crate::singlethread::AnchorToken;
-
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext,
 };

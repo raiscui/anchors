@@ -1,18 +1,18 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2023-04-03 13:14:46
+ * @LastEditTime: 2023-04-03 23:23:41
  * @LastEditors: Rais
  * @Description:
  */
 mod external_impl;
-use tracing::{debug, debug_span, trace, warn};
+use tracing::{debug, trace};
 
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext, Var,
 };
-use crate::singlethread::AnchorToken;
-use std::{any::Any, cell::RefCell, fmt::Debug};
+
+use std::{cell::RefCell, fmt::Debug};
 use std::{fmt::Display, rc::Rc};
 
 /// An Anchor type for values that are mutated by calling a setter function from outside of the Anchors recomputation graph.
@@ -437,7 +437,7 @@ mod voa {
         let xw = x.watch();
         // let a = ValOrAnchor::Val(1i32);
         let n = 1i32;
-        let nn: i64 = n.into();
+        let _nn: i64 = n.into();
 
         let b: ValOrAnchor<i64> = xw.cast_into();
         // let b: ValOrAnchor<i64> = n.into();
