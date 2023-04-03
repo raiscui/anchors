@@ -266,9 +266,59 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        expert::Constant,
+        expert::{Constant, MultiAnchor},
         singlethread::{Engine, Var},
     };
+
+    #[test]
+    fn test_mut() {
+        let mut engine = Engine::new();
+
+        let a = Var::new(1);
+
+        let aw = a.watch().map_mut(0i32, |out, &x| {
+            if x > 5 {
+                println!("change, out 2");
+                *out = 2;
+                true
+            } else {
+                println!("not change, out 1");
+                *out = 1;
+                false
+            }
+        });
+
+        let b = Var::new(2);
+
+        let aw2 = (&b.watch(), &aw).map(|bv, av| {
+            println!("bv: {bv} av: {av}");
+            *av
+        });
+
+        let aw_solo = aw.map(|av| {
+            println!(" aw change : {av}");
+            *av
+        });
+
+        println!("--------------------- {}", engine.get(&aw));
+        println!("-- {}", engine.get(&aw2));
+        println!("--s {}", engine.get(&aw_solo));
+        // ─────────────────────────────────────────────────────────────
+
+        a.set(10);
+        println!("--------------------- {}", engine.get(&aw));
+        println!("--s {}", engine.get(&aw_solo));
+        println!("-- {}", engine.get(&aw2));
+
+        a.set(2);
+        println!("--------------------- {}", engine.get(&aw));
+        println!("--s {}", engine.get(&aw_solo));
+        println!("-- {}", engine.get(&aw2));
+        println!("--------------------- {}", engine.get(&aw));
+        println!("--s {}", engine.get(&aw_solo));
+        println!("-- {}", engine.get(&aw2));
+        //TODO fix 这里 --s solo 是 2 但是 aw2是1 ,(&b.watch(), &aw).map 和 aw.map 结果不一致
+    }
 
     #[test]
     fn test_var_eq() {

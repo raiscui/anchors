@@ -190,7 +190,7 @@ where
     #[track_caller]
     pub fn increment_reduction<F, T>(&self, initial_state: T, mut f: F) -> Anchor<T, E>
     where
-        F: FnMut(&mut T, &K, &V) + 'static,
+        F: FnMut(&mut T, &K, &V) -> bool + 'static,
         T: Clone + PartialEq + 'static,
     {
         self.unordered_fold(initial_state, move |out, diff_item, len| {
@@ -198,18 +198,13 @@ where
                 return false;
             }
             match diff_item {
-                DiffItem::Add(k, v) => {
-                    f(out, k, v);
-
-                    true
-                }
+                DiffItem::Add(k, v) => f(out, k, v),
                 DiffItem::Update {
                     old: _,
                     new: (k, v),
                 } => {
                     //TODO  if key change , v not?
-                    f(out, k, v);
-                    true
+                    f(out, k, v)
                 }
                 DiffItem::Remove(_k, _v) => false,
             }

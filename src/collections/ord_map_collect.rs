@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-03-31 18:11:56
+ * @LastEditTime: 2023-04-03 15:02:27
  * @LastEditors: Rais
  * @Description:
  */
@@ -14,6 +14,19 @@ use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
 };
 use std::panic::Location;
+
+impl<I, V, E> From<OrdMap<I, Anchor<V, E>>> for Anchor<OrdMap<I, V>, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    V: std::clone::Clone + 'static,
+    I: 'static + Clone + std::cmp::Ord,
+    E: Engine,
+    // OrdMap<I, V>: std::cmp::Eq,
+{
+    fn from(value: OrdMap<I, Anchor<V, E>>) -> Self {
+        OrdMapCollect::new_to_anchor(value)
+    }
+}
 
 impl<I, V, E> From<Anchor<OrdMap<I, Anchor<V, E>>, E>> for Anchor<OrdMap<I, V>, E>
 where

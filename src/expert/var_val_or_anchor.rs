@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2023-03-31 23:26:54
+ * @LastEditTime: 2023-04-03 13:14:46
  * @LastEditors: Rais
  * @Description:
  */
@@ -82,6 +82,12 @@ pub fn voa<T, X: Into<T>, E: Engine>(x: X) -> ValOrAnchor<T, E> {
 pub enum ValOrAnchor<T, E: Engine> {
     Val(T),
     Anchor(Anchor<T, E>),
+}
+
+impl<T, E: Engine> ValOrAnchor<T, E> {
+    pub fn new_val(v: T) -> Self {
+        Self::Val(v)
+    }
 }
 
 impl<T: Default, E: Engine> Default for ValOrAnchor<T, E> {
