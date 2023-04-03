@@ -13,9 +13,10 @@ repository = "https://github.com/lord/anchors"
 # crate-type = ["dylib", "rlib"]
 
 [features]
-default = []
+default = ["generic_size_voa"]
 # pool = ["im-rc/pool"]
 # pool = []
+generic_size_voa = ["emg_common"]
 
 
 [dependencies]
@@ -30,6 +31,8 @@ arena-graph = { version = "0.1.0", path = "../arena-graph" }
 tracing = { version = "^0.1" }
 smallvec = { version = "1.10.0", features = ["const_generics"] }
 emg_hasher = { path = "../iced_emg/emg_hasher" }
+
+emg_common = { path = "../iced_emg/emg_common", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["html_reports", "real_blackbox"] }

@@ -1,12 +1,13 @@
 #![feature(negative_impls)]
 #![feature(exact_size_is_empty)]
 #![feature(specialization)]
-#![feature(option_result_contains)] //for with_anchor func
+// #![feature(option_result_contains)] //for with_anchor func
 #![feature(iter_collect_into)]
 #![feature(auto_traits)]
 #![feature(unboxed_closures)]
 #![feature(tuple_trait)]
 #![feature(fn_traits)]
+#![feature(is_some_and)]
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod collections;

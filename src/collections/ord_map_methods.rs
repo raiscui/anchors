@@ -307,7 +307,7 @@ where
             //     return true;
             // }
 
-            if !last_observation_a.contains(a) {
+            if last_observation_a.as_ref().is_some_and(|x| x != a) {
                 last_observation.clear();
                 *out = initial_state_save.clone();
             }

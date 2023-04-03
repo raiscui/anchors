@@ -266,7 +266,7 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        expert::{Constant, MultiAnchor},
+        expert::Constant,
         singlethread::{Engine, Var},
     };
 

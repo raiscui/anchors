@@ -28,6 +28,7 @@ pub type Anchor<T> = crate::expert::Anchor<T, Engine>;
 pub type VarVOA<T> = crate::expert::VarVOA<T, Engine>;
 pub type Var<T> = crate::expert::Var<T, Engine>;
 pub type ValOrAnchor<T> = crate::expert::ValOrAnchor<T, Engine>;
+pub type ForceOpVOA<T> = crate::expert::ForceOpVOA<T, Engine>;
 
 pub use crate::expert::MultiAnchor;
 

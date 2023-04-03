@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-03-14 10:58:59
+ * @LastEditTime: 2023-03-31 18:11:56
  * @LastEditors: Rais
  * @Description:
  */
@@ -129,11 +129,11 @@ where
                 .iter()
                 .try_fold(vec![], |mut acc, (i, anchor)| {
                     let s = ctx.request(anchor, true);
-                    if s != Poll::Pending {
+                    if s == Poll::Pending {
+                        None
+                    } else {
                         acc.push((s, (i, anchor)));
                         Some(acc)
-                    } else {
-                        None
                     }
                 });
 
@@ -144,7 +144,7 @@ where
             self.dirty = false;
 
             if let Some(ref mut old_vals) = self.vals {
-                for (poll, (i, anchor)) in polls.unwrap().iter() {
+                for (poll, (i, anchor)) in &polls.unwrap() {
                     if &Poll::Updated == poll {
                         old_vals.insert((**i).clone(), ctx.get(anchor).clone());
                         changed = true;

@@ -1,15 +1,15 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2023-03-29 17:33:19
+ * @LastEditTime: 2023-03-31 23:26:54
  * @LastEditors: Rais
  * @Description:
  */
-
+mod external_impl;
 use tracing::{debug, debug_span, trace, warn};
 
 use super::{
-    Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext,
+    Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext, Var,
 };
 use crate::singlethread::AnchorToken;
 use std::{any::Any, cell::RefCell, fmt::Debug};
@@ -75,9 +75,19 @@ impl<T, E: Engine> Clone for VarVOA<T, E> {
     }
 }
 
+pub fn voa<T, X: Into<T>, E: Engine>(x: X) -> ValOrAnchor<T, E> {
+    ValOrAnchor::Val(x.into())
+}
+
 pub enum ValOrAnchor<T, E: Engine> {
     Val(T),
     Anchor(Anchor<T, E>),
+}
+
+impl<T: Default, E: Engine> Default for ValOrAnchor<T, E> {
+    fn default() -> Self {
+        Self::Val(T::default())
+    }
 }
 
 impl<T: Eq, E: Engine> Eq for ValOrAnchor<T, E> {}
@@ -109,6 +119,7 @@ impl<T: PartialEq, E: Engine> PartialEq<Anchor<T, E>> for ValOrAnchor<T, E> {
         }
     }
 }
+//@ ops ─────────────────────────────────────────────────────────────────────────────
 
 impl<T: std::ops::Sub<Output = T>, E: Engine> core::ops::Sub<T> for ValOrAnchor<T, E> {
     type Output = Self;
@@ -154,6 +165,85 @@ where
         }
     }
 }
+
+pub fn force_op<T, E: Engine>(voa: ValOrAnchor<T, E>) -> ForceOpVOA<T, E> {
+    ForceOpVOA(voa)
+}
+
+pub struct ForceOpVOA<T, E: Engine>(ValOrAnchor<T, E>);
+
+impl<
+        T: std::ops::Sub<Output = T> + std::clone::Clone + std::cmp::PartialEq + 'static,
+        E: Engine,
+    > core::ops::Sub<T> for ForceOpVOA<T, E>
+{
+    type Output = ValOrAnchor<T, E>;
+
+    fn sub(self, rhs: T) -> Self::Output {
+        match self.0 {
+            ValOrAnchor::Val(v) => ValOrAnchor::Val(v - rhs),
+            ValOrAnchor::Anchor(an) => {
+                ValOrAnchor::Anchor(an.map(move |x| x.clone() - rhs.clone()))
+            }
+        }
+    }
+}
+
+impl<
+        T: std::ops::Add<Output = T> + std::clone::Clone + std::cmp::PartialEq + 'static,
+        E: Engine,
+    > core::ops::Add<T> for ForceOpVOA<T, E>
+{
+    type Output = ValOrAnchor<T, E>;
+
+    fn add(self, rhs: T) -> Self::Output {
+        match self.0 {
+            ValOrAnchor::Val(v) => ValOrAnchor::Val(v + rhs),
+            ValOrAnchor::Anchor(an) => {
+                ValOrAnchor::Anchor(an.map(move |x| x.clone() + rhs.clone()))
+            }
+        }
+    }
+}
+
+impl<T, E: Engine> core::ops::AddAssign<T> for ForceOpVOA<T, E>
+where
+    T: core::ops::AddAssign<T>
+        + std::cmp::PartialEq
+        + Clone
+        + std::ops::Add<T, Output = T>
+        + 'static,
+{
+    fn add_assign(&mut self, rhs: T) {
+        match &mut self.0 {
+            ValOrAnchor::Val(t) => {
+                *t += rhs;
+            }
+            ValOrAnchor::Anchor(an) => {
+                *an = an.map(move |x| x.clone() + rhs.clone());
+            }
+        };
+    }
+}
+impl<T, E: Engine> core::ops::SubAssign<T> for ForceOpVOA<T, E>
+where
+    T: core::ops::SubAssign<T>
+        + std::cmp::PartialEq
+        + Clone
+        + std::ops::Sub<T, Output = T>
+        + 'static,
+{
+    fn sub_assign(&mut self, rhs: T) {
+        match &mut self.0 {
+            ValOrAnchor::Val(t) => *t -= rhs,
+            ValOrAnchor::Anchor(an) => {
+                *an = an.map(move |x| x.clone() - rhs.clone());
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl<T: Clone, E: Engine> Clone for ValOrAnchor<T, E> {
     fn clone(&self) -> Self {
@@ -230,10 +320,20 @@ impl<T: Display, E: Engine> Display for ValOrAnchor<T, E> {
         }
     }
 }
-// pub auto trait NotAnchorOrEA {}
-// impl<T, E> !NotAnchorOrEA for Anchor<T, E> {}
-// impl<T, E> !NotAnchorOrEA for ValOrAnchor<T, E> {}
 
+pub auto trait NotAnchorOrEA {}
+impl<T, E> !NotAnchorOrEA for Anchor<T, E> {}
+impl<T, E> !NotAnchorOrEA for ValOrAnchor<T, E> {}
+
+// impl<T, X, E: Engine> From<X> for ValOrAnchor<T, E>
+// where
+//     T: NotAnchorOrEA,
+//     X: Into<T> + NotAnchorOrEA,
+// {
+//     fn from(value: X) -> Self {
+//         Self::Val(value.into())
+//     }
+// }
 impl<T, E: Engine> From<T> for ValOrAnchor<T, E> {
     fn from(value: T) -> Self {
         Self::Val(value)
@@ -262,6 +362,24 @@ where
     }
 }
 
+impl<T, X, E: Engine> CastFromValOrAnchor<VarVOA<X, E>> for ValOrAnchor<T, E>
+where
+    X: Into<T> + Clone + 'static,
+    T: PartialEq + 'static,
+{
+    fn cast_from(value: VarVOA<X, E>) -> Self {
+        ValOrAnchor::Anchor(value.watch().map(|x| x.clone().into()))
+    }
+}
+impl<T, X, E: Engine> CastFromValOrAnchor<Var<X, E>> for ValOrAnchor<T, E>
+where
+    X: Into<T> + Clone + 'static,
+    T: PartialEq + 'static,
+{
+    fn cast_from(value: Var<X, E>) -> Self {
+        ValOrAnchor::Anchor(value.watch().map(|x| x.clone().into()))
+    }
+}
 impl<T, X, E: Engine> CastFromValOrAnchor<Anchor<X, E>> for ValOrAnchor<T, E>
 where
     X: Into<T> + Clone + 'static,
@@ -307,12 +425,16 @@ mod voa {
     };
 
     #[test]
-    fn xx() {
-        let engine = Engine::new();
+    fn test_into() {
+        let _engine = Engine::new();
         let x = Var::new(1i32);
         let xw = x.watch();
         // let a = ValOrAnchor::Val(1i32);
+        let n = 1i32;
+        let nn: i64 = n.into();
+
         let b: ValOrAnchor<i64> = xw.cast_into();
+        // let b: ValOrAnchor<i64> = n.into();
         // let x = 1i32;
         // let y: i64 = x.into();
         // println!("y {:?}", y);

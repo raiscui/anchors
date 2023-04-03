@@ -231,4 +231,7 @@ mod var_val_or_anchor;
 pub use constant::Constant;
 use tracing::{debug, debug_span};
 pub use var::Var;
-pub use var_val_or_anchor::{CastFromValOrAnchor, CastIntoValOrAnchor, ValOrAnchor, VarVOA};
+pub use var_val_or_anchor::{
+    force_op, voa, CastFromValOrAnchor, CastIntoValOrAnchor, ForceOpVOA, NotAnchorOrEA,
+    ValOrAnchor, VarVOA,
+};
