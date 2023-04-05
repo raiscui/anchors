@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-04-03 14:30:01
- * @LastEditTime: 2023-04-03 15:37:22
+ * @LastEditTime: 2023-04-05 00:12:41
  * @LastEditors: Rais
  * @Description:
  */
@@ -194,7 +194,7 @@ where
                                 old_vals.insert((**i).clone(), ctx.get(an).clone());
                                 changed = true;
                             }
-                            _ => (),
+                            _ => {}
                         }
                     }
                 }
@@ -248,11 +248,9 @@ where
 #[cfg(test)]
 mod test {
 
-    use crate::{collections::ord_map_methods::Dict, expert::voa, im::OrdMap};
+    use crate::{collections::ord_map_methods::Dict, im::OrdMap};
 
     use crate::{dict, singlethread::*};
-
-    use super::OrdMapVOACollect;
 
     #[test]
     fn collect_k_change() {

@@ -7,3 +7,4 @@ pub mod ord_set_methods;
 mod rope;
 mod smallvec;
 pub mod vector;
+pub mod vector_voa;
