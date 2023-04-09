@@ -33,6 +33,17 @@ where
         value.then(|v| VectorCollect::new_to_anchor(v.clone()))
     }
 }
+impl<V, E> From<Vector<Anchor<V, E>>> for Anchor<Vector<V>, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    V: std::clone::Clone + 'static,
+    E: Engine,
+    // OrdMap<I, V>: std::cmp::Eq,
+{
+    fn from(value: Vector<Anchor<V, E>>) -> Self {
+        VectorCollect::new_to_anchor(value)
+    }
+}
 
 impl<I: 'static + Clone, E: Engine> std::iter::FromIterator<Anchor<I, E>> for Anchor<Vector<I>, E> {
     fn from_iter<T>(iter: T) -> Self
