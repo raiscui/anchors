@@ -41,17 +41,17 @@ impl<T: 'static> Constant<T> {
 
 impl<T: 'static, E: Engine> AnchorInner<E> for Constant<T> {
     type Output = T;
-    fn dirty(&mut self, child: &<E::AnchorHandle as AnchorHandle>::Token) {
-        let e = child as &dyn Any;
-        let ee = e
+    fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+        let e = edge as &dyn Any;
+        let nodekey = e
             .downcast_ref::<crate::singlethread::AnchorToken>()
             .unwrap();
-        let ng = unsafe { ee.ptr.lookup_unchecked() };
+        let ng = unsafe { nodekey.ptr.lookup_unchecked() };
 
         error!(
             target:"anchors",
             "Constant never has any inputs; dirty should not have been called. alleged child: {:?},child info: {:?}  ,type: {:?},\nloc{:?}",
-            child,
+            edge,
             ng.debug_info.get(),
             std::any::type_name::<T>(),
             self.location

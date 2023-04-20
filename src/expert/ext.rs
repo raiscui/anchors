@@ -264,6 +264,34 @@ where
             location: Location::caller(),
         })
     }
+    #[track_caller]
+    pub fn debounce(&self) -> Anchor<O1, E>
+    where
+        O1: PartialEq + Copy,
+    {
+        let mut old_v: Option<O1> = None;
+        self.cutoff(move |x| {
+            if let Some(ov) = &old_v && ov == x {
+                return false;
+            }
+            old_v = Some(*x);
+            true
+        })
+    }
+    #[track_caller]
+    pub fn debounce_clone(&self) -> Anchor<O1, E>
+    where
+        O1: PartialEq + Clone,
+    {
+        let mut old_v: Option<O1> = None;
+        self.cutoff(move |x| {
+            if let Some(ov) = &old_v && ov == x {
+                return false;
+            }
+            old_v = Some(x.clone());
+            true
+        })
+    }
 }
 
 macro_rules! impl_tuple_ext {

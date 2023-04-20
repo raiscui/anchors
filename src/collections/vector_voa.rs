@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-04-04 23:56:14
- * @LastEditTime: 2023-04-05 20:36:28
+ * @LastEditTime: 2023-04-18 12:22:14
  * @LastEditors: Rais
  * @Description:
  */
@@ -50,6 +50,17 @@ where
 {
     fn from(value: Vector<ValOrAnchor<V, E>>) -> Self {
         VectorVOACollect::new_to_anchor(value)
+    }
+}
+impl<V, E> From<&Anchor<Vector<ValOrAnchor<V, E>>, E>> for Anchor<Vector<V>, E>
+where
+    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    V: std::clone::Clone + 'static,
+    E: Engine,
+    // OrdMap<I, V>: std::cmp::Eq,
+{
+    fn from(value: &Anchor<Vector<ValOrAnchor<V, E>>, E>) -> Self {
+        value.then(|v| VectorVOACollect::new_to_anchor(v.clone()))
     }
 }
 impl<V, E> From<Anchor<Vector<ValOrAnchor<V, E>>, E>> for Anchor<Vector<V>, E>
@@ -259,13 +270,13 @@ mod test {
         let sum: Anchor<usize> = nums.map(|nums| nums.iter().sum());
         let ns: Anchor<usize> = nums.map(|nums: &Vector<_>| nums.len());
 
-        assert_eq!(engine.get(&sum), 8+22);
+        assert_eq!(engine.get(&sum), 8 + 22);
 
         a.set(2);
-        assert_eq!(engine.get(&sum), 9+22);
+        assert_eq!(engine.get(&sum), 9 + 22);
 
         c.set(1);
-        assert_eq!(engine.get(&sum), 2+2+1+22);
+        assert_eq!(engine.get(&sum), 2 + 2 + 1 + 22);
         println!("ns {}", engine.get(&ns));
         b.set(9);
         println!("after b set: {}", engine.get(&sum));

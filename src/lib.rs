@@ -8,6 +8,7 @@
 #![feature(tuple_trait)]
 #![feature(fn_traits)]
 #![feature(is_some_and)]
+#![feature(let_chains)]
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod collections;

@@ -1,18 +1,18 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2023-04-03 23:23:41
+ * @LastEditTime: 2023-04-20 12:12:59
  * @LastEditors: Rais
  * @Description:
  */
 mod external_impl;
-use tracing::{debug, trace};
+use tracing::{debug, error, trace};
 
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext, Var,
 };
 
-use std::{cell::RefCell, fmt::Debug};
+use std::{borrow::Cow, cell::RefCell, fmt::Debug};
 use std::{fmt::Display, rc::Rc};
 
 /// An Anchor type for values that are mutated by calling a setter function from outside of the Anchors recomputation graph.
@@ -496,17 +496,30 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
 impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
     type Output = T;
     fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        // debug!("dirty...");
+        // println!("dirty...");
         let mut inner = self.inner.borrow_mut();
 
         // inner.output_stale = true;
-
+        // return;
+        if inner.output_stale {
+            return;
+        }
         if let ValOrAnchor::<T, E>::Anchor(an) = &*inner.val {
             if &an.token() == edge {
-                // debug!("dirty...output_stale=true");
+                // debug!("dirty...output_stale=true, VarEitherAnchor");
+                // println!("dirty...output_stale=true, VarEitherAnchor");
                 inner.output_stale = true;
             }
-        }
+        } else {
+            //NOTE is val
+            error!(
+                target:"anchors",
+                "dirty,  edge: {:?},  ,type: {:?}",
+                edge,
+                // ng.debug_info.get(),
+                std::any::type_name::<T>(),
+            );
+        };
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
@@ -523,11 +536,11 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
             let poll = match (&*self.val, &*inner.val) {
                 (ValOrAnchor::Val(_old), ValOrAnchor::Val(_new_v)) => {
                     debug!("a1");
-                    if !Rc::ptr_eq(&self.val, &inner.val) {
-                        Poll::Updated
-                    } else {
+                    if Rc::ptr_eq(&self.val, &inner.val) {
                         force_unchanged_no_clone = true;
                         Poll::Unchanged
+                    } else {
+                        Poll::Updated
                     }
                 }
                 (ValOrAnchor::Val(_), ValOrAnchor::Anchor(new_a)) => {

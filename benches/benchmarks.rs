@@ -578,4 +578,4 @@ criterion_group! {
 
 // criterion_main!(all);
 // criterion_main!(im);
-criterion_main!(var_e_a);
+criterion_main!(benches);

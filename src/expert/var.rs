@@ -171,17 +171,17 @@ impl<T: 'static, E: Engine> Var<T, E> {
 
 impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
     type Output = T;
-    fn dirty(&mut self, child: &<E::AnchorHandle as AnchorHandle>::Token) {
-        let e = child as &dyn Any;
-        let ee = e
+    fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+        let e = edge as &dyn Any;
+        let nodekey = e
             .downcast_ref::<crate::singlethread::AnchorToken>()
             .unwrap();
-        let ng = unsafe { ee.ptr.lookup_unchecked() };
+        let ng = unsafe { nodekey.ptr.lookup_unchecked() };
 
         error!(
             target:"anchors",
-            "dirty,  child: {:?},child info: {:?}  ,type: {:?}",
-            child,
+            "dirty,  edge: {:?},edge info: {:?}  ,type: {:?}",
+            edge,
             ng.debug_info.get(),
             std::any::type_name::<T>(),
         );

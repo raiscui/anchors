@@ -25,6 +25,9 @@ macro_rules! impl_tuple_map_mut {
             type Output = Out;
             fn dirty(&mut self, edge:  &<E::AnchorHandle as crate::expert::AnchorHandle>::Token) {
                 // self.output_stale = true;
+                if self.output_stale {
+                    return;
+                }
                 $(
                     if edge == &self.anchors.$num.data.token() {
                         self.output_stale = true;

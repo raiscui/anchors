@@ -25,6 +25,10 @@ macro_rules! impl_tuple_then {
         {
             type Output = Out;
             fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+                if self.output_stale {
+                    return;
+                }
+
                 $(
                     // only invalidate f_anchor if one of the lhs anchors is invalidated
                     if edge == &self.anchors.$num.data.token() {
