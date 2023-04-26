@@ -17,24 +17,20 @@ fn main() {
     engine.mark_observed(&animal_callback);
 
     println!("stabilizing...");
-    engine.stabilize();
-
+    // engine.stabilize();
+    engine.get(&cat_count.watch());
+    println!("cat_count setting...");
     cat_count.set(2);
+    println!("dog_count setting...");
     dog_count.set(2);
     println!("stabilizing...");
-    engine.stabilize();
+    // engine.stabilize();
+    engine.get(&cat_count.watch());
 
+    println!("fish_count setting...");
     fish_count.set(2);
     println!("stabilizing...");
-    engine.stabilize();
+    // engine.stabilize();
+    engine.get(&cat_count.watch());
 
-    let a = Rc::new(String::from("ff"));
-    let b = a.deref();
-    let c = a.as_ref();
-    let d = String::from("fff");
-    let dd = d.deref();
-    let ddd = &d;
-    let dddd = ddd.deref();
-    println!("{} {} {}", a, b, c);
-    println!("{} {} {} {} ", d, dd, ddd, dddd);
 }
