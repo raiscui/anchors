@@ -2,7 +2,7 @@
 name = "anchors"
 version = "0.6.0"
 authors = ["Robert Lord <robert@lord.io>"]
-edition = "2021"
+edition = "2024"
 description = "async incremental computations"
 license = "MIT"
 documentation = "https://docs.rs/anchors"
@@ -30,9 +30,9 @@ arena-graph = { version = "0.1.0", path = "../arena-graph" }
 
 tracing = { version = "^0.1" }
 smallvec = { version = "1.10.0", features = ["const_generics"] }
-emg_hasher = { path = "../iced_emg/emg_hasher" }
+emg_hasher = { path = "../emg_hasher" }
 
-emg_common = { path = "../iced_emg/emg_common", optional = true }
+emg_common = { path = "../emg_common", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["html_reports", "real_blackbox"] }

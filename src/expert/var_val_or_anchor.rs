@@ -178,10 +178,8 @@ pub fn force_op<T, E: Engine>(voa: ValOrAnchor<T, E>) -> ForceOpVOA<T, E> {
 
 pub struct ForceOpVOA<T, E: Engine>(ValOrAnchor<T, E>);
 
-impl<
-        T: std::ops::Sub<Output = T> + std::clone::Clone + std::cmp::PartialEq + 'static,
-        E: Engine,
-    > core::ops::Sub<T> for ForceOpVOA<T, E>
+impl<T: std::ops::Sub<Output = T> + std::clone::Clone + std::cmp::PartialEq + 'static, E: Engine>
+    core::ops::Sub<T> for ForceOpVOA<T, E>
 {
     type Output = ValOrAnchor<T, E>;
 
@@ -195,10 +193,8 @@ impl<
     }
 }
 
-impl<
-        T: std::ops::Add<Output = T> + std::clone::Clone + std::cmp::PartialEq + 'static,
-        E: Engine,
-    > core::ops::Add<T> for ForceOpVOA<T, E>
+impl<T: std::ops::Add<Output = T> + std::clone::Clone + std::cmp::PartialEq + 'static, E: Engine>
+    core::ops::Add<T> for ForceOpVOA<T, E>
 {
     type Output = ValOrAnchor<T, E>;
 
@@ -328,7 +324,7 @@ impl<T: Display, E: Engine> Display for ValOrAnchor<T, E> {
 }
 
 pub auto trait NotAnchorOrEA {}
-impl<T, E> !NotAnchorOrEA for Anchor<T, E> {}
+impl<T, E: Engine + ?Sized> !NotAnchorOrEA for Anchor<T, E> {}
 impl<T, E> !NotAnchorOrEA for ValOrAnchor<T, E> {}
 
 // impl<T, X, E: Engine> From<X> for ValOrAnchor<T, E>
@@ -633,8 +629,8 @@ mod tests {
 
     use crate::{
         expert::{
-            var_val_or_anchor::{ValOrAnchor, VarVOA},
             Constant,
+            var_val_or_anchor::{ValOrAnchor, VarVOA},
         },
         singlethread::{Engine, Var},
     };
