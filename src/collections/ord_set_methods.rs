@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-01-20 17:00:31
- * @LastEditTime: 2023-03-17 14:32:56
+ * @LastEditTime: 2025-09-16 12:58:55
  * @LastEditors: Rais
  * @Description:
  */
@@ -14,8 +14,6 @@ impl<E: Engine, K: Clone + Ord + 'static> Anchor<OrdSet<K>, E> {
     pub fn filter<F: FnMut(&K) -> bool + 'static>(&self, f: F) -> Anchor<OrdSet<K>, E> {
         self.filter_map(f)
     }
-
-    // TODO rlord: fix this name god
 
     // #[track_caller]
 
