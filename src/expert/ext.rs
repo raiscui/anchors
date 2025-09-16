@@ -271,7 +271,9 @@ where
     {
         let mut old_v: Option<O1> = None;
         self.cutoff(move |x| {
-            if let Some(ov) = &old_v && ov == x {
+            if let Some(ov) = &old_v
+                && ov == x
+            {
                 return false;
             }
             old_v = Some(*x);
@@ -285,7 +287,9 @@ where
     {
         let mut old_v: Option<O1> = None;
         self.cutoff(move |x| {
-            if let Some(ov) = &old_v && ov == x {
+            if let Some(ov) = &old_v
+                && ov == x
+            {
                 return false;
             }
             old_v = Some(x.clone());

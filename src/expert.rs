@@ -218,13 +218,13 @@ pub trait AnchorInner<E: Engine + ?Sized> {
 }
 
 mod ext;
+pub use ext::MultiAnchor;
 pub use ext::cutoff;
 pub use ext::either;
 pub use ext::map;
 pub use ext::map_mut;
 pub use ext::refmap;
 pub use ext::then;
-pub use ext::MultiAnchor;
 pub(crate) mod constant;
 mod var;
 mod var_val_or_anchor;
@@ -232,6 +232,6 @@ pub use constant::Constant;
 use tracing::{debug, debug_span};
 pub use var::Var;
 pub use var_val_or_anchor::{
-    force_op, voa, CastFromValOrAnchor, CastIntoValOrAnchor, ForceOpVOA, NotAnchorOrEA,
-    ValOrAnchor, VarVOA,
+    CastFromValOrAnchor, CastIntoValOrAnchor, ForceOpVOA, NotAnchorOrEA, ValOrAnchor, VarVOA,
+    force_op, voa,
 };

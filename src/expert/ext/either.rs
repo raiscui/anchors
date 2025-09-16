@@ -225,7 +225,7 @@ mod tests {
     use tracing::debug;
 
     use crate::{
-        expert::{var_val_or_anchor::CastIntoValOrAnchor, MultiAnchor},
+        expert::{MultiAnchor, var_val_or_anchor::CastIntoValOrAnchor},
         singlethread::{Engine, Var, VarVOA},
     };
 
@@ -289,11 +289,7 @@ mod tests {
 
         let w = a.watch().either(move |&x| {
             debug!("in either  ,  x:{x}");
-            if x >= 2 {
-                bw.clone().into()
-            } else {
-                x.into()
-            }
+            if x >= 2 { bw.clone().into() } else { x.into() }
         });
         let ww = w.map(|x| {
             debug!("in map  ww,  x:{x}");
@@ -347,11 +343,7 @@ mod tests {
 
         let w = a.watch().either(move |&x| {
             debug!("in either  ,  x:{x}");
-            if x >= 2 {
-                bw.clone().into()
-            } else {
-                x.into()
-            }
+            if x >= 2 { bw.clone().into() } else { x.into() }
         });
 
         assert_eq!(engine.get(&w), 1);

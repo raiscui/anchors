@@ -32,5 +32,4 @@ fn main() {
     println!("stabilizing...");
     // engine.stabilize();
     engine.get(&cat_count.watch());
-
 }

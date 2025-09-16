@@ -231,7 +231,7 @@ mod test {
 
     use crate::{
         expert::CastIntoValOrAnchor,
-        im::{vector, Vector},
+        im::{Vector, vector},
     };
 
     use crate::singlethread::*;

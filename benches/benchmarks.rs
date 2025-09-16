@@ -4,10 +4,10 @@ use anchors::{
     singlethread::{Anchor, Engine, MultiAnchor, Var},
 };
 
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
-use anchors::im::{ordmap, vector, Vector};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use anchors::im::{Vector, ordmap, vector};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 fn stabilize_linear_nodes_simple(c: &mut Criterion) {
     for node_count in &[10, 100, 1000] {

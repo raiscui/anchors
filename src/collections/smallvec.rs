@@ -131,7 +131,7 @@ impl<T: 'static + Clone, E: Engine, const S: usize> AnchorInner<E> for SmallVecC
 
 #[cfg(test)]
 mod test {
-    use smallvec::{smallvec, SmallVec};
+    use smallvec::{SmallVec, smallvec};
 
     use crate::singlethread::*;
 

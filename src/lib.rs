@@ -35,7 +35,6 @@ where
 impl<Args, Res2, Fun> FnMutInto2<Res2, Args> for Fun
 where
     Self: FnMut<Args> + 'static,
-
     Args: std::marker::Tuple,
     Res2: From<Self::Output>,
 {
@@ -59,7 +58,6 @@ where
 impl<Args, Fun> FnMutInto<Args> for Fun
 where
     Self: FnMut<Args> + 'static,
-
     Args: std::marker::Tuple,
 {
     fn call_into<Res2>(&mut self, args: Args) -> Res2

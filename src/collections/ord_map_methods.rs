@@ -2,7 +2,7 @@ use tracing::debug;
 
 use crate::{
     expert::MultiAnchor,
-    im::{ordmap::DiffItem, OrdMap},
+    im::{OrdMap, ordmap::DiffItem},
 };
 
 use crate::expert::{Anchor, Engine};
@@ -37,11 +37,7 @@ where
         F: FnMut(&A, &K, &V) -> bool + 'static,
     {
         self.filter_map_with_anchor(pool_size, anchor, move |a, k, v| {
-            if f(a, k, v) {
-                Some(v.clone())
-            } else {
-                None
-            }
+            if f(a, k, v) { Some(v.clone()) } else { None }
         })
     }
 
@@ -346,11 +342,7 @@ mod test {
         let anchor1 = var_1.watch();
         let filtered = a.watch().filter_map_with_anchor(10, &anchor1, |aa, k, v| {
             debug!("k={} a={}", k, aa);
-            if k != aa {
-                Some(*v)
-            } else {
-                None
-            }
+            if k != aa { Some(*v) } else { None }
         });
 
         let expected = ordmap! {"a".to_string()=>1, "c".to_string()=>5,"d".to_string()=>24};
@@ -372,11 +364,7 @@ mod test {
         let anchor1 = var_1.watch();
         let filtered = a.watch().filter_map_with_anchor(8, &anchor1, |aa, k, v| {
             debug!("k={} a={}", k, aa);
-            if k != aa {
-                Some(*v)
-            } else {
-                None
-            }
+            if k != aa { Some(*v) } else { None }
         });
 
         let sum = filtered.map(|d| d.values().sum::<i32>());

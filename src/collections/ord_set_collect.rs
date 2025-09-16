@@ -118,7 +118,7 @@ where
 #[cfg(test)]
 mod test {
 
-    use crate::im::{ordset, OrdSet};
+    use crate::im::{OrdSet, ordset};
 
     use crate::singlethread::*;
 

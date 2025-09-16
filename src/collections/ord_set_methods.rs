@@ -5,7 +5,7 @@
  * @LastEditors: Rais
  * @Description:
  */
-use crate::im::{ordset::DiffItem, OrdSet};
+use crate::im::{OrdSet, ordset::DiffItem};
 
 use crate::expert::{Anchor, Engine};
 

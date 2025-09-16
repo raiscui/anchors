@@ -193,7 +193,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
 #[cfg(test)]
 mod test {
 
-    use crate::im::{vector, Vector};
+    use crate::im::{Vector, vector};
 
     use crate::singlethread::*;
 

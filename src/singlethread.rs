@@ -333,6 +333,189 @@ impl Engine {
         "".to_string()
     }
 
+    /// 导出指定若干 AnchorToken 作为根的依赖图，生成 GraphViz DOT 文本
+    ///
+    /// 设计说明：
+    /// - 仅遍历从 roots 出发可达的子图，避免整个图的暴力扫描（Graph2 不暴露全量迭代接口）。
+    /// - 边分两类：
+    ///   - CleanParent 依赖：计算上的普通父依赖（使用实线）
+    ///   - NecessaryChild 依赖：必要子链路（使用虚线）
+    /// - 节点标签：优先使用 `AnchorDebugInfo` 的位置信息（文件:行:列 + 名称），否则使用类型名。
+    ///
+    /// 使用方式（示例）：
+    /// ```ignore
+    /// let roots = vec![anchor_a.token(), anchor_b.token()];
+    /// let dot = engine.export_dot_from_tokens(&roots);
+    /// println!("{}", dot);
+    /// ```
+    pub fn export_dot_from_tokens(&self, roots: &[AnchorToken]) -> String {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        // 使用 BFS 遍历从 roots 可达的子图
+        let mut visited: HashSet<AnchorToken> = HashSet::new();
+        let mut queue: VecDeque<AnchorToken> = VecDeque::new();
+
+        for &r in roots {
+            if visited.insert(r) {
+                queue.push_back(r);
+            }
+        }
+
+        // 收集节点与边
+        #[derive(Clone, Copy)]
+        enum EdgeKind {
+            CleanParent,
+            Necessary,
+        }
+
+        let mut edges: Vec<(AnchorToken, AnchorToken, EdgeKind)> = Vec::new();
+        let mut labels: HashMap<AnchorToken, String> = HashMap::new();
+
+        self.graph.with(|graph| {
+            while let Some(tok) = queue.pop_front() {
+                if let Some(node) = graph.get(tok) {
+                    // 生成节点标签：优先使用 debug 位置信息
+                    let dbg = node.debug_info.get();
+                    let label = match dbg.location {
+                        Some((name, loc)) => {
+                            // 例如："file.rs:123:45\nname"
+                            format!("{}\n{}", loc, name)
+                        }
+                        None => dbg._to_string(),
+                    };
+                    labels.entry(tok).or_insert(label);
+
+                    // Clean parents（从当前 -> 父）
+                    for p in node.clean_parents() {
+                        let ptok = p.key();
+                        edges.push((tok, ptok, EdgeKind::CleanParent));
+                        if visited.insert(ptok) {
+                            queue.push_back(ptok);
+                        }
+                    }
+                    // Necessary children（统一采用 依赖 -> 使用者 的方向：child -> self）
+                    for c in node.necessary_children() {
+                        let ctok = c.key();
+                        edges.push((ctok, tok, EdgeKind::Necessary));
+                        if visited.insert(ctok) {
+                            queue.push_back(ctok);
+                        }
+                    }
+                }
+            }
+        });
+
+        // 生成 DOT 文本
+        let mut out = String::new();
+        out.push_str("digraph Anchors {\n");
+        out.push_str("  rankdir=LR;\n");
+        out.push_str("  node [shape=box, fontsize=10];\n");
+
+        // 打印节点
+        for (tok, label) in labels.iter() {
+            // 使用 token.ptr 的地址作为稳定 id（Debug 格式包含指针值）
+            out.push_str(&format!(
+                "  \"{:?}\" [label=\"{}\"];\n",
+                tok.ptr,
+                label.replace('\"', "\\\"")
+            ));
+        }
+
+        // 打印边
+        for (a, b, kind) in edges.iter().copied() {
+            let style = match kind {
+                EdgeKind::CleanParent => "solid",
+                EdgeKind::Necessary => "dashed",
+            };
+            out.push_str(&format!(
+                "  \"{:?}\" -> \"{:?}\" [style={}];\n",
+                a.ptr, b.ptr, style
+            ));
+        }
+
+        out.push_str("}\n");
+        out
+    }
+
+    /// 与 `export_dot_from_tokens` 类似，但允许用户提供 `names` 来覆盖节点标签（用于显示变量名等）。
+    pub fn export_dot_from_tokens_with_names(
+        &self,
+        roots: &[AnchorToken],
+        names: &std::collections::HashMap<AnchorToken, String>,
+    ) -> String {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let mut visited: HashSet<AnchorToken> = HashSet::new();
+        let mut queue: VecDeque<AnchorToken> = VecDeque::new();
+        for &r in roots {
+            if visited.insert(r) {
+                queue.push_back(r);
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum EdgeKind {
+            CleanParent,
+            Necessary,
+        }
+
+        let mut edges: Vec<(AnchorToken, AnchorToken, EdgeKind)> = Vec::new();
+        let mut labels: HashMap<AnchorToken, String> = HashMap::new();
+
+        self.graph.with(|graph| {
+            while let Some(tok) = queue.pop_front() {
+                if let Some(node) = graph.get(tok) {
+                    let dbg = node.debug_info.get();
+                    let default_label = match dbg.location {
+                        Some((name, loc)) => format!("{}\n{}", loc, name),
+                        None => dbg._to_string(),
+                    };
+                    let label = names.get(&tok).cloned().unwrap_or(default_label);
+                    labels.entry(tok).or_insert(label);
+
+                    for p in node.clean_parents() {
+                        let ptok = p.key();
+                        edges.push((tok, ptok, EdgeKind::CleanParent));
+                        if visited.insert(ptok) {
+                            queue.push_back(ptok);
+                        }
+                    }
+                    for c in node.necessary_children() {
+                        let ctok = c.key();
+                        edges.push((ctok, tok, EdgeKind::Necessary));
+                        if visited.insert(ctok) {
+                            queue.push_back(ctok);
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut out = String::new();
+        out.push_str("digraph Anchors {\n");
+        out.push_str("  rankdir=LR;\n");
+        out.push_str("  node [shape=box, fontsize=10];\n");
+        for (tok, label) in labels.iter() {
+            out.push_str(&format!(
+                "  \"{:?}\" [label=\"{}\"];\n",
+                tok.ptr,
+                label.replace('\"', "\\\"")
+            ));
+        }
+        for (a, b, kind) in edges.iter().copied() {
+            let style = match kind {
+                EdgeKind::CleanParent => "solid",
+                EdgeKind::Necessary => "dashed",
+            };
+            out.push_str(&format!(
+                "  \"{:?}\" -> \"{:?}\" [style={}];\n",
+                a.ptr, b.ptr, style
+            ));
+        }
+        out.push_str("}\n");
+        out
+    }
+
     pub fn check_observed<T>(&self, anchor: &Anchor<T>) -> ObservedState {
         self.graph.with(|graph| {
             let node = graph.get(anchor.token()).unwrap();
@@ -564,4 +747,3 @@ impl AnchorDebugInfo {
         }
     }
 }
-
