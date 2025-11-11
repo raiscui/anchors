@@ -12,7 +12,7 @@ use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext, Var,
 };
 
-use std::{borrow::Cow, cell::RefCell, fmt::Debug};
+use std::{cell::RefCell, fmt::Debug};
 use std::{fmt::Display, rc::Rc};
 
 /// An Anchor type for values that are mutated by calling a setter function from outside of the Anchors recomputation graph.

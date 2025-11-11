@@ -1,4 +1,4 @@
-use anchors::expert::{MultiAnchor, Var};
+use anchors::expert::Var;
 use anchors::singlethread::*;
 use std::cell::RefCell;
 

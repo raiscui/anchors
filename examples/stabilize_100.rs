@@ -1,4 +1,4 @@
-use anchors::expert::{Anchor, MultiAnchor, Var};
+use anchors::expert::{Anchor, Var};
 use anchors::singlethread::Engine;
 
 const NODE_COUNT: u64 = 100;

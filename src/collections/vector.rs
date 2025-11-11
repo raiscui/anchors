@@ -5,7 +5,7 @@ use crate::im::Vector;
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
 };
-use std::{any::Any, panic::Location};
+use std::panic::Location;
 
 use super::ord_map_methods::Dict;
 

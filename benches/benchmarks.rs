@@ -1,7 +1,7 @@
 use anchors::{
     collections::ord_map_methods::Dict,
     expert::VarVOA,
-    singlethread::{Anchor, Engine, MultiAnchor, Var},
+    singlethread::{Anchor, Engine, Var},
 };
 
 use smallvec::{SmallVec, smallvec};

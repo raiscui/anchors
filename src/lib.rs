@@ -7,9 +7,7 @@
 #![feature(unboxed_closures)]
 #![feature(tuple_trait)]
 #![feature(fn_traits)]
-#![feature(is_some_and)]
-#![feature(let_chains)]
-#![feature(local_key_cell_methods)]
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod collections;
