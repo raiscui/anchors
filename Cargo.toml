@@ -13,10 +13,11 @@ repository = "https://github.com/lord/anchors"
 # crate-type = ["dylib", "rlib"]
 
 [features]
-default = ["generic_size_voa"]
+default = ["generic_size_voa", "anchors_slotmap"]
 # pool = ["im-rc/pool"]
 # pool = []
 generic_size_voa = ["emg_common"]
+anchors_slotmap = []
 
 
 [dependencies]
@@ -27,6 +28,8 @@ im-rc = { version = "15.1.0", features = ["pool"] }
 
 # typed-arena = { version = "2.0.1" }
 arena-graph = { version = "0.1.0", path = "../arena-graph" }
+slotmap = "1.0"
+fastrace = "0.7.14"
 
 tracing = { version = "^0.1" }
 smallvec = { version = "1.10.0", features = ["const_generics"] }
@@ -35,11 +38,17 @@ emg_hasher = { path = "../emg_hasher" }
 emg_common = { path = "../emg_common", optional = true }
 
 [dev-dependencies]
-criterion = { version = "0.4.0", features = ["html_reports", "real_blackbox"] }
+criterion = { version = "0.5", features = ["html_reports", "plotters"] }
+flamegraph = "0.6.10"
+insta = { version = "1", features = ["glob"] }
 tracing-subscriber = "0.3"
 
 [[bench]]
 name = "benchmarks"
+harness = false
+
+[[bench]]
+name = "stabilize_linear_nodes_simple"
 harness = false
 
 # [profile.release]

@@ -2,6 +2,131 @@ use super::{AnchorDebugInfo, Generation, GenericAnchor};
 use std::cell::{Cell, RefCell, RefMut};
 use std::rc::Rc;
 
+#[cfg(feature = "anchors_slotmap")]
+use crate::telemetry::{SlotmapEventKind, record_slotmap_event};
+
+#[cfg(feature = "anchors_slotmap")]
+mod node_store {
+    use slotmap::{DefaultKey, SlotMap};
+    use std::cell::UnsafeCell;
+    use std::marker::PhantomData;
+
+    pub struct Graph<T> {
+        slots: UnsafeCell<SlotMap<DefaultKey, T>>,
+    }
+
+    impl<T> Graph<T> {
+        pub fn new() -> Self {
+            Self {
+                slots: UnsafeCell::new(SlotMap::with_key()),
+            }
+        }
+
+        pub fn with<F, R>(&self, func: F) -> R
+        where
+            F: for<'any> FnOnce(GraphGuard<'any, T>) -> R,
+        {
+            let guard = GraphGuard {
+                graph: self,
+                _marker: PhantomData,
+            };
+            func(guard)
+        }
+
+        pub unsafe fn with_unchecked(&self) -> GraphGuard<'_, T> {
+            GraphGuard {
+                graph: self,
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    pub struct GraphGuard<'a, T> {
+        pub(super) graph: *const Graph<T>,
+        _marker: PhantomData<&'a Graph<T>>,
+    }
+
+    impl<'a, T> GraphGuard<'a, T> {
+        pub fn insert(&self, node: T) -> NodeGuard<'a, T> {
+            unsafe {
+                let slots = &mut *(*self.graph).slots.get();
+                let key = slots.insert(node);
+                NodeGuard {
+                    graph: self.graph,
+                    key,
+                    _marker: PhantomData,
+                }
+            }
+        }
+
+        pub unsafe fn lookup_ptr(&self, ptr: NodePtr<T>) -> &T {
+            debug_assert_eq!(ptr.graph, self.graph);
+            let slots = &*(*self.graph).slots.get();
+            slots
+                .get(ptr.key)
+                .expect("dangling NodePtr: 已释放或跨 Graph2 使用")
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub struct NodePtr<T> {
+        pub(super) graph: *const Graph<T>,
+        pub(super) key: DefaultKey,
+    }
+
+    impl<T> NodePtr<T> {
+        pub fn new(graph: *const Graph<T>, key: DefaultKey) -> Self {
+            Self { graph, key }
+        }
+
+        pub unsafe fn lookup_unchecked<'a>(self) -> NodeGuard<'a, T> {
+            NodeGuard {
+                graph: self.graph,
+                key: self.key,
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    pub struct NodeGuard<'a, T> {
+        pub(super) graph: *const Graph<T>,
+        pub(super) key: DefaultKey,
+        _marker: PhantomData<&'a T>,
+    }
+
+    impl<'a, T> NodeGuard<'a, T> {
+        pub fn make_ptr(&self) -> NodePtr<T> {
+            NodePtr::new(self.graph, self.key)
+        }
+
+        pub fn node(&self) -> &T {
+            unsafe {
+                let slots = &*(*self.graph).slots.get();
+                slots
+                    .get(self.key)
+                    .expect("dangling NodeGuard: 节点已被移除")
+            }
+        }
+
+        pub unsafe fn lookup_ptr(&self, ptr: NodePtr<T>) -> &T {
+            debug_assert_eq!(ptr.graph, self.graph);
+            let slots = &*(*self.graph).slots.get();
+            slots.get(ptr.key).expect("dangling NodePtr: 节点已被移除")
+        }
+    }
+
+    impl<'a, T> std::ops::Deref for NodeGuard<'a, T> {
+        type Target = T;
+        fn deref(&self) -> &Self::Target {
+            self.node()
+        }
+    }
+}
+
+#[cfg(feature = "anchors_slotmap")]
+use node_store as ag;
+
+#[cfg(not(feature = "anchors_slotmap"))]
 use arena_graph::raw as ag;
 
 use std::iter::Iterator;
@@ -11,6 +136,30 @@ use std::marker::PhantomData;
 pub struct NodeGuard<'gg>(ag::NodeGuard<'gg, Node>);
 
 type NodePtr = ag::NodePtr<Node>;
+
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Default)]
+struct NodeStoreMetrics {
+    alloc: Cell<u64>,
+    free: Cell<u64>,
+    gc_skipped: Cell<u64>,
+    free_skip: Cell<u64>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl NodeStoreMetrics {
+    fn record(&self, kind: SlotmapEventKind) {
+        let counter = match kind {
+            SlotmapEventKind::Alloc => &self.alloc,
+            SlotmapEventKind::Free => &self.free,
+            SlotmapEventKind::GcSkipped => &self.gc_skipped,
+            SlotmapEventKind::FreeSkip => &self.free_skip,
+        };
+        let next = counter.get().saturating_add(1);
+        counter.set(next);
+        record_slotmap_event(kind, next);
+    }
+}
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RecalcState {
@@ -27,6 +176,10 @@ thread_local! {
 pub struct Graph2 {
     nodes: ag::Graph<Node>,
     graph_token: u32,
+    #[cfg(feature = "anchors_slotmap")]
+    node_metrics: NodeStoreMetrics,
+    #[cfg(feature = "anchors_slotmap")]
+    token_counter: Cell<u64>,
 
     still_alive: Rc<Cell<bool>>,
 
@@ -54,7 +207,7 @@ pub struct Node {
     /// number of nodes that list this node as a necessary child
     pub necessary_count: Cell<usize>,
 
-    pub token: u32,
+    pub slot_token: Cell<u64>,
 
     pub debug_info: Cell<AnchorDebugInfo>,
 
@@ -72,7 +225,7 @@ pub struct Node {
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 pub struct NodeKey {
     pub ptr: NodePtr,
-    token: u32,
+    token: u64,
 }
 
 impl !Send for NodeKey {}
@@ -111,8 +264,11 @@ pub struct AnchorHandle {
 impl Clone for AnchorHandle {
     fn clone(&self) -> Self {
         if self.still_alive.get() {
-            let count = &unsafe { self.num.ptr.lookup_unchecked() }.ptrs.handle_count;
-            count.set(count.get() + 1);
+            let guard = unsafe { self.num.ptr.lookup_unchecked() };
+            if guard.slot_token.get() == self.num.token {
+                let count = &guard.ptrs.handle_count;
+                count.set(count.get() + 1);
+            }
         }
         AnchorHandle {
             num: self.num,
@@ -124,14 +280,33 @@ impl Clone for AnchorHandle {
 
 impl Drop for AnchorHandle {
     fn drop(&mut self) {
-        if self.still_alive.get() {
-            let count = &unsafe { self.num.ptr.lookup_unchecked() }.ptrs.handle_count;
-            let new_count = count.get() - 1;
-            count.set(new_count);
-            // drop(count);
-            if new_count == 0 {
-                unsafe { free(self.num.ptr) };
+        if !self.still_alive.get() {
+            return;
+        }
+
+        let guard = unsafe { self.num.ptr.lookup_unchecked() };
+        if guard.slot_token.get() != self.num.token {
+            #[cfg(feature = "anchors_slotmap")]
+            {
+                let graph: &Graph2 = unsafe { &*guard.ptrs.graph };
+                graph.node_metrics.record(SlotmapEventKind::FreeSkip);
             }
+            return;
+        }
+        let count = &guard.ptrs.handle_count;
+        let current = count.get();
+        if current == 0 {
+            #[cfg(feature = "anchors_slotmap")]
+            {
+                let graph: &Graph2 = unsafe { &*guard.ptrs.graph };
+                graph.node_metrics.record(SlotmapEventKind::FreeSkip);
+            }
+            return;
+        }
+        let new_count = current - 1;
+        count.set(new_count);
+        if new_count == 0 {
+            unsafe { free(self.num.ptr) };
         }
     }
 }
@@ -153,7 +328,7 @@ impl<'a> NodeGuard<'a> {
     pub fn key(self) -> NodeKey {
         NodeKey {
             ptr: unsafe { self.0.make_ptr() },
-            token: self.token,
+            token: self.slot_token.get(),
         }
     }
 
@@ -276,10 +451,11 @@ impl<'a> Drop for RefCellVecIterator<'a> {
 
 impl<'gg> Graph2Guard<'gg> {
     pub fn get(&self, key: NodeKey) -> Option<NodeGuard<'gg>> {
-        if key.token != self.graph.graph_token {
+        let node = unsafe { self.nodes.lookup_ptr(key.ptr) };
+        if key.token != node.slot_token.get() {
             return None;
         }
-        Some(NodeGuard(unsafe { self.nodes.lookup_ptr(key.ptr) }))
+        Some(NodeGuard(node))
     }
 
     #[cfg(test)]
@@ -350,6 +526,18 @@ impl<'gg> Graph2Guard<'gg> {
 }
 
 impl Graph2 {
+    #[cfg(feature = "anchors_slotmap")]
+    fn next_slot_token(&self) -> u64 {
+        let current = self.token_counter.get();
+        self.token_counter.set(current + 1);
+        current
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    fn next_slot_token(&self) -> u64 {
+        self.graph_token as u64
+    }
+
     pub fn new(max_height: usize) -> Self {
         Self {
             nodes: ag::Graph::new(),
@@ -358,6 +546,10 @@ impl Graph2 {
                 token.set(n + 1);
                 n
             }),
+            #[cfg(feature = "anchors_slotmap")]
+            node_metrics: NodeStoreMetrics::default(),
+            #[cfg(feature = "anchors_slotmap")]
+            token_counter: Cell::new(0),
             recalc_queues: RefCell::new(vec![None; max_height]),
             recalc_min_height: Cell::new(max_height),
             recalc_max_height: Cell::new(0),
@@ -398,6 +590,7 @@ impl Graph2 {
                 node.observed.set(false);
                 node.visited.set(false);
                 node.necessary_count.set(0);
+                node.slot_token.set(self.next_slot_token());
                 node.ptrs.clean_parent0.set(None);
                 node.ptrs.clean_parents.replace(vec![]);
                 node.ptrs.recalc_state.set(RecalcState::Needed);
@@ -416,7 +609,7 @@ impl Graph2 {
                     observed: Cell::new(false),
                     visited: Cell::new(false),
                     necessary_count: Cell::new(0),
-                    token: self.graph_token,
+                    slot_token: Cell::new(self.next_slot_token()),
                     ptrs: NodePtrs {
                         clean_parent0: Cell::new(None),
                         clean_parents: RefCell::new(vec![]),
@@ -439,6 +632,8 @@ impl Graph2 {
                 ptr: unsafe { ptr.make_ptr() },
                 token: self.graph_token,
             };
+            #[cfg(feature = "anchors_slotmap")]
+            self.node_metrics.record(SlotmapEventKind::Alloc);
             AnchorHandle {
                 num,
                 still_alive: self.still_alive.clone(),
@@ -521,6 +716,14 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
 
 unsafe fn free(ptr: NodePtr) {
     let guard = NodeGuard(ptr.lookup_unchecked());
+    if guard.anchor.borrow().is_none() {
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            let graph_ref: &Graph2 = unsafe { &*guard.ptrs.graph };
+            graph_ref.node_metrics.record(SlotmapEventKind::GcSkipped);
+        }
+        return;
+    }
     let _ = guard.drain_necessary_children();
     let _ = guard.drain_clean_parents();
     let graph = &*guard.ptrs.graph;
@@ -537,6 +740,8 @@ unsafe fn free(ptr: NodePtr) {
 
     // "SAFETY": this may cause other nodes to be dropped, so do with care
     *guard.anchor.borrow_mut() = None;
+    #[cfg(feature = "anchors_slotmap")]
+    graph.node_metrics.record(SlotmapEventKind::Free);
 }
 
 pub fn height(node: NodeGuard<'_>) -> usize {

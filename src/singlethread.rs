@@ -376,13 +376,19 @@ impl Engine {
                 if let Some(node) = graph.get(tok) {
                     // 生成节点标签：优先使用 debug 位置信息
                     let dbg = node.debug_info.get();
-                    let label = match dbg.location {
+                    let mut label = match dbg.location {
                         Some((name, loc)) => {
                             // 例如："file.rs:123:45\nname"
                             format!("{}\n{}", loc, name)
                         }
                         None => dbg._to_string(),
                     };
+                    let slot_id = format!("{:?}", tok.ptr).replace('"', "\\\"");
+                    let slot_token = node.slot_token.get();
+                    let recalc = graph2::recalc_state(node);
+                    label.push_str(&format!("\\nslot_id={slot_id}"));
+                    label.push_str(&format!("\\ntoken={slot_token}"));
+                    label.push_str(&format!("\\nrecalc={recalc:?}"));
                     labels.entry(tok).or_insert(label);
 
                     // Clean parents（从当前 -> 父）
@@ -470,7 +476,13 @@ impl Engine {
                         Some((name, loc)) => format!("{}\n{}", loc, name),
                         None => dbg._to_string(),
                     };
-                    let label = names.get(&tok).cloned().unwrap_or(default_label);
+                    let mut label = names.get(&tok).cloned().unwrap_or(default_label);
+                    let slot_id = format!("{:?}", tok.ptr).replace('"', "\\\"");
+                    let slot_token = node.slot_token.get();
+                    let recalc = graph2::recalc_state(node);
+                    label.push_str(&format!("\\nslot_id={slot_id}"));
+                    label.push_str(&format!("\\ntoken={slot_token}"));
+                    label.push_str(&format!("\\nrecalc={recalc:?}"));
                     labels.entry(tok).or_insert(label);
 
                     for p in node.clean_parents() {
