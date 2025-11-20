@@ -35,8 +35,14 @@ pub use crate::expert::MultiAnchor;
 use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 
 use generation::Generation;
+#[cfg(feature = "anchors_slotmap")]
+use libc::RUSAGE_SELF;
+#[cfg(feature = "anchors_slotmap")]
+use libc::getrusage;
+#[cfg(feature = "anchors_slotmap")]
+use libc::rusage;
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::panic::Location;
 use std::rc::Rc;
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +105,23 @@ impl crate::expert::Engine for Engine {
 }
 
 impl Engine {
+    #[cfg(feature = "anchors_slotmap")]
+    fn current_rss_bytes() -> u64 {
+        // getrusage 在 macOS 返回 bytes，Linux 返回 KB；这里统一转换成字节后再比较。
+        let mut usage: rusage = unsafe { std::mem::zeroed() };
+        let ret = unsafe { getrusage(RUSAGE_SELF, &mut usage) };
+        if ret != 0 {
+            return 0;
+        }
+        let raw = usage.ru_maxrss as u64;
+        // 简单启发式：若值小于 1e9 则视为 KB 转换。
+        if raw < 1_000_000_000 {
+            raw.saturating_mul(1024)
+        } else {
+            raw
+        }
+    }
+
     /// Creates a new Engine with maximum height 256.
     pub fn new() -> Self {
         Self::new_with_max_height(256)
@@ -188,17 +211,35 @@ impl Engine {
                 // to make sure we don't unnecessarily increment generation number
                 self.stabilize0();
             }
-            // let target_anchor = &graph.get(anchor.token()).unwrap().anchor;
+            let mut retry = 0u8;
+            loop {
+                if anchor_node.anchor_locked.get() {
+                    graph.queue_recalc(anchor_node);
+                    self.stabilize0();
+                    retry = retry.saturating_add(1);
+                    if retry > 3 {
+                        panic!(
+                            "slotmap: anchor locked after stabilize {:?}",
+                            anchor_node.debug_info.get()
+                        );
+                    }
+                    continue;
+                }
 
-            let target_anchor = &anchor_node.anchor;
-            let borrow = target_anchor.borrow();
-            borrow
-                .as_ref()
-                .unwrap()
-                .output(&mut EngineContext { engine: self })
-                .downcast_ref::<O>()
-                .unwrap()
-                .clone()
+                let target_anchor = unsafe { &*anchor_node.anchor.get() };
+                if let Some(inner) = target_anchor.as_ref() {
+                    break inner
+                        .output(&mut EngineContext { engine: self })
+                        .downcast_ref::<O>()
+                        .unwrap()
+                        .clone();
+                } else {
+                    panic!(
+                        "slotmap: 节点已被删除或 token 失效，无法执行操作 get::<O> 读取节点，token={:?}",
+                        anchor.token()
+                    );
+                }
+            }
         })
     }
     pub fn get_with<O: Clone + 'static, F: FnOnce(&O) -> R, R>(
@@ -218,11 +259,13 @@ impl Engine {
                 // to make sure we don't unnecessarily increment generation number
                 self.stabilize0();
             }
-            let target_anchor = &self
-                .expect_node(&graph, anchor.token(), "get_with 读取 anchor")
-                .anchor;
-            let borrow = target_anchor.borrow();
-            let o = borrow
+            let target_node = self.expect_node(&graph, anchor.token(), "get_with 读取 anchor");
+            if target_node.anchor_locked.get() {
+                graph.queue_recalc(target_node);
+                self.stabilize0();
+            }
+            let borrowed = unsafe { &*target_node.anchor.get() };
+            let o = borrowed
                 .as_ref()
                 .unwrap()
                 .output(&mut EngineContext { engine: self })
@@ -237,8 +280,16 @@ impl Engine {
         self.graph.with(|graph| {
             let dirty_marks = std::mem::take(&mut *self.dirty_marks.borrow_mut());
             for dirty in dirty_marks {
-                let node = self.expect_node(&graph, dirty, "update_dirty_marks");
-                mark_dirty(graph, node, false);
+                if let Some(node) = graph.get(dirty) {
+                    mark_dirty(graph, node, false);
+                } else {
+                    #[cfg(feature = "anchors_slotmap")]
+                    tracing::warn!(
+                        target: "anchors",
+                        "update_dirty_marks: token 已失效或节点已删除，跳过处理 {:?}",
+                        dirty
+                    );
+                }
             }
         })
     }
@@ -257,6 +308,10 @@ impl Engine {
     fn stabilize0(&self) {
         trace!("stabilize0");
         self.graph.with(|graph| {
+            #[cfg(feature = "anchors_slotmap")]
+            {
+                graph.retry_pending_free();
+            }
             while let Some((height, node)) = graph.recalc_pop_next() {
                 let calculation_complete = if graph2::height(node) == height {
                     trace!("recalculate height");
@@ -273,6 +328,20 @@ impl Engine {
                     graph.queue_recalc(node);
                 }
             }
+            #[cfg(feature = "anchors_slotmap")]
+            {
+                graph.retry_pending_free();
+                if std::env::var("ANCHORS_ACTIVE_NODES_LOG").is_ok() {
+                    let rss = Self::current_rss_bytes();
+                    let active = graph.active_nodes();
+                    tracing::info!(
+                        target: "anchors",
+                        active_nodes = active,
+                        rss_bytes = rss,
+                        "anchors.active_nodes snapshot"
+                    );
+                }
+            }
         });
         trace!("...stabilize0");
     }
@@ -286,11 +355,51 @@ impl Engine {
             graph,
             pending_on_anchor_get: false,
         };
-        let poll_result = this_anchor
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .poll_updated(&mut ecx);
+        struct AnchorLockGuard<'a> {
+            flag: &'a Cell<bool>,
+        }
+        impl Drop for AnchorLockGuard<'_> {
+            fn drop(&mut self) {
+                self.flag.set(false);
+            }
+        }
+
+        if node.anchor_locked.get() {
+            // 单线程场景下，出现锁标志通常意味着上一次重算异常中断或遗留标志未及时清理。
+            // 直接抢占并继续重算，避免无休止的重排队导致 panic。
+            let retry = node.recalc_retry.get().saturating_add(1);
+            node.recalc_retry.set(retry);
+            if retry % 8 == 0 {
+                tracing::warn!(
+                    target: "anchors",
+                    "检测到遗留 Anchor 锁，强制解锁后重算: {:?}, retry={}",
+                    node.debug_info.get()._to_string(),
+                    retry
+                );
+            }
+            node.anchor_locked.set(false);
+        }
+        node.anchor_locked.set(true);
+
+        let _lock_guard = AnchorLockGuard {
+            flag: &node.anchor_locked,
+        };
+
+        let anchor_ref = unsafe {
+            (*this_anchor.get())
+                .as_mut()
+                .expect("anchor 已被移除，无法重算")
+        };
+        {
+            // 把之前因借用冲突积累的 dirty 消息在这里一次性补偿。
+            let mut pending = node.pending_dirty.borrow_mut();
+            for child in pending.drain(..) {
+                anchor_ref.dirty(&child);
+            }
+        }
+
+        let poll_result = anchor_ref.poll_updated(&mut ecx);
+        node.recalc_retry.set(0);
         let pending_on_anchor_get = ecx.pending_on_anchor_get;
         match poll_result {
             Poll::Pending => {
@@ -578,17 +687,19 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
     if skip_self {
         let parents = node.drain_clean_parents();
         for parent in parents {
-            // TODO still calling dirty twice on observed relationships
-            parent
-                .anchor
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .dirty(&node.key());
+            push_pending_dirty(parent, node.key());
+            graph.queue_recalc(parent);
             mark_dirty0(graph, parent);
         }
     } else {
         mark_dirty0(graph, node);
+    }
+}
+
+fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
+    let mut pending = parent.pending_dirty.borrow_mut();
+    if !pending.iter().any(|k| *k == child) {
+        pending.push(child);
     }
 }
 
@@ -601,10 +712,9 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
         graph2::needs_recalc(next);
         let parents = next.drain_clean_parents();
         for parent in parents {
-            if let Some(v) = parent.anchor.borrow_mut().as_mut() {
-                v.dirty(&id);
-                mark_dirty0(graph, parent);
-            }
+            push_pending_dirty(parent, id);
+            graph.queue_recalc(parent);
+            mark_dirty0(graph, parent);
         }
     }
 }
@@ -646,14 +756,12 @@ impl<'eng> OutputContext<'eng> for EngineContext<'eng> {
             if graph2::recalc_state(node) != RecalcState::Ready {
                 panic!("attempted to get node that was not previously requested")
             }
-            let unsafe_borrow = unsafe { node.anchor.as_ptr().as_ref().unwrap() };
-            let output: &O = unsafe_borrow
-                .as_ref()
-                .unwrap()
+            let anchor_impl = unsafe { (*node.anchor.get()).as_ref().unwrap() };
+            let output: &O = anchor_impl
                 .output(&mut EngineContext {
                     engine: self.engine,
                 })
-                .downcast_ref()
+                .downcast_ref::<O>()
                 .unwrap();
             output
         })
@@ -675,14 +783,12 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                 panic!("attempted to get node that was not previously requested")
             }
 
-            let unsafe_borrow = unsafe { node.anchor.as_ptr().as_ref().unwrap() };
-            let output: &O = unsafe_borrow
-                .as_ref()
-                .unwrap()
+            let anchor_impl = unsafe { (*node.anchor.get()).as_ref().unwrap() };
+            let output: &O = anchor_impl
                 .output(&mut EngineContext {
                     engine: self.engine,
                 })
-                .downcast_ref()
+                .downcast_ref::<O>()
                 .unwrap();
             output
         })

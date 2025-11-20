@@ -3,6 +3,7 @@
 
 #[cfg(feature = "anchors_slotmap")]
 mod tests {
+    use anchors::expert::MultiAnchor;
     use anchors::singlethread::{Anchor, Engine, Var};
 
     /// 构造简单父子链：p -> c，标记 observed，删除 child 后再次 stabilize 不应 panic。

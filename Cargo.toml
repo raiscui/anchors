@@ -17,7 +17,7 @@ default = ["generic_size_voa", "anchors_slotmap"]
 # pool = ["im-rc/pool"]
 # pool = []
 generic_size_voa = ["emg_common"]
-anchors_slotmap = []
+anchors_slotmap = ["libc"]
 
 
 [dependencies]
@@ -36,12 +36,14 @@ smallvec = { version = "1.10.0", features = ["const_generics"] }
 emg_hasher = { path = "../emg_hasher" }
 
 emg_common = { path = "../emg_common", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "plotters"] }
 flamegraph = "0.6.10"
 insta = { version = "1", features = ["glob"] }
 tracing-subscriber = "0.3"
+png = "0.17"
 
 [[bench]]
 name = "benchmarks"

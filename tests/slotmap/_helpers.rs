@@ -98,6 +98,8 @@ pub fn run_creation_drop_cycles(
         // 离开作用域即可释放 anchors/vars，模拟 handle drop。
         drop(anchors);
         drop(vars);
+        // 立即跑一轮 stabilize，将 pending_free 清空到 free list，避免累积导致内存峰值被放大。
+        engine.stabilize();
     }
     snapshots
 }

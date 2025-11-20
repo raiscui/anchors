@@ -1,5 +1,5 @@
 use super::{AnchorDebugInfo, Generation, GenericAnchor};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 
 #[cfg(feature = "anchors_slotmap")]
@@ -63,7 +63,8 @@ mod node_store {
 
         pub unsafe fn lookup_ptr(&self, ptr: NodePtr<T>) -> &T {
             debug_assert_eq!(ptr.graph, self.graph);
-            let slots = &*(*self.graph).slots.get();
+            // unsafe: graph 指针来源受 NodeStoreGuard 生命周期约束，确保在 SlotMap 内有效。
+            let slots = unsafe { &*(*self.graph).slots.get() };
             slots
                 .get(ptr.key)
                 .expect("dangling NodePtr: 已释放或跨 Graph2 使用")
@@ -152,18 +153,20 @@ mod node_store {
         }
 
         pub fn node(&self) -> &T {
-            unsafe {
-                let slots = &*(*self.graph).slots.get();
-                slots
-                    .get(self.key)
-                    .expect("dangling NodeGuard: 节点已被移除")
-            }
+            // unsafe: NodeGuard 持有 graph 生命周期，保证 slots 指针有效。
+            let slots = unsafe { &*(*self.graph).slots.get() };
+            slots
+                .get(self.key)
+                .expect("dangling NodeGuard: 节点已被移除")
         }
 
         pub unsafe fn lookup_ptr(&self, ptr: NodePtr<T>) -> &T {
             debug_assert_eq!(ptr.graph, self.graph);
-            let slots = &*(*self.graph).slots.get();
-            slots.get(ptr.key).expect("dangling NodePtr: 节点已被移除")
+            // unsafe: graph 指针来自同一 NodeStore，确保访问合法。
+            let slots = unsafe { &*(*self.graph).slots.get() };
+            slots
+                .get(ptr.key)
+                .expect("dangling NodePtr: 节点已被移除")
         }
     }
 
@@ -203,41 +206,84 @@ mod node_store {
         ///
         /// # Safety
         /// 仅在确保 handle_count 已降为 0 且 token 匹配的场景调用。
-        pub unsafe fn remove(&self, ptr: NodePtr<super::Node>) {
-            let raw_guard = ptr.lookup_unchecked();
+        pub unsafe fn remove(&self, ptr: NodePtr<super::Node>) -> bool {
+            let raw_guard = unsafe { ptr.lookup_unchecked() };
             let guard = super::NodeGuard(raw_guard);
-            let graph: &super::Graph2 = &*guard.ptrs.graph;
-            if guard.anchor.borrow().is_none() {
+            // unsafe: graph 指针由 slotmap 生成，与当前节点同生灭。
+            let graph: &super::Graph2 = unsafe { &*guard.ptrs.graph };
+            if guard.anchor_locked.get() {
+                graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
+                return false;
+            }
+
+            if unsafe { (&*guard.anchor.get()).is_none() } {
                 graph
                     .node_metrics
                     .record(super::SlotmapEventKind::GcSkipped);
-                return;
+                return true;
             }
 
-            let _ = guard.drain_necessary_children();
-            let _ = guard.drain_clean_parents();
+            // 尝试非阻塞清理必要子节点，若外部仍借用则跳过以避免 RefCell panic。
+            let drained_children = if let Ok(mut children) = guard.ptrs.necessary_children.try_borrow_mut() {
+                for child in children.iter() {
+                    let count = &unsafe { guard.0.lookup_ptr(*child) }.necessary_count;
+                    count.set(count.get().saturating_sub(1));
+                }
+                children.clear();
+                true
+            } else {
+                graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
+                false
+            };
+            if !drained_children {
+                return false;
+            }
+
+            guard.ptrs.clean_parent0.set(None);
+            // 父列表同理，避免在外层持有不可预期借用时触发崩溃。
+            let drained_parents = if let Ok(mut parents) = guard.ptrs.clean_parents.try_borrow_mut() {
+                parents.clear();
+                true
+            } else {
+                graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
+                false
+            };
+            if !drained_parents {
+                return false;
+            }
+
             super::dequeue_calc(graph, guard);
 
-            let free_head = &graph.free_head;
-            if let Some(old_free) = free_head.get() {
-                let old_guard = old_free.lookup_unchecked();
-                old_guard.ptrs.prev.set(Some(ptr));
+            let anchor_slot = unsafe { &mut *guard.anchor.get() };
+            if anchor_slot.is_none() {
+                graph.node_metrics.record(super::SlotmapEventKind::GcSkipped);
+                return true;
             }
-            guard.ptrs.next.set(free_head.get());
-            guard.ptrs.prev.set(None);
-            free_head.set(Some(ptr));
+            *anchor_slot = None;
 
             guard.ptrs.handle_count.set(0);
             guard.observed.set(false);
             guard.visited.set(false);
             guard.necessary_count.set(0);
             guard.ptrs.recalc_state.set(super::RecalcState::Needed);
-            guard.ptrs.necessary_children.borrow_mut().clear();
-            guard.ptrs.clean_parent0.set(None);
-            guard.ptrs.clean_parents.borrow_mut().clear();
+            guard.recalc_retry.set(0);
+            guard.pending_dirty.borrow_mut().clear();
+            guard.anchor_locked.set(false);
 
-            *guard.anchor.borrow_mut() = None;
+            let free_head = &graph.free_head;
+            if let Some(old_free) = free_head.get() {
+                let old_guard = unsafe { old_free.lookup_unchecked() };
+                old_guard.ptrs.prev.set(Some(ptr));
+            }
+            guard.ptrs.next.set(free_head.get());
+            guard.ptrs.prev.set(None);
+            free_head.set(Some(ptr));
+
+            graph
+                .active_nodes
+                .set(graph.active_nodes.get().saturating_sub(1));
             graph.node_metrics.record(super::SlotmapEventKind::Free);
+            true
         }
     }
 }
@@ -311,6 +357,10 @@ pub struct Graph2 {
     nodes: ag::NodeStore<Node>,
     #[cfg(not(feature = "anchors_slotmap"))]
     nodes: ag::Graph<Node>,
+    #[cfg(feature = "anchors_slotmap")]
+    active_nodes: Cell<usize>,
+    #[cfg(feature = "anchors_slotmap")]
+    pending_free: RefCell<Vec<NodePtr>>,
     graph_token: u32,
     #[cfg(feature = "anchors_slotmap")]
     node_metrics: NodeStoreMetrics,
@@ -351,9 +401,15 @@ pub struct Node {
     pub(super) last_ready: Cell<Option<Generation>>,
     /// tracks the generation when this Node last polled as Updated
     pub(super) last_update: Cell<Option<Generation>>,
+    /// 记录因借用冲突导致的重算重试次数，避免无限排队。
+    pub recalc_retry: Cell<u8>,
+    /// 累积 deferred dirty 的子节点 token，借用冲突恢复后统一处理。
+    pub pending_dirty: RefCell<Vec<NodeKey>>,
 
     /// Some() if this node is still active, None otherwise
-    pub anchor: RefCell<Option<Box<dyn GenericAnchor>>>,
+    pub anchor: UnsafeCell<Option<Box<dyn GenericAnchor>>>,
+    /// 标记当前 anchor 是否正被 poll，避免重入。
+    pub anchor_locked: Cell<bool>,
 
     pub ptrs: NodePtrs,
 }
@@ -502,7 +558,7 @@ impl<'a> NodeGuard<'a> {
 
     pub fn add_necessary_child(self, child: NodeGuard<'a>) {
         let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = unsafe { child.0.make_ptr() };
+        let child_ptr = child.0.make_ptr();
         if let Err(i) = necessary_children.binary_search(&child_ptr) {
             necessary_children.insert(i, child_ptr);
             child.necessary_count.set(child.necessary_count.get() + 1)
@@ -511,7 +567,7 @@ impl<'a> NodeGuard<'a> {
 
     pub fn remove_necessary_child(&self, child: NodeGuard<'a>) {
         let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = unsafe { child.0.make_ptr() };
+        let child_ptr = child.0.make_ptr();
         if let Ok(i) = necessary_children.binary_search(&child_ptr) {
             necessary_children.remove(i);
             child.necessary_count.set(child.necessary_count.get() - 1)
@@ -539,16 +595,33 @@ impl<'a> NodeGuard<'a> {
         children.clear();
         collected
     }
+
+    #[inline]
+    pub fn handle_count(&self) -> usize {
+        self.ptrs.handle_count.get()
+    }
 }
 
 impl<'gg> Graph2Guard<'gg> {
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn active_nodes(&self) -> usize {
+        self.graph.active_nodes.get()
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn retry_pending_free(&self) {
+        self.graph.retry_pending_free();
+    }
+
     pub fn get(&self, key: NodeKey) -> Option<NodeGuard<'gg>> {
         let node = NodeGuard(unsafe { key.ptr.lookup_unchecked() });
         if key.token != node.slot_token.get() {
             return None;
         }
-        if node.anchor.borrow().is_none() {
-            return None;
+        unsafe {
+            if (*node.anchor.get()).is_none() {
+                return None;
+            }
         }
         Some(node)
     }
@@ -628,6 +701,33 @@ impl Graph2 {
         current
     }
 
+    #[cfg(feature = "anchors_slotmap")]
+    fn enqueue_free_retry(&self, ptr: NodePtr) {
+        let mut pending = self.pending_free.borrow_mut();
+        if !pending.iter().any(|p| *p == ptr) {
+            pending.push(ptr);
+        }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn retry_pending_free(&self) {
+        let mut pending = self.pending_free.borrow_mut();
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut still_pending = Vec::new();
+        for ptr in pending.drain(..) {
+            let freed = unsafe { self.nodes.remove(ptr) };
+            if !freed {
+                if !still_pending.iter().any(|p| *p == ptr) {
+                    still_pending.push(ptr);
+                }
+            }
+        }
+        *pending = still_pending;
+    }
+
     #[cfg(not(feature = "anchors_slotmap"))]
     fn next_slot_token(&self) -> u64 {
         self.graph_token as u64
@@ -648,6 +748,10 @@ impl Graph2 {
             node_metrics: NodeStoreMetrics::default(),
             #[cfg(feature = "anchors_slotmap")]
             token_counter: Cell::new(0),
+            #[cfg(feature = "anchors_slotmap")]
+            active_nodes: Cell::new(0),
+            #[cfg(feature = "anchors_slotmap")]
+            pending_free: RefCell::new(vec![]),
             recalc_queues: RefCell::new(vec![None; max_height]),
             recalc_min_height: Cell::new(max_height),
             recalc_max_height: Cell::new(0),
@@ -700,7 +804,12 @@ impl Graph2 {
                 guard.debug_info.set(debug_info);
                 guard.last_ready.set(None);
                 guard.last_update.set(None);
-                guard.anchor.replace(Some(anchor));
+                guard.recalc_retry.set(0);
+                guard.pending_dirty.replace(vec![]);
+                unsafe {
+                    *guard.anchor.get() = Some(anchor);
+                }
+                guard.anchor_locked.set(false);
                 guard
             } else {
                 let node = Node {
@@ -722,13 +831,19 @@ impl Graph2 {
                     debug_info: Cell::new(debug_info),
                     last_ready: Cell::new(None),
                     last_update: Cell::new(None),
-                    anchor: RefCell::new(Some(anchor)),
+                    recalc_retry: Cell::new(0),
+                    pending_dirty: RefCell::new(vec![]),
+                    anchor: UnsafeCell::new(Some(anchor)),
+                    anchor_locked: Cell::new(false),
                 };
                 NodeGuard(nodes.insert(node))
             };
             let num = guard.key();
             #[cfg(feature = "anchors_slotmap")]
             self.node_metrics.record(SlotmapEventKind::Alloc);
+            #[cfg(feature = "anchors_slotmap")]
+            self.active_nodes
+                .set(self.active_nodes.get().saturating_add(1));
             AnchorHandle {
                 num,
                 still_alive: self.still_alive.clone(),
@@ -811,20 +926,28 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
 
 #[cfg(feature = "anchors_slotmap")]
 unsafe fn free(ptr: NodePtr) {
-    let guard = ptr.lookup_unchecked();
-    let graph: &Graph2 = &*guard.ptrs.graph;
-    graph.nodes.remove(ptr);
+    let graph: &Graph2 = {
+        let guard = unsafe { ptr.lookup_unchecked() };
+        // unsafe: graph 指针来源于当前 slotmap 节点，生命周期受 NodeStore 约束。
+        unsafe { &*guard.ptrs.graph }
+    };
+
+    if unsafe { !graph.nodes.remove(ptr) } {
+        graph.enqueue_free_retry(ptr);
+    }
 }
 
 #[cfg(not(feature = "anchors_slotmap"))]
 unsafe fn free(ptr: NodePtr) {
-    let guard = NodeGuard(ptr.lookup_unchecked());
-    if guard.anchor.borrow().is_none() {
+    let guard = NodeGuard(unsafe { ptr.lookup_unchecked() });
+    let anchor_slot = unsafe { &mut *guard.anchor.get() };
+    if anchor_slot.is_none() {
         return;
     }
     let _ = guard.drain_necessary_children();
     let _ = guard.drain_clean_parents();
-    let graph = &*guard.ptrs.graph;
+    // unsafe: graph 指针来自节点内部，保持同生命周期。
+    let graph = unsafe { &*guard.ptrs.graph };
     dequeue_calc(graph, guard);
     let free_head = &graph.free_head;
     let old_free = free_head.get();
@@ -833,7 +956,8 @@ unsafe fn free(ptr: NodePtr) {
     }
     guard.ptrs.next.set(old_free);
     free_head.set(Some(ptr));
-    *guard.anchor.borrow_mut() = None;
+    *anchor_slot = None;
+    guard.anchor_locked.set(false);
 }
 
 pub fn height(node: NodeGuard<'_>) -> usize {
@@ -856,8 +980,8 @@ pub fn recalc_state(node: NodeGuard<'_>) -> RecalcState {
 mod test {
     use super::*;
 
-    fn to_vec<I: std::iter::Iterator>(iter: I) -> Vec<I::Item> {
-        iter.collect()
+    fn to_vec<I: IntoIterator>(iter: I) -> Vec<I::Item> {
+        iter.into_iter().collect()
     }
 
     #[test]
