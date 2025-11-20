@@ -118,13 +118,28 @@ impl Engine {
         }
     }
 
+    #[inline]
+    fn expect_node<'gg>(
+        &self,
+        graph: &Graph2Guard<'gg>,
+        key: NodeKey,
+        context: &str,
+    ) -> graph2::NodeGuard<'gg> {
+        graph.get(key).unwrap_or_else(|| {
+            panic!(
+                "slotmap: 节点已被删除或 token 失效，无法执行操作：{}，token={:?}",
+                context, key
+            )
+        })
+    }
+
     /// Marks an Anchor as observed. All observed nodes will always be brought up-to-date
     /// when *any* Anchor in the graph is retrieved. If you get an output value fairly
     /// often, it's best to mark it as Observed so that Anchors can calculate its
     /// dependencies faster.
     pub fn mark_observed<O: 'static>(&mut self, anchor: &Anchor<O>) {
         self.graph.with(|graph| {
-            let node = graph.get(anchor.token()).unwrap();
+            let node = self.expect_node(&graph, anchor.token(), "mark_observed");
             node.observed.set(true);
             if graph2::recalc_state(node) != RecalcState::Ready {
                 graph.queue_recalc(node);
@@ -137,7 +152,7 @@ impl Engine {
     /// necessary.
     pub fn mark_unobserved<O: 'static>(&mut self, anchor: &Anchor<O>) {
         self.graph.with(|graph| {
-            let node = graph.get(anchor.token()).unwrap();
+            let node = self.expect_node(&graph, anchor.token(), "mark_unobserved");
             node.observed.set(false);
             Self::update_necessary_children(node);
         })
@@ -161,7 +176,7 @@ impl Engine {
         // as dirty
         self.stabilize();
         self.graph.with(|graph| {
-            let anchor_node = graph.get(anchor.token()).unwrap();
+            let anchor_node = self.expect_node(&graph, anchor.token(), "get::<O> 读取节点");
             if graph2::recalc_state(anchor_node) != RecalcState::Ready {
                 trace!(
                     "graph2::recalc_state(anchor_node) != RecalcState::Ready ,{:?}",
@@ -195,7 +210,7 @@ impl Engine {
         // as dirty
         self.stabilize();
         self.graph.with(|graph| {
-            let anchor_node = graph.get(anchor.token()).unwrap();
+            let anchor_node = self.expect_node(&graph, anchor.token(), "get_with 读取节点");
             if graph2::recalc_state(anchor_node) != RecalcState::Ready {
                 graph.queue_recalc(anchor_node);
                 // stabilize again, to make sure our target node that is now in the queue is up-to-date
@@ -203,7 +218,9 @@ impl Engine {
                 // to make sure we don't unnecessarily increment generation number
                 self.stabilize0();
             }
-            let target_anchor = &graph.get(anchor.token()).unwrap().anchor;
+            let target_anchor = &self
+                .expect_node(&graph, anchor.token(), "get_with 读取 anchor")
+                .anchor;
             let borrow = target_anchor.borrow();
             let o = borrow
                 .as_ref()
@@ -220,7 +237,7 @@ impl Engine {
         self.graph.with(|graph| {
             let dirty_marks = std::mem::take(&mut *self.dirty_marks.borrow_mut());
             for dirty in dirty_marks {
-                let node = graph.get(dirty).unwrap();
+                let node = self.expect_node(&graph, dirty, "update_dirty_marks");
                 mark_dirty(graph, node, false);
             }
         })
@@ -530,7 +547,7 @@ impl Engine {
 
     pub fn check_observed<T>(&self, anchor: &Anchor<T>) -> ObservedState {
         self.graph.with(|graph| {
-            let node = graph.get(anchor.token()).unwrap();
+            let node = self.expect_node(&graph, anchor.token(), "check_observed");
             Self::check_observed_raw(node)
         })
     }
@@ -623,7 +640,9 @@ impl<'eng> OutputContext<'eng> for EngineContext<'eng> {
         'eng: 'out,
     {
         self.engine.graph.with(|graph| {
-            let node = graph.get(anchor.token()).unwrap();
+            let node = self
+                .engine
+                .expect_node(&graph, anchor.token(), "EngineContext::get");
             if graph2::recalc_state(node) != RecalcState::Ready {
                 panic!("attempted to get node that was not previously requested")
             }
@@ -649,7 +668,9 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
         'slf: 'out,
     {
         self.engine.graph.with(|graph| {
-            let node = graph.get(anchor.token()).unwrap();
+            let node = self
+                .engine
+                .expect_node(&graph, anchor.token(), "EngineContextMut::get");
             if graph2::recalc_state(node) != RecalcState::Ready {
                 panic!("attempted to get node that was not previously requested")
             }
@@ -668,7 +689,9 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
     }
 
     fn request<'out, O: 'static>(&mut self, anchor: &Anchor<O>, necessary: bool) -> Poll {
-        let child = self.graph.get(anchor.token()).unwrap();
+        let child =
+            self.engine
+                .expect_node(&self.graph, anchor.token(), "EngineContextMut::request");
         let height_already_increased = match graph2::ensure_height_increases(child, self.node) {
             Ok(v) => v,
             Err(()) => {
@@ -701,7 +724,9 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
     }
 
     fn unrequest<'out, O: 'static>(&mut self, anchor: &Anchor<O>) {
-        let child = self.graph.get(anchor.token()).unwrap();
+        let child =
+            self.engine
+                .expect_node(&self.graph, anchor.token(), "EngineContextMut::unrequest");
         self.node.remove_necessary_child(child);
         Engine::update_necessary_children(child);
     }

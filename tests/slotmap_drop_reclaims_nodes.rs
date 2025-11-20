@@ -4,9 +4,7 @@
 
 mod slotmap;
 
-use slotmap::_helpers::{
-    new_slotmap_engine, run_creation_drop_cycles, SlotmapStressConfig,
-};
+use slotmap::_helpers::{SlotmapStressConfig, new_slotmap_engine, run_creation_drop_cycles};
 
 #[test]
 fn slotmap_drop_reclaims_nodes() {
@@ -23,13 +21,19 @@ fn slotmap_drop_reclaims_nodes() {
     // 验证每轮计算出的值与 seeds 一致，确保 Engine::get 正常。
     for (i, snap) in snapshots.iter().enumerate() {
         let expected_first = cfg.base_value + i;
-        assert_eq!(snap.values.first().copied().unwrap_or_default(), expected_first);
+        assert_eq!(
+            snap.values.first().copied().unwrap_or_default(),
+            expected_first
+        );
     }
 
     // 重点：token 应单调递增且不重复（简单冒泡检查相邻轮次）。
     for win in snapshots.windows(2) {
         let prev = &win[0].tokens;
         let next = &win[1].tokens;
-        assert!(next.iter().all(|tok| !prev.contains(tok)), "token reuse detected");
+        assert!(
+            next.iter().all(|tok| !prev.contains(tok)),
+            "token reuse detected"
+        );
     }
 }

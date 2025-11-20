@@ -1,5 +1,5 @@
 use super::{AnchorDebugInfo, Generation, GenericAnchor};
-use std::cell::{Cell, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(feature = "anchors_slotmap")]
@@ -9,13 +9,14 @@ use crate::telemetry::{SlotmapEventKind, record_slotmap_event};
 mod node_store {
     use slotmap::{DefaultKey, SlotMap};
     use std::cell::UnsafeCell;
+    use std::hash::Hasher;
     use std::marker::PhantomData;
 
-    pub struct Graph<T> {
+    pub struct NodeStore<T> {
         slots: UnsafeCell<SlotMap<DefaultKey, T>>,
     }
 
-    impl<T> Graph<T> {
+    impl<T> NodeStore<T> {
         pub fn new() -> Self {
             Self {
                 slots: UnsafeCell::new(SlotMap::with_key()),
@@ -24,29 +25,30 @@ mod node_store {
 
         pub fn with<F, R>(&self, func: F) -> R
         where
-            F: for<'any> FnOnce(GraphGuard<'any, T>) -> R,
+            F: for<'any> FnOnce(NodeStoreGuard<'any, T>) -> R,
         {
-            let guard = GraphGuard {
+            let guard = NodeStoreGuard {
                 graph: self,
                 _marker: PhantomData,
             };
             func(guard)
         }
 
-        pub unsafe fn with_unchecked(&self) -> GraphGuard<'_, T> {
-            GraphGuard {
+        pub unsafe fn with_unchecked(&self) -> NodeStoreGuard<'_, T> {
+            NodeStoreGuard {
                 graph: self,
                 _marker: PhantomData,
             }
         }
     }
 
-    pub struct GraphGuard<'a, T> {
-        pub(super) graph: *const Graph<T>,
-        _marker: PhantomData<&'a Graph<T>>,
+    #[derive(Debug)]
+    pub struct NodeStoreGuard<'a, T> {
+        pub(super) graph: *const NodeStore<T>,
+        _marker: PhantomData<&'a NodeStore<T>>,
     }
 
-    impl<'a, T> GraphGuard<'a, T> {
+    impl<'a, T> NodeStoreGuard<'a, T> {
         pub fn insert(&self, node: T) -> NodeGuard<'a, T> {
             unsafe {
                 let slots = &mut *(*self.graph).slots.get();
@@ -68,14 +70,20 @@ mod node_store {
         }
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    impl<'a, T> Copy for NodeStoreGuard<'a, T> {}
+    impl<'a, T> Clone for NodeStoreGuard<'a, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
     pub struct NodePtr<T> {
-        pub(super) graph: *const Graph<T>,
+        pub(super) graph: *const NodeStore<T>,
         pub(super) key: DefaultKey,
     }
 
     impl<T> NodePtr<T> {
-        pub fn new(graph: *const Graph<T>, key: DefaultKey) -> Self {
+        pub fn new(graph: *const NodeStore<T>, key: DefaultKey) -> Self {
             Self { graph, key }
         }
 
@@ -88,8 +96,52 @@ mod node_store {
         }
     }
 
+    impl<T> Copy for NodePtr<T> {}
+    impl<T> Clone for NodePtr<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<T> std::fmt::Debug for NodePtr<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NodePtr")
+                .field("graph", &(self.graph as *const ()))
+                .field("key", &self.key)
+                .finish()
+        }
+    }
+
+    impl<T> PartialEq for NodePtr<T> {
+        fn eq(&self, other: &Self) -> bool {
+            self.graph == other.graph && self.key == other.key
+        }
+    }
+    impl<T> Eq for NodePtr<T> {}
+
+    impl<T> std::hash::Hash for NodePtr<T> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            std::hash::Hash::hash(&(self.graph as usize), state);
+            std::hash::Hash::hash(&self.key, state);
+        }
+    }
+
+    impl<T> PartialOrd for NodePtr<T> {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl<T> Ord for NodePtr<T> {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.key
+                .cmp(&other.key)
+                .then_with(|| (self.graph as usize).cmp(&(other.graph as usize)))
+        }
+    }
+
     pub struct NodeGuard<'a, T> {
-        pub(super) graph: *const Graph<T>,
+        pub(super) graph: *const NodeStore<T>,
         pub(super) key: DefaultKey,
         _marker: PhantomData<&'a T>,
     }
@@ -121,6 +173,73 @@ mod node_store {
             self.node()
         }
     }
+
+    impl<'a, T> Copy for NodeGuard<'a, T> {}
+    impl<'a, T> Clone for NodeGuard<'a, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<'a, T> PartialEq for NodeGuard<'a, T> {
+        fn eq(&self, other: &Self) -> bool {
+            self.graph == other.graph && self.key == other.key
+        }
+    }
+    impl<'a, T> Eq for NodeGuard<'a, T> {}
+
+    impl<'a, T> std::fmt::Debug for NodeGuard<'a, T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NodeGuard")
+                .field("graph", &(self.graph as *const ()))
+                .field("key", &self.key)
+                .finish()
+        }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    impl NodeStore<super::Node> {
+        /// 移除指定节点：解绑队列/父子指针并回收到 free list。
+        ///
+        /// # Safety
+        /// 仅在确保 handle_count 已降为 0 且 token 匹配的场景调用。
+        pub unsafe fn remove(&self, ptr: NodePtr<super::Node>) {
+            let raw_guard = ptr.lookup_unchecked();
+            let guard = super::NodeGuard(raw_guard);
+            let graph: &super::Graph2 = &*guard.ptrs.graph;
+            if guard.anchor.borrow().is_none() {
+                graph
+                    .node_metrics
+                    .record(super::SlotmapEventKind::GcSkipped);
+                return;
+            }
+
+            let _ = guard.drain_necessary_children();
+            let _ = guard.drain_clean_parents();
+            super::dequeue_calc(graph, guard);
+
+            let free_head = &graph.free_head;
+            if let Some(old_free) = free_head.get() {
+                let old_guard = old_free.lookup_unchecked();
+                old_guard.ptrs.prev.set(Some(ptr));
+            }
+            guard.ptrs.next.set(free_head.get());
+            guard.ptrs.prev.set(None);
+            free_head.set(Some(ptr));
+
+            guard.ptrs.handle_count.set(0);
+            guard.observed.set(false);
+            guard.visited.set(false);
+            guard.necessary_count.set(0);
+            guard.ptrs.recalc_state.set(super::RecalcState::Needed);
+            guard.ptrs.necessary_children.borrow_mut().clear();
+            guard.ptrs.clean_parent0.set(None);
+            guard.ptrs.clean_parents.borrow_mut().clear();
+
+            *guard.anchor.borrow_mut() = None;
+            graph.node_metrics.record(super::SlotmapEventKind::Free);
+        }
+    }
 }
 
 #[cfg(feature = "anchors_slotmap")]
@@ -129,13 +248,27 @@ use node_store as ag;
 #[cfg(not(feature = "anchors_slotmap"))]
 use arena_graph::raw as ag;
 
+use std::fmt;
 use std::iter::Iterator;
-use std::marker::PhantomData;
 
-#[derive(PartialEq, Clone, Copy, Debug)]
+#[derive(PartialEq, Clone, Copy)]
 pub struct NodeGuard<'gg>(ag::NodeGuard<'gg, Node>);
 
 type NodePtr = ag::NodePtr<Node>;
+
+impl<'gg> fmt::Debug for NodeGuard<'gg> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeGuard")
+            .field("ptr", &self.0.make_ptr())
+            .field("slot_token", &self.slot_token.get())
+            .finish()
+    }
+}
+
+#[cfg(feature = "anchors_slotmap")]
+type AgGuard<'gg> = ag::NodeStoreGuard<'gg, Node>;
+#[cfg(not(feature = "anchors_slotmap"))]
+type AgGuard<'gg> = ag::GraphGuard<'gg, Node>;
 
 #[cfg(feature = "anchors_slotmap")]
 #[derive(Default)]
@@ -174,6 +307,9 @@ thread_local! {
 }
 
 pub struct Graph2 {
+    #[cfg(feature = "anchors_slotmap")]
+    nodes: ag::NodeStore<Node>,
+    #[cfg(not(feature = "anchors_slotmap"))]
     nodes: ag::Graph<Node>,
     graph_token: u32,
     #[cfg(feature = "anchors_slotmap")]
@@ -194,7 +330,7 @@ pub struct Graph2 {
 
 #[derive(Clone, Copy)]
 pub struct Graph2Guard<'gg> {
-    nodes: ag::GraphGuard<'gg, Node>,
+    nodes: AgGuard<'gg>,
     graph: &'gg Graph2,
 }
 
@@ -327,42 +463,41 @@ impl<'a> std::ops::Deref for NodeGuard<'a> {
 impl<'a> NodeGuard<'a> {
     pub fn key(self) -> NodeKey {
         NodeKey {
-            ptr: unsafe { self.0.make_ptr() },
+            ptr: self.0.make_ptr(),
             token: self.slot_token.get(),
         }
     }
 
     pub fn add_clean_parent(self, parent: NodeGuard<'a>) {
         if self.ptrs.clean_parent0.get().is_none() {
-            self.ptrs
-                .clean_parent0
-                .set(Some(unsafe { parent.0.make_ptr() }))
+            self.ptrs.clean_parent0.set(Some(parent.0.make_ptr()))
         } else {
             self.ptrs
                 .clean_parents
                 .borrow_mut()
-                .push(unsafe { parent.0.make_ptr() })
+                .push(parent.0.make_ptr())
         }
     }
 
-    pub fn clean_parents(self) -> impl Iterator<Item = NodeGuard<'a>> {
-        RefCellVecIterator {
-            inside: self.0.node().ptrs.clean_parents.borrow_mut(),
-            next_i: 0,
-            first: self.ptrs.clean_parent0.get(),
-            f: PhantomData,
-            empty_on_drop: false,
+    pub fn clean_parents(&self) -> Vec<NodeGuard<'a>> {
+        let mut out = Vec::new();
+        if let Some(first) = self.ptrs.clean_parent0.get() {
+            out.push(NodeGuard(unsafe { first.lookup_unchecked() }));
         }
+        let parents = self.ptrs.clean_parents.borrow();
+        out.extend(
+            parents
+                .iter()
+                .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() })),
+        );
+        out
     }
 
-    pub fn drain_clean_parents(self) -> impl Iterator<Item = NodeGuard<'a>> {
-        RefCellVecIterator {
-            inside: self.0.node().ptrs.clean_parents.borrow_mut(),
-            next_i: 0,
-            first: self.ptrs.clean_parent0.take(),
-            f: PhantomData,
-            empty_on_drop: true,
-        }
+    pub fn drain_clean_parents(&self) -> Vec<NodeGuard<'a>> {
+        let res = self.clean_parents();
+        self.ptrs.clean_parent0.set(None);
+        self.ptrs.clean_parents.borrow_mut().clear();
+        res
     }
 
     pub fn add_necessary_child(self, child: NodeGuard<'a>) {
@@ -374,7 +509,7 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
-    pub fn remove_necessary_child(self, child: NodeGuard<'a>) {
+    pub fn remove_necessary_child(&self, child: NodeGuard<'a>) {
         let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
         let child_ptr = unsafe { child.0.make_ptr() };
         if let Ok(i) = necessary_children.binary_search(&child_ptr) {
@@ -383,79 +518,39 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
-    pub fn necessary_children(self) -> impl Iterator<Item = NodeGuard<'a>> {
-        RefCellVecIterator {
-            inside: self.0.node().ptrs.necessary_children.borrow_mut(),
-            next_i: 0,
-            first: None,
-            f: PhantomData,
-            empty_on_drop: false,
-        }
+    pub fn necessary_children(&self) -> Vec<NodeGuard<'a>> {
+        let children = self.ptrs.necessary_children.borrow();
+        children
+            .iter()
+            .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() }))
+            .collect()
     }
 
-    pub fn drain_necessary_children(self) -> impl Iterator<Item = NodeGuard<'a>> {
-        let necessary_children = self.0.node().ptrs.necessary_children.borrow_mut();
-        for child in &*necessary_children {
+    pub fn drain_necessary_children(&self) -> Vec<NodeGuard<'a>> {
+        let mut children = self.ptrs.necessary_children.borrow_mut();
+        for child in children.iter() {
             let count = &unsafe { self.0.lookup_ptr(*child) }.necessary_count;
-            count.set(count.get() - 1);
+            count.set(count.get().saturating_sub(1));
         }
-        RefCellVecIterator {
-            inside: necessary_children,
-            next_i: 0,
-            first: None,
-            f: PhantomData,
-            empty_on_drop: true,
-        }
-    }
-}
-
-struct RefCellVecIterator<'a> {
-    inside: RefMut<'a, Vec<NodePtr>>,
-    next_i: usize,
-    first: Option<NodePtr>,
-    // hack to make RefCellVecIterator invariant
-    f: PhantomData<&'a mut &'a ()>,
-    empty_on_drop: bool,
-}
-
-impl<'a> Iterator for RefCellVecIterator<'a> {
-    type Item = NodeGuard<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(first) = self.first.take() {
-            return Some(NodeGuard(unsafe { first.lookup_unchecked() }));
-        }
-        let next = self.inside.get(self.next_i)?;
-        self.next_i += 1;
-        Some(NodeGuard(unsafe { next.lookup_unchecked() }))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let mut remaining = self.inside.len() - self.next_i;
-
-        if self.first.is_some() {
-            remaining += 1;
-        }
-
-        (remaining, Some(remaining))
-    }
-}
-
-impl<'a> Drop for RefCellVecIterator<'a> {
-    fn drop(&mut self) {
-        if self.empty_on_drop {
-            self.inside.clear()
-        }
+        let collected = children
+            .iter()
+            .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() }))
+            .collect();
+        children.clear();
+        collected
     }
 }
 
 impl<'gg> Graph2Guard<'gg> {
     pub fn get(&self, key: NodeKey) -> Option<NodeGuard<'gg>> {
-        let node = unsafe { self.nodes.lookup_ptr(key.ptr) };
+        let node = NodeGuard(unsafe { key.ptr.lookup_unchecked() });
         if key.token != node.slot_token.get() {
             return None;
         }
-        Some(NodeGuard(node))
+        if node.anchor.borrow().is_none() {
+            return None;
+        }
+        Some(node)
     }
 
     #[cfg(test)]
@@ -470,10 +565,10 @@ impl<'gg> Graph2Guard<'gg> {
         let mut recalc_queues = self.graph.recalc_queues.borrow_mut();
         while self.graph.recalc_min_height.get() <= self.graph.recalc_max_height.get() {
             if let Some(ptr) = recalc_queues[self.graph.recalc_min_height.get()] {
-                let node = unsafe { self.nodes.lookup_ptr(ptr) };
+                let node = NodeGuard(unsafe { ptr.lookup_unchecked() });
                 recalc_queues[self.graph.recalc_min_height.get()] = node.ptrs.next.get();
                 if let Some(next_in_queue_ptr) = node.ptrs.next.get() {
-                    unsafe { self.nodes.lookup_ptr(next_in_queue_ptr) }
+                    NodeGuard(unsafe { next_in_queue_ptr.lookup_unchecked() })
                         .ptrs
                         .prev
                         .set(None);
@@ -481,7 +576,7 @@ impl<'gg> Graph2Guard<'gg> {
                 node.ptrs.prev.set(None);
                 node.ptrs.next.set(None);
                 node.ptrs.recalc_state.set(RecalcState::Ready);
-                return Some((self.graph.recalc_min_height.get(), NodeGuard(node)));
+                return Some((self.graph.recalc_min_height.get(), node));
             } else {
                 self.graph
                     .recalc_min_height
@@ -508,10 +603,10 @@ impl<'gg> Graph2Guard<'gg> {
             );
         }
         if let Some(old) = recalc_queues[node_height] {
-            unsafe { self.nodes.lookup_ptr(old) }
+            NodeGuard(unsafe { old.lookup_unchecked() })
                 .ptrs
                 .prev
-                .set(Some(unsafe { node.0.make_ptr() }));
+                .set(Some(node.0.make_ptr()));
             node.ptrs.next.set(Some(old));
         } else {
             if self.graph.recalc_min_height.get() > node_height {
@@ -521,7 +616,7 @@ impl<'gg> Graph2Guard<'gg> {
                 self.graph.recalc_max_height.set(node_height);
             }
         }
-        recalc_queues[node_height] = Some(unsafe { node.0.make_ptr() });
+        recalc_queues[node_height] = Some(node.0.make_ptr());
     }
 }
 
@@ -540,6 +635,9 @@ impl Graph2 {
 
     pub fn new(max_height: usize) -> Self {
         Self {
+            #[cfg(feature = "anchors_slotmap")]
+            nodes: ag::NodeStore::new(),
+            #[cfg(not(feature = "anchors_slotmap"))]
             nodes: ag::Graph::new(),
             graph_token: NEXT_TOKEN.with(|token| {
                 let n = token.get();
@@ -580,30 +678,30 @@ impl Graph2 {
         debug_info: AnchorDebugInfo,
     ) -> AnchorHandle {
         self.nodes.with(|nodes| {
-            let ptr = if let Some(free_head) = self.free_head.get() {
-                let node = unsafe { nodes.lookup_ptr(free_head) };
-                self.free_head.set(node.ptrs.next.get());
-                if let Some(next_ptr) = node.ptrs.next.get() {
+            let guard = if let Some(free_head) = self.free_head.get() {
+                let guard = NodeGuard(unsafe { free_head.lookup_unchecked() });
+                self.free_head.set(guard.ptrs.next.get());
+                if let Some(next_ptr) = guard.ptrs.next.get() {
                     let next_node = unsafe { nodes.lookup_ptr(next_ptr) };
                     next_node.ptrs.prev.set(None);
                 }
-                node.observed.set(false);
-                node.visited.set(false);
-                node.necessary_count.set(0);
-                node.slot_token.set(self.next_slot_token());
-                node.ptrs.clean_parent0.set(None);
-                node.ptrs.clean_parents.replace(vec![]);
-                node.ptrs.recalc_state.set(RecalcState::Needed);
-                node.ptrs.necessary_children.replace(vec![]);
-                node.ptrs.height.set(0);
-                node.ptrs.handle_count.set(1);
-                node.ptrs.prev.set(None);
-                node.ptrs.next.set(None);
-                node.debug_info.set(debug_info);
-                node.last_ready.set(None);
-                node.last_update.set(None);
-                node.anchor.replace(Some(anchor));
-                node
+                guard.observed.set(false);
+                guard.visited.set(false);
+                guard.necessary_count.set(0);
+                guard.slot_token.set(self.next_slot_token());
+                guard.ptrs.clean_parent0.set(None);
+                guard.ptrs.clean_parents.replace(vec![]);
+                guard.ptrs.recalc_state.set(RecalcState::Needed);
+                guard.ptrs.necessary_children.replace(vec![]);
+                guard.ptrs.height.set(0);
+                guard.ptrs.handle_count.set(1);
+                guard.ptrs.prev.set(None);
+                guard.ptrs.next.set(None);
+                guard.debug_info.set(debug_info);
+                guard.last_ready.set(None);
+                guard.last_update.set(None);
+                guard.anchor.replace(Some(anchor));
+                guard
             } else {
                 let node = Node {
                     observed: Cell::new(false),
@@ -626,12 +724,9 @@ impl Graph2 {
                     last_update: Cell::new(None),
                     anchor: RefCell::new(Some(anchor)),
                 };
-                nodes.insert(node)
+                NodeGuard(nodes.insert(node))
             };
-            let num = NodeKey {
-                ptr: unsafe { ptr.make_ptr() },
-                token: self.graph_token,
-            };
+            let num = guard.key();
             #[cfg(feature = "anchors_slotmap")]
             self.node_metrics.record(SlotmapEventKind::Alloc);
             AnchorHandle {
@@ -714,22 +809,23 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
     node.ptrs.next.set(None);
 }
 
+#[cfg(feature = "anchors_slotmap")]
+unsafe fn free(ptr: NodePtr) {
+    let guard = ptr.lookup_unchecked();
+    let graph: &Graph2 = &*guard.ptrs.graph;
+    graph.nodes.remove(ptr);
+}
+
+#[cfg(not(feature = "anchors_slotmap"))]
 unsafe fn free(ptr: NodePtr) {
     let guard = NodeGuard(ptr.lookup_unchecked());
     if guard.anchor.borrow().is_none() {
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            let graph_ref: &Graph2 = unsafe { &*guard.ptrs.graph };
-            graph_ref.node_metrics.record(SlotmapEventKind::GcSkipped);
-        }
         return;
     }
     let _ = guard.drain_necessary_children();
     let _ = guard.drain_clean_parents();
     let graph = &*guard.ptrs.graph;
     dequeue_calc(graph, guard);
-    // TODO clear out this node with default empty data
-    // TODO add node to chain of free nodes
     let free_head = &graph.free_head;
     let old_free = free_head.get();
     if let Some(old_free) = old_free {
@@ -737,11 +833,7 @@ unsafe fn free(ptr: NodePtr) {
     }
     guard.ptrs.next.set(old_free);
     free_head.set(Some(ptr));
-
-    // "SAFETY": this may cause other nodes to be dropped, so do with care
     *guard.anchor.borrow_mut() = None;
-    #[cfg(feature = "anchors_slotmap")]
-    graph.node_metrics.record(SlotmapEventKind::Free);
 }
 
 pub fn height(node: NodeGuard<'_>) -> usize {
@@ -970,9 +1062,18 @@ mod test {
         let a = graph.insert_testing();
         let d = graph.insert_testing();
 
-        assert_eq!(a_token, a.token());
-        assert_eq!(b_token, b.token());
-        assert_eq!(c_token, c.token());
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            assert!(a.token().token > a_token.token);
+            assert!(b.token().token > b_token.token);
+            assert!(c.token().token > c_token.token);
+        }
+        #[cfg(not(feature = "anchors_slotmap"))]
+        {
+            assert_eq!(a_token, a.token());
+            assert_eq!(b_token, b.token());
+            assert_eq!(c_token, c.token());
+        }
         let d_token = d.token();
 
         std::mem::drop(c);
@@ -985,9 +1086,19 @@ mod test {
         let a = graph.insert_testing();
         let c = graph.insert_testing();
 
-        assert_eq!(a_token, a.token());
-        assert_eq!(b_token, b.token());
-        assert_eq!(c_token, c.token());
-        assert_eq!(d_token, d.token());
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            assert!(a.token().token > a_token.token);
+            assert!(b.token().token > b_token.token);
+            assert!(c.token().token > c_token.token);
+            assert!(d.token().token > d_token.token);
+        }
+        #[cfg(not(feature = "anchors_slotmap"))]
+        {
+            assert_eq!(a_token, a.token());
+            assert_eq!(b_token, b.token());
+            assert_eq!(c_token, c.token());
+            assert_eq!(d_token, d.token());
+        }
     }
 }
