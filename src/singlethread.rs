@@ -45,6 +45,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::panic::Location;
 use std::rc::Rc;
+use std::sync::OnceLock;
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn into_ea<T>(x: impl Into<ValOrAnchor<T>>) -> ValOrAnchor<T> {
@@ -355,6 +356,18 @@ impl Engine {
             graph,
             pending_on_anchor_get: false,
         };
+        /// ══════════════════════════════════════════════════════════════════════
+        /// 锁严格模式开关：设置环境变量 `ANCHORS_LOCK_STRICT=1` 时，检测到遗留锁会直接 panic，
+        /// 便于在本地/CI 及时暴露潜在的重入缺陷；默认模式则会抢占解锁继续重算，避免卡死。
+        fn lock_strict_enabled() -> bool {
+            static STRICT: OnceLock<bool> = OnceLock::new();
+            *STRICT.get_or_init(|| {
+                std::env::var("ANCHORS_LOCK_STRICT")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+            })
+        }
+
         struct AnchorLockGuard<'a> {
             flag: &'a Cell<bool>,
         }
@@ -365,8 +378,15 @@ impl Engine {
         }
 
         if node.anchor_locked.get() {
-            // 单线程场景下，出现锁标志通常意味着上一次重算异常中断或遗留标志未及时清理。
-            // 直接抢占并继续重算，避免无休止的重排队导致 panic。
+            // ╔════════════ 警示：遗留锁可能意味着真实重入缺陷 ════════════╗
+            // ║ STRICT 模式下直接 panic 揭露问题；默认模式下抢占解锁以避免卡死。 ║
+            // ╚═══════════════════════════════════════════════════════════════╝
+            if lock_strict_enabled() {
+                panic!(
+                    "slotmap: detected anchor_locked while strict mode enabled,可能存在重入缺陷 {:?}",
+                    node.debug_info.get()._to_string()
+                );
+            }
             let retry = node.recalc_retry.get().saturating_add(1);
             node.recalc_retry.set(retry);
             if retry % 8 == 0 {
