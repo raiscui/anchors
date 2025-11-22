@@ -382,13 +382,18 @@ impl Engine {
             })
         }
 
+        #[derive(Clone)]
+        struct LockTraceRecord {
+            /// 仅记录定位信息，避免为每一次锁捕获整段回溯导致 RSS 暴涨。
+            info: String,
+        }
+
         fn lock_trace_store(key: u64, info: String) {
             if !lock_trace_enabled() {
                 return;
             }
-            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
-            let bt = Backtrace::force_capture();
-            let record = format!("{}\n{:?}", info, bt);
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
+            let record = LockTraceRecord { info: info.clone() };
             TRACE_MAP
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
@@ -401,7 +406,7 @@ impl Engine {
             if !lock_trace_enabled() {
                 return None;
             }
-            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             let removed = TRACE_MAP
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
@@ -411,22 +416,28 @@ impl Engine {
                 println!(
                     "ANCHORS_LOCK_TRACE: unlock token={} info(first line)={}",
                     key,
-                    info.lines().next().unwrap_or("")
+                    info.info.lines().next().unwrap_or("")
                 );
             }
-            removed
+            removed.map(|rec| rec.info)
         }
 
         fn lock_trace_peek(key: u64) -> Option<String> {
             if !lock_trace_enabled() {
                 return None;
             }
-            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             TRACE_MAP
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .ok()
-                .and_then(|map| map.get(&key).cloned())
+                .and_then(|map| {
+                    map.get(&key).map(|rec| {
+                        // 仅在真正需要报错时才捕获回溯，避免日常路径的高额内存占用。
+                        let bt = Backtrace::force_capture();
+                        format!("{}\n{:?}", rec.info, bt)
+                    })
+                })
         }
 
         struct AnchorLockGuard<'a> {
