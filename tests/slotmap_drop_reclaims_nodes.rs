@@ -8,8 +8,8 @@ mod slotmap;
 use libc::_SC_PAGESIZE;
 #[cfg(all(feature = "anchors_slotmap", target_os = "macos"))]
 use libc::{
-    mach_msg_type_number_t, mach_task_basic_info_data_t, mach_task_self, task_info, KERN_SUCCESS,
-    MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT,
+    KERN_SUCCESS, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_msg_type_number_t,
+    mach_task_basic_info_data_t, mach_task_self, task_info,
 };
 #[cfg(all(
     feature = "anchors_slotmap",

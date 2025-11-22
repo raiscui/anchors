@@ -164,9 +164,7 @@ mod node_store {
             debug_assert_eq!(ptr.graph, self.graph);
             // unsafe: graph 指针来自同一 NodeStore，确保访问合法。
             let slots = unsafe { &*(*self.graph).slots.get() };
-            slots
-                .get(ptr.key)
-                .expect("dangling NodePtr: 节点已被移除")
+            slots.get(ptr.key).expect("dangling NodePtr: 节点已被移除")
         }
     }
 
@@ -224,24 +222,26 @@ mod node_store {
             }
 
             // 尝试非阻塞清理必要子节点，若外部仍借用则跳过以避免 RefCell panic。
-            let drained_children = if let Ok(mut children) = guard.ptrs.necessary_children.try_borrow_mut() {
-                for child in children.iter() {
-                    let count = &unsafe { guard.0.lookup_ptr(*child) }.necessary_count;
-                    count.set(count.get().saturating_sub(1));
-                }
-                children.clear();
-                true
-            } else {
-                graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
-                false
-            };
+            let drained_children =
+                if let Ok(mut children) = guard.ptrs.necessary_children.try_borrow_mut() {
+                    for child in children.iter() {
+                        let count = &unsafe { guard.0.lookup_ptr(*child) }.necessary_count;
+                        count.set(count.get().saturating_sub(1));
+                    }
+                    children.clear();
+                    true
+                } else {
+                    graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
+                    false
+                };
             if !drained_children {
                 return false;
             }
 
             guard.ptrs.clean_parent0.set(None);
             // 父列表同理，避免在外层持有不可预期借用时触发崩溃。
-            let drained_parents = if let Ok(mut parents) = guard.ptrs.clean_parents.try_borrow_mut() {
+            let drained_parents = if let Ok(mut parents) = guard.ptrs.clean_parents.try_borrow_mut()
+            {
                 parents.clear();
                 true
             } else {
@@ -256,7 +256,9 @@ mod node_store {
 
             let anchor_slot = unsafe { &mut *guard.anchor.get() };
             if anchor_slot.is_none() {
-                graph.node_metrics.record(super::SlotmapEventKind::GcSkipped);
+                graph
+                    .node_metrics
+                    .record(super::SlotmapEventKind::GcSkipped);
                 return true;
             }
             *anchor_slot = None;
@@ -422,6 +424,13 @@ pub struct NodeKey {
 
 impl !Send for NodeKey {}
 impl !Sync for NodeKey {}
+
+impl NodeKey {
+    /// 仅供调试使用，返回 slot token 原始值。
+    pub fn raw_token(&self) -> u64 {
+        self.token
+    }
+}
 
 pub struct NodePtrs {
     /// first parent, remaining parents. unsorted, duplicates may exist

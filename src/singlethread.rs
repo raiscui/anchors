@@ -42,10 +42,12 @@ use libc::getrusage;
 #[cfg(feature = "anchors_slotmap")]
 use libc::rusage;
 use std::any::Any;
+use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::panic::Location;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn into_ea<T>(x: impl Into<ValOrAnchor<T>>) -> ValOrAnchor<T> {
@@ -368,12 +370,75 @@ impl Engine {
             })
         }
 
+        /// ══════════════════════════════════════════════════════════════════════
+        /// 可选调试：`ANCHORS_LOCK_TRACE=1` 时记录锁的来源，帮助定位重入根因。
+        /// 在 strict 模式下 panic 时，会把上一次持锁时的调用栈附带出来。
+        fn lock_trace_enabled() -> bool {
+            static TRACE: OnceLock<bool> = OnceLock::new();
+            *TRACE.get_or_init(|| {
+                std::env::var("ANCHORS_LOCK_TRACE")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+            })
+        }
+
+        fn lock_trace_store(key: u64, info: String) {
+            if !lock_trace_enabled() {
+                return;
+            }
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+            let bt = Backtrace::force_capture();
+            let record = format!("{}\n{:?}", info, bt);
+            TRACE_MAP
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .expect("lock trace poisoned")
+                .insert(key, record);
+            println!("ANCHORS_LOCK_TRACE: lock token={} info={}", key, info);
+        }
+
+        fn lock_trace_take(key: u64) -> Option<String> {
+            if !lock_trace_enabled() {
+                return None;
+            }
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+            let removed = TRACE_MAP
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(&key));
+            if let Some(ref info) = removed {
+                println!(
+                    "ANCHORS_LOCK_TRACE: unlock token={} info(first line)={}",
+                    key,
+                    info.lines().next().unwrap_or("")
+                );
+            }
+            removed
+        }
+
+        fn lock_trace_peek(key: u64) -> Option<String> {
+            if !lock_trace_enabled() {
+                return None;
+            }
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+            TRACE_MAP
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&key).cloned())
+        }
+
         struct AnchorLockGuard<'a> {
             flag: &'a Cell<bool>,
+            trace_key: Option<u64>,
         }
         impl Drop for AnchorLockGuard<'_> {
             fn drop(&mut self) {
                 self.flag.set(false);
+                if let Some(key) = self.trace_key.take() {
+                    let _ = lock_trace_take(key);
+                }
             }
         }
 
@@ -382,10 +447,21 @@ impl Engine {
             // ║ STRICT 模式下直接 panic 揭露问题；默认模式下抢占解锁以避免卡死。 ║
             // ╚═══════════════════════════════════════════════════════════════╝
             if lock_strict_enabled() {
-                panic!(
-                    "slotmap: detected anchor_locked while strict mode enabled,可能存在重入缺陷 {:?}",
-                    node.debug_info.get()._to_string()
-                );
+                let trace = lock_trace_peek(node.key().raw_token());
+                if let Some(t) = trace {
+                    panic!(
+                        "slotmap: detected anchor_locked while strict mode enabled,可能存在重入缺陷 {:?}\n上次持锁位置: {}",
+                        node.debug_info.get()._to_string(),
+                        t
+                    );
+                } else {
+                    tracing::error!(
+                        target: "anchors",
+                        debug_info = %node.debug_info.get()._to_string(),
+                        "strict 模式遇到未知来源的遗留锁，尝试先强制解锁再继续，以便避免误报",
+                    );
+                    node.anchor_locked.set(false);
+                }
             }
             let retry = node.recalc_retry.get().saturating_add(1);
             node.recalc_retry.set(retry);
@@ -401,8 +477,18 @@ impl Engine {
         }
         node.anchor_locked.set(true);
 
+        let trace_key = if lock_trace_enabled() {
+            Some(node.key().raw_token())
+        } else {
+            None
+        };
+        if let Some(key) = trace_key {
+            lock_trace_store(key, node.debug_info.get()._to_string());
+        }
+
         let _lock_guard = AnchorLockGuard {
             flag: &node.anchor_locked,
+            trace_key,
         };
 
         let anchor_ref = unsafe {
