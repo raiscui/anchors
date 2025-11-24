@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2025-11-24 22:31:26
+ * @LastEditTime: 2025-11-24 22:52:51
  * @LastEditors: Rais
  * @Description:
  */
@@ -29,8 +29,7 @@ where
     #[track_caller]
     fn from(value: OrdMap<I, Anchor<V, E>>) -> Self {
         // 将静态字典包成 Constant，再交给流式收集器统一处理，保证依赖链稳定
-        let input = Constant::new_internal::<E>(value);
-        OrdMapCollectStream::new_from_anchor(input)
+        OrdMapCollectStream::from_value(value)
     }
 }
 
@@ -43,13 +42,14 @@ where
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
 {
+    #[track_caller]
     fn from(
         value: Anchor<
             OrdMap<I, Anchor<V, crate::singlethread::Engine>>,
             crate::singlethread::Engine,
         >,
     ) -> Self {
-        OrdMapCollectStream::new_from_anchor(value)
+        OrdMapCollectStream::new_to_anchor(value)
     }
 }
 
@@ -66,8 +66,7 @@ where
         T: IntoIterator<Item = (I, Anchor<V, E>)>,
     {
         let anchors: OrdMap<I, Anchor<V, E>> = iter.into_iter().collect();
-        let input = Constant::new_internal::<E>(anchors);
-        OrdMapCollectStream::new_from_anchor(input)
+        OrdMapCollectStream::from_value(anchors)
     }
 }
 
@@ -84,8 +83,7 @@ where
         T: IntoIterator<Item = &'a (I, Anchor<V, E>)>,
     {
         let anchors: OrdMap<I, Anchor<V, E>> = iter.into_iter().cloned().collect();
-        let input = Constant::new_internal::<E>(anchors);
-        OrdMapCollectStream::new_from_anchor(input)
+        OrdMapCollectStream::from_value(anchors)
     }
 }
 
@@ -105,8 +103,7 @@ where
             .into_iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let input = Constant::new_internal::<E>(anchors);
-        OrdMapCollectStream::new_from_anchor(input)
+        OrdMapCollectStream::from_value(anchors)
     }
 }
 
@@ -238,13 +235,19 @@ where
     V: std::clone::Clone + 'static,
 {
     #[track_caller]
-    pub fn new_from_anchor(input: Anchor<OrdMap<I, Anchor<V, E>>, E>) -> Anchor<OrdMap<I, V>, E> {
+    pub fn new_to_anchor(input: Anchor<OrdMap<I, Anchor<V, E>>, E>) -> Anchor<OrdMap<I, V>, E> {
         E::mount(Self {
             input,
             vals: None,
             dirty: true,
             location: Location::caller(),
         })
+    }
+
+    #[track_caller]
+    pub fn from_value(dict: OrdMap<I, Anchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
+        let input = Constant::new_internal::<E>(dict);
+        Self::new_to_anchor(input)
     }
 }
 
