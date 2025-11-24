@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2023-04-03 15:02:27
+ * @LastEditTime: 2025-11-24 21:46:44
  * @LastEditors: Rais
  * @Description:
  */
@@ -11,33 +11,45 @@ use im_rc::ordmap;
 use crate::im::OrdMap;
 
 use crate::expert::{
-    Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
+    constant::Constant, Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll,
+    UpdateContext,
 };
 use std::panic::Location;
 
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║ 从静态字典或迭代器直接构建 Anchor<OrdMap<..>>，内部统一走流式收集器以规避重入 ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
 impl<I, V, E> From<OrdMap<I, Anchor<V, E>>> for Anchor<OrdMap<I, V>, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from(value: OrdMap<I, Anchor<V, E>>) -> Self {
-        OrdMapCollect::new_to_anchor(value)
+        // 将静态字典包成 Constant，再交给流式收集器统一处理，保证依赖链稳定
+        let input = Constant::new_internal::<E>(value);
+        OrdMapCollectStream::new_from_anchor(input)
     }
 }
 
-impl<I, V, E> From<Anchor<OrdMap<I, Anchor<V, E>>, E>> for Anchor<OrdMap<I, V>, E>
+// 保留原 API，但内部使用流式收集器；限制为单线程 Engine 以匹配 Var 的 Engine 类型。
+impl<I, V>
+    From<Anchor<OrdMap<I, Anchor<V, crate::singlethread::Engine>>, crate::singlethread::Engine>>
+    for Anchor<OrdMap<I, V>, crate::singlethread::Engine>
 where
-    <E as Engine>::AnchorHandle: PartialOrd + Ord,
+    <crate::singlethread::Engine as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
-    E: Engine,
-    // OrdMap<I, V>: std::cmp::Eq,
 {
-    fn from(value: Anchor<OrdMap<I, Anchor<V, E>>, E>) -> Self {
-        value.then(|v| OrdMapCollect::new_to_anchor(v.clone()))
+    fn from(
+        value: Anchor<
+            OrdMap<I, Anchor<V, crate::singlethread::Engine>>,
+            crate::singlethread::Engine,
+        >,
+    ) -> Self {
+        OrdMapCollectStream::new_from_anchor(value)
     }
 }
 
@@ -47,71 +59,190 @@ where
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from_iter<T>(iter: T) -> Self
     where
         T: IntoIterator<Item = (I, Anchor<V, E>)>,
     {
-        OrdMapCollect::new_to_anchor(iter.into_iter().collect())
+        let anchors: OrdMap<I, Anchor<V, E>> = iter.into_iter().collect();
+        let input = Constant::new_internal::<E>(anchors);
+        OrdMapCollectStream::new_from_anchor(input)
     }
 }
 
-impl<'a, I, V, E> std::iter::FromIterator<&'a (I, Anchor<V, E>)> for Anchor<OrdMap<I, V>, E>
+impl<'a, I, V, E> std::iter::FromIterator<&'a (I, Anchor<V, E>)>
+    for Anchor<OrdMap<I, V>, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from_iter<T>(iter: T) -> Self
     where
         T: IntoIterator<Item = &'a (I, Anchor<V, E>)>,
     {
-        OrdMapCollect::new_to_anchor(iter.into_iter().cloned().collect())
+        let anchors: OrdMap<I, Anchor<V, E>> = iter.into_iter().cloned().collect();
+        let input = Constant::new_internal::<E>(anchors);
+        OrdMapCollectStream::new_from_anchor(input)
     }
 }
 
-impl<'a, I, V, E> std::iter::FromIterator<(&'a I, &'a Anchor<V, E>)> for Anchor<OrdMap<I, V>, E>
+impl<'a, I, V, E> std::iter::FromIterator<(&'a I, &'a Anchor<V, E>)>
+    for Anchor<OrdMap<I, V>, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from_iter<T>(iter: T) -> Self
     where
         T: IntoIterator<Item = (&'a I, &'a Anchor<V, E>)>,
     {
-        OrdMapCollect::new_to_anchor(
-            iter.into_iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        )
+        let anchors: OrdMap<I, Anchor<V, E>> = iter
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let input = Constant::new_internal::<E>(anchors);
+        OrdMapCollectStream::new_from_anchor(input)
     }
 }
 
-pub struct OrdMapCollect<I, V, E: Engine> {
-    anchors: OrdMap<I, Anchor<V, E>>,
+// pub struct OrdMapCollect<I, V, E: Engine> {
+//     anchors: OrdMap<I, Anchor<V, E>>,
+//     vals: Option<OrdMap<I, V>>,
+//     dirty: bool,
+//     location: &'static Location<'static>,
+// }
+
+// impl<I: 'static + Clone + std::cmp::Ord, V, E: Engine> OrdMapCollect<I, V, E>
+// where
+//     <E as Engine>::AnchorHandle: PartialOrd + Ord,
+//     V: std::clone::Clone + 'static,
+//     //TODO 通过特化 制作PartialEq版本, (im_rc 在 PartialEq 的情况下 对比 ,没有Eq 性能高)
+//     //TODO 制作 vector smallvec 的对比版本
+//     // OrdMap<I, V>: std::cmp::Eq,
+// {
+//     #[track_caller]
+//     pub fn new_to_anchor(anchors: OrdMap<I, Anchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
+//         E::mount(Self {
+//             anchors,
+//             vals: None,
+//             dirty: true,
+//             location: Location::caller(),
+//         })
+//     }
+// }
+
+// impl<I, V, E> AnchorInner<E> for OrdMapCollect<I, V, E>
+// where
+//     <E as Engine>::AnchorHandle: PartialOrd + Ord,
+//     V: std::clone::Clone + 'static,
+//     I: 'static + Clone + std::cmp::Ord,
+//     E: Engine,
+//     // OrdMap<I, V>: std::cmp::Eq,
+// {
+//     type Output = OrdMap<I, V>;
+//     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+//         // self.vals = None;
+//         self.dirty = true;
+//     }
+
+//     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
+//         let mut changed = false;
+
+//         if self.dirty {
+//             let polls = self
+//                 .anchors
+//                 .iter()
+//                 .try_fold(vec![], |mut acc, (i, anchor)| {
+//                     let s = ctx.request(anchor, true);
+//                     if s == Poll::Pending {
+//                         None
+//                     } else {
+//                         acc.push((s, (i, anchor)));
+//                         Some(acc)
+//                     }
+//                 });
+
+//             if polls.is_none() {
+//                 return Poll::Pending;
+//             }
+
+//             self.dirty = false;
+
+//             if let Some(ref mut old_vals) = self.vals {
+//                 for (poll, (i, anchor)) in &polls.unwrap() {
+//                     if &Poll::Updated == poll {
+//                         old_vals.insert((**i).clone(), ctx.get(anchor).clone());
+//                         changed = true;
+//                     }
+//                 }
+//             } else {
+//                 // self.vals = Some(
+//                 //     self.anchors
+//                 //         .iter()
+//                 //         .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
+//                 //         .collect(),
+//                 // );
+//                 // changed = true;
+
+//                 let pool = ordmap::OrdMapPool::new(self.anchors.len());
+//                 let mut dict = OrdMap::with_pool(&pool);
+
+//                 self.anchors
+//                     .iter()
+//                     .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
+//                     .collect_into(&mut dict);
+
+//                 self.vals = Some(dict);
+//                 changed = true;
+//             }
+//         }
+
+//         if changed {
+//             Poll::Updated
+//         } else {
+//             Poll::Unchanged
+//         }
+//     }
+
+//     fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
+//         &'slf self,
+//         _ctx: &mut G,
+//     ) -> &'out Self::Output
+//     where
+//         'slf: 'out,
+//     {
+//         self.vals.as_ref().unwrap()
+//     }
+
+//     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
+//         Some(("DictCollect", self.location))
+//     }
+// }
+
+/// 流式版本：只挂一次节点，后续通过输入 Anchor 更新，可增删键且避免 then 的重入风险。
+pub struct OrdMapCollectStream<I, V, E: Engine> {
+    input: Anchor<OrdMap<I, Anchor<V, E>>, E>,
     vals: Option<OrdMap<I, V>>,
     dirty: bool,
     location: &'static Location<'static>,
 }
 
-impl<I: 'static + Clone + std::cmp::Ord, V, E: Engine> OrdMapCollect<I, V, E>
+impl<I: 'static + Clone + std::cmp::Ord, V, E: Engine> OrdMapCollectStream<I, V, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
-    //TODO 通过特化 制作PartialEq版本, (im_rc 在 PartialEq 的情况下 对比 ,没有Eq 性能高)
-    //TODO 制作 vector smallvec 的对比版本
-    // OrdMap<I, V>: std::cmp::Eq,
 {
     #[track_caller]
-    pub fn new_to_anchor(anchors: OrdMap<I, Anchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
+    pub fn new_from_anchor(input: Anchor<OrdMap<I, Anchor<V, E>>, E>) -> Anchor<OrdMap<I, V>, E> {
         E::mount(Self {
-            anchors,
+            input,
             vals: None,
             dirty: true,
             location: Location::caller(),
@@ -119,69 +250,56 @@ where
     }
 }
 
-impl<I, V, E> AnchorInner<E> for OrdMapCollect<I, V, E>
+impl<I, V, E> AnchorInner<E> for OrdMapCollectStream<I, V, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
     I: 'static + Clone + std::cmp::Ord,
     E: Engine,
-    // OrdMap<I, V>: std::cmp::Eq,
 {
     type Output = OrdMap<I, V>;
     fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        // self.vals = None;
         self.dirty = true;
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         let mut changed = false;
 
+        // 只有一个输入：整张字典 Anchor。更新/脏时重建输出。
         if self.dirty {
-            let polls = self
-                .anchors
-                .iter()
-                .try_fold(vec![], |mut acc, (i, anchor)| {
-                    let s = ctx.request(anchor, true);
-                    if s == Poll::Pending {
-                        None
-                    } else {
-                        acc.push((s, (i, anchor)));
-                        Some(acc)
-                    }
-                });
-
-            if polls.is_none() {
-                return Poll::Pending;
+            match ctx.request(&self.input, true) {
+                Poll::Pending => return Poll::Pending,
+                _ => {}
             }
 
-            self.dirty = false;
+            let dict_in = ctx.get(&self.input);
+            let entries: Vec<(I, Anchor<V, E>)> = dict_in
+                .iter()
+                .map(|(i, anchor)| (i.clone(), anchor.clone()))
+                .collect();
+            let pool = ordmap::OrdMapPool::new(entries.len());
+            let mut dict = OrdMap::with_pool(&pool);
 
-            if let Some(ref mut old_vals) = self.vals {
-                for (poll, (i, anchor)) in &polls.unwrap() {
-                    if &Poll::Updated == poll {
-                        old_vals.insert((**i).clone(), ctx.get(anchor).clone());
-                        changed = true;
-                    }
+            for (i, anchor) in entries {
+                match ctx.request(&anchor, true) {
+                    Poll::Pending => return Poll::Pending,
+                    _ => {}
                 }
-            } else {
-                // self.vals = Some(
-                //     self.anchors
-                //         .iter()
-                //         .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
-                //         .collect(),
-                // );
-                // changed = true;
+                dict.insert(i, ctx.get(&anchor).clone());
+            }
 
-                let pool = ordmap::OrdMapPool::new(self.anchors.len());
-                let mut dict = OrdMap::with_pool(&pool);
-
-                self.anchors
-                    .iter()
-                    .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
-                    .collect_into(&mut dict);
-
-                self.vals = Some(dict);
-                changed = true;
+            self.vals = Some(dict);
+            self.dirty = false;
+            changed = true;
+        } else {
+            // 保持依赖以便高度/必要关系正确
+            match ctx.request(&self.input, true) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Updated => {
+                    self.dirty = true;
+                    return Poll::Pending;
+                }
+                Poll::Unchanged => {}
             }
         }
 
@@ -203,14 +321,14 @@ where
     }
 
     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
-        Some(("DictCollect", self.location))
+        Some(("DictCollectStream", self.location))
     }
 }
 
 #[cfg(test)]
 mod test {
 
-    use crate::{collections::ord_map_collect::OrdMapCollect, im::OrdMap};
+    use crate::im::OrdMap;
 
     use crate::{dict, singlethread::*};
 
@@ -224,10 +342,12 @@ mod test {
         let dict = dict!(1usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch());
         let f = Var::new(dict.clone());
 
+        // let nums: Anchor<OrdMap<_, _>> = f.watch().into();
         let nums = f.watch().then(|d| {
             let nums: Anchor<OrdMap<_, _>> = d.into_iter().collect();
             nums
         });
+
         let sum: Anchor<usize> = nums.map(|nums| nums.values().sum());
         assert_eq!(engine.get(&sum), 8);
         f.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
@@ -238,10 +358,7 @@ mod test {
         // ─────────────────────────────────────────────────────────────────────────────
         let f2 = Var::new(dict.clone());
 
-        let nums2 = f2.watch().then(|d| {
-            let nums2: Anchor<OrdMap<_, _>> = OrdMapCollect::new_to_anchor(d.clone());
-            nums2
-        });
+        let nums2: Anchor<OrdMap<_, _>> = f2.watch().into();
         let sum: Anchor<usize> = nums2.map(|nums| nums.values().sum());
         assert_eq!(engine.get(&sum), 8);
         f2.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
