@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-04-03 14:30:01
- * @LastEditTime: 2025-11-24 21:50:11
+ * @LastEditTime: 2025-11-24 22:49:45
  * @LastEditors: Rais
  * @Description:
  */
@@ -11,8 +11,8 @@ use im_rc::ordmap;
 use crate::{
     // collections::ord_map_collect::OrdMapCollect,
     expert::{
-        constant::Constant, Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll,
-        UpdateContext, ValOrAnchor,
+        Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext, ValOrAnchor,
+        constant::Constant,
     },
     im::OrdMap,
 };
@@ -31,7 +31,7 @@ where
     #[track_caller]
     fn from(value: OrdMap<I, ValOrAnchor<V, E>>) -> Self {
         let input = Constant::new_internal::<E>(value);
-        OrdMapVOACollectStream::new_from_anchor(input)
+        OrdMapVOACollectStream::new_to_anchor(input)
     }
 }
 impl<I, V, E> From<Anchor<OrdMap<I, ValOrAnchor<V, E>>, E>> for Anchor<OrdMap<I, V>, E>
@@ -43,7 +43,7 @@ where
     // OrdMap<I, V>: std::cmp::Eq,
 {
     fn from(value: Anchor<OrdMap<I, ValOrAnchor<V, E>>, E>) -> Self {
-        OrdMapVOACollectStream::new_from_anchor(value)
+        OrdMapVOACollectStream::new_to_anchor(value)
     }
 }
 
@@ -61,12 +61,11 @@ where
     {
         let dict: OrdMap<I, ValOrAnchor<V, E>> = iter.into_iter().collect();
         let input = Constant::new_internal::<E>(dict);
-        OrdMapVOACollectStream::new_from_anchor(input)
+        OrdMapVOACollectStream::new_to_anchor(input)
     }
 }
 
-impl<'a, I, V, E> std::iter::FromIterator<&'a (I, ValOrAnchor<V, E>)>
-    for Anchor<OrdMap<I, V>, E>
+impl<'a, I, V, E> std::iter::FromIterator<&'a (I, ValOrAnchor<V, E>)> for Anchor<OrdMap<I, V>, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static + std::cmp::PartialEq,
@@ -80,7 +79,7 @@ where
     {
         let dict: OrdMap<I, ValOrAnchor<V, E>> = iter.into_iter().cloned().collect();
         let input = Constant::new_internal::<E>(dict);
-        OrdMapVOACollectStream::new_from_anchor(input)
+        OrdMapVOACollectStream::new_to_anchor(input)
     }
 }
 
@@ -102,7 +101,7 @@ where
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let input = Constant::new_internal::<E>(dict);
-        OrdMapVOACollectStream::new_from_anchor(input)
+        OrdMapVOACollectStream::new_to_anchor(input)
     }
 }
 
@@ -164,8 +163,16 @@ where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static + std::cmp::PartialEq,
 {
+    /// 将静态 VOA 字典包成 Constant，再统一走流式收集器，避免两套实现分叉。
     #[track_caller]
-    pub fn new_from_anchor(
+    pub fn from_value(dict: OrdMap<I, ValOrAnchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
+        // 先固化输入为 Anchor，依赖图在构造期成型，后续仅需 request/get。
+        let input = Constant::new_internal::<E>(dict);
+        Self::new_to_anchor(input)
+    }
+
+    #[track_caller]
+    pub fn new_to_anchor(
         input: Anchor<OrdMap<I, ValOrAnchor<V, E>>, E>,
     ) -> Anchor<OrdMap<I, V>, E> {
         E::mount(Self {
@@ -260,7 +267,7 @@ where
 #[cfg(test)]
 mod test {
 
-    use crate::{collections::ord_map_methods::Dict, expert::Constant, im::OrdMap};
+    use crate::{collections::ord_map_methods::Dict, im::OrdMap};
 
     use crate::{dict, singlethread::*};
 
