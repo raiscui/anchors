@@ -459,20 +459,13 @@ impl Engine {
             // ╚═══════════════════════════════════════════════════════════════╝
             if lock_strict_enabled() {
                 let trace = lock_trace_peek(node.key().raw_token());
-                if let Some(t) = trace {
-                    panic!(
-                        "slotmap: detected anchor_locked while strict mode enabled,可能存在重入缺陷 {:?}\n上次持锁位置: {}",
-                        node.debug_info.get()._to_string(),
-                        t
-                    );
-                } else {
-                    tracing::error!(
-                        target: "anchors",
-                        debug_info = %node.debug_info.get()._to_string(),
-                        "strict 模式遇到未知来源的遗留锁，尝试先强制解锁再继续，以便避免误报",
-                    );
-                    node.anchor_locked.set(false);
-                }
+                panic!(
+                    "slotmap: detected anchor_locked while strict mode enabled,疑似重入缺陷 {:?}\n上次持锁位置: {}",
+                    node.debug_info.get()._to_string(),
+                    trace.unwrap_or_else(|| {
+                        "未记录 trace，请开启 ANCHORS_LOCK_TRACE 以获取更多定位信息".to_string()
+                    })
+                );
             }
             let retry = node.recalc_retry.get().saturating_add(1);
             node.recalc_retry.set(retry);
