@@ -8,12 +8,14 @@
 
 use im_rc::ordmap;
 
-use crate::{expert::ValOrAnchor, im::OrdMap};
-
-use crate::expert::{
-    Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
+use crate::{
+    collections::ord_map_collect::OrdMapCollect,
+    expert::{ValOrAnchor, constant::Constant},
+    im::OrdMap,
 };
-use std::panic::Location;
+
+use crate::expert::Anchor;
+use crate::expert::Engine;
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl<I, V, E> From<OrdMap<I, ValOrAnchor<V, E>>> for Anchor<OrdMap<I, V>, E>
@@ -94,154 +96,48 @@ where
     }
 }
 
-pub struct OrdMapVOACollect<I, V, E: Engine> {
-    anchors: OrdMap<I, ValOrAnchor<V, E>>,
-    vals: Option<OrdMap<I, V>>,
-    dirty: bool,
-    location: &'static Location<'static>,
-}
+/// 过渡器：将 `ValOrAnchor` 预先“固化”为稳定的 Anchor，再复用已有的 `OrdMapCollect`。
+/// 好处：依赖图在构造时就成型，避免在 `poll_updated` 过程中临时变更依赖链引发重入。
+pub struct OrdMapVOACollect;
 
-impl<I: 'static + Clone + std::cmp::Ord, V, E: Engine> OrdMapVOACollect<I, V, E>
-where
-    <E as Engine>::AnchorHandle: PartialOrd + Ord,
-    V: std::clone::Clone + 'static + std::cmp::PartialEq,
-    //TODO 通过特化 制作PartialEq版本, (im_rc 在 PartialEq 的情况下 对比 ,没有Eq 性能高)
-    //TODO 制作 vector smallvec 的对比版本
-    // OrdMap<I, V>: std::cmp::Eq,
-{
+impl OrdMapVOACollect {
+    /// 将 `OrdMap<I, ValOrAnchor<V>>` 映射为 `OrdMap<I, Anchor<V>>`，然后直接交给 `OrdMapCollect`
+    /// 处理，保证依赖在构造期就稳定下来。
     #[track_caller]
-    pub fn new_to_anchor(anchors: OrdMap<I, ValOrAnchor<V, E>>) -> Anchor<OrdMap<I, V>, E> {
-        E::mount(Self {
-            anchors,
-            vals: None,
-            dirty: true,
-            location: Location::caller(),
-        })
-    }
-}
-
-impl<I, V, E> AnchorInner<E> for OrdMapVOACollect<I, V, E>
-where
-    <E as Engine>::AnchorHandle: PartialOrd + Ord,
-    V: std::clone::Clone + 'static + std::cmp::PartialEq,
-    I: 'static + Clone + std::cmp::Ord,
-    E: Engine,
-    // OrdMap<I, V>: std::cmp::Eq,
-{
-    type Output = OrdMap<I, V>;
-    fn dirty(&mut self, _edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        // self.vals = None;
-        self.dirty = true;
-    }
-
-    fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
-        let mut changed = false;
-
-        if self.dirty {
-            let polls = self
-                .anchors
-                .iter()
-                .try_fold(vec![], |mut acc, (i, anchor)| match anchor {
-                    ValOrAnchor::Val(_) => {
-                        #[cfg(debug_assertions)]
-                        acc.push((Poll::Unchanged, (i, anchor)));
-                        #[cfg(not(debug_assertions))]
-                        acc.push((Poll::Unchanged, (i, None)));
-
-                        Some(acc)
-                    }
-                    ValOrAnchor::Anchor(an) => {
-                        let s = ctx.request(an, true);
-                        if s == Poll::Pending {
-                            None
-                        } else {
-                            #[cfg(debug_assertions)]
-                            acc.push((s, (i, anchor)));
-                            #[cfg(not(debug_assertions))]
-                            acc.push((s, (i, Some(an))));
-
-                            Some(acc)
-                        }
-                    }
-                });
-
-            if polls.is_none() {
-                return Poll::Pending;
-            }
-
-            self.dirty = false;
-
-            if let Some(ref mut old_vals) = self.vals {
-                for (poll, (i, opt_an)) in &polls.unwrap() {
-                    #[cfg(debug_assertions)]
-                    {
-                        match opt_an {
-                            ValOrAnchor::Val(v) => {
-                                debug_assert!(old_vals.get(i).unwrap() == v);
-                            }
-                            ValOrAnchor::Anchor(an) => {
-                                if &Poll::Updated == poll {
-                                    old_vals.insert((**i).clone(), ctx.get(an).clone());
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                    #[cfg(not(debug_assertions))]
-                    {
-                        match opt_an {
-                            Some(an) if &Poll::Updated == poll => {
-                                old_vals.insert((**i).clone(), ctx.get(an).clone());
-                                changed = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            } else {
-                // self.vals = Some(
-                //     self.anchors
-                //         .iter()
-                //         .map(|(i, anchor)| (i.clone(), ctx.get(anchor).clone()))
-                //         .collect(),
-                // );
-                // changed = true;
-
-                let pool = ordmap::OrdMapPool::new(self.anchors.len());
-                let mut dict = OrdMap::with_pool(&pool);
-
-                self.anchors
-                    .iter()
-                    .map(|(i, voa)| match voa {
-                        ValOrAnchor::Val(v) => (i.clone(), v.clone()),
-                        ValOrAnchor::Anchor(an) => (i.clone(), ctx.get(an).clone()),
-                    })
-                    .collect_into(&mut dict);
-
-                self.vals = Some(dict);
-                changed = true;
-            }
-        }
-
-        if changed {
-            Poll::Updated
-        } else {
-            Poll::Unchanged
-        }
-    }
-
-    fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
-        &'slf self,
-        _ctx: &mut G,
-    ) -> &'out Self::Output
+    pub fn new_to_anchor<I, V, E>(anchors: OrdMap<I, ValOrAnchor<V, E>>) -> Anchor<OrdMap<I, V>, E>
     where
-        'slf: 'out,
+        <E as Engine>::AnchorHandle: PartialOrd + Ord,
+        V: Clone + 'static + std::cmp::PartialEq,
+        I: 'static + Clone + std::cmp::Ord,
+        E: Engine,
     {
-        self.vals.as_ref().unwrap()
+        let anchor_map = Self::voa_dict_to_anchor_dict(anchors);
+        OrdMapCollect::new_to_anchor(anchor_map)
     }
 
-    fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
-        Some(("DictCollect", self.location))
+    /// 把 VOA 字典转换为“稳定 Anchor”字典：`Val` 立即包成 Constant，`Anchor` 原样传递。
+    fn voa_dict_to_anchor_dict<I, V, E>(
+        anchors: OrdMap<I, ValOrAnchor<V, E>>,
+    ) -> OrdMap<I, Anchor<V, E>>
+    where
+        V: Clone + 'static + std::cmp::PartialEq,
+        I: Clone + std::cmp::Ord,
+        E: Engine,
+    {
+        let pool = ordmap::OrdMapPool::new(anchors.len());
+        let mut dict = OrdMap::with_pool(&pool);
+
+        anchors
+            .into_iter()
+            .map(|(i, voa)| {
+                let anchor = match voa {
+                    ValOrAnchor::Val(v) => Constant::new_internal::<E>(v),
+                    ValOrAnchor::Anchor(an) => an,
+                };
+                (i, anchor)
+            })
+            .collect_into(&mut dict);
+        dict
     }
 }
 
