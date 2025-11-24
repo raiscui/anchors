@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2022-09-14 11:08:53
- * @LastEditTime: 2025-11-24 21:46:44
+ * @LastEditTime: 2025-11-24 22:31:26
  * @LastEditors: Rais
  * @Description:
  */
@@ -11,8 +11,8 @@ use im_rc::ordmap;
 use crate::im::OrdMap;
 
 use crate::expert::{
-    constant::Constant, Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll,
-    UpdateContext,
+    Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
+    constant::Constant,
 };
 use std::panic::Location;
 
@@ -71,8 +71,7 @@ where
     }
 }
 
-impl<'a, I, V, E> std::iter::FromIterator<&'a (I, Anchor<V, E>)>
-    for Anchor<OrdMap<I, V>, E>
+impl<'a, I, V, E> std::iter::FromIterator<&'a (I, Anchor<V, E>)> for Anchor<OrdMap<I, V>, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
@@ -90,8 +89,7 @@ where
     }
 }
 
-impl<'a, I, V, E> std::iter::FromIterator<(&'a I, &'a Anchor<V, E>)>
-    for Anchor<OrdMap<I, V>, E>
+impl<'a, I, V, E> std::iter::FromIterator<(&'a I, &'a Anchor<V, E>)> for Anchor<OrdMap<I, V>, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
     V: std::clone::Clone + 'static,
@@ -358,7 +356,11 @@ mod test {
         // ─────────────────────────────────────────────────────────────────────────────
         let f2 = Var::new(dict.clone());
 
-        let nums2: Anchor<OrdMap<_, _>> = f2.watch().into();
+        // let nums2: Anchor<OrdMap<_, _>> = f2.watch().into();
+        let nums2 = f2.watch().then(|d| {
+            let nums2: Anchor<OrdMap<_, _>> = d.clone().into();
+            nums2
+        });
         let sum: Anchor<usize> = nums2.map(|nums| nums.values().sum());
         assert_eq!(engine.get(&sum), 8);
         f2.set(dict!(9usize=>a.watch(),2usize=>b.watch(),3usize=>c.watch()));
