@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-04-03 14:30:01
- * @LastEditTime: 2025-11-24 22:49:45
+ * @LastEditTime: 2025-11-24 22:55:38
  * @LastEditors: Rais
  * @Description:
  */
@@ -30,8 +30,7 @@ where
 {
     #[track_caller]
     fn from(value: OrdMap<I, ValOrAnchor<V, E>>) -> Self {
-        let input = Constant::new_internal::<E>(value);
-        OrdMapVOACollectStream::new_to_anchor(input)
+        OrdMapVOACollectStream::from_value(value)
     }
 }
 impl<I, V, E> From<Anchor<OrdMap<I, ValOrAnchor<V, E>>, E>> for Anchor<OrdMap<I, V>, E>
@@ -42,6 +41,7 @@ where
     E: Engine,
     // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from(value: Anchor<OrdMap<I, ValOrAnchor<V, E>>, E>) -> Self {
         OrdMapVOACollectStream::new_to_anchor(value)
     }
@@ -60,8 +60,7 @@ where
         T: IntoIterator<Item = (I, ValOrAnchor<V, E>)>,
     {
         let dict: OrdMap<I, ValOrAnchor<V, E>> = iter.into_iter().collect();
-        let input = Constant::new_internal::<E>(dict);
-        OrdMapVOACollectStream::new_to_anchor(input)
+        OrdMapVOACollectStream::from_value(dict)
     }
 }
 
@@ -78,8 +77,7 @@ where
         T: IntoIterator<Item = &'a (I, ValOrAnchor<V, E>)>,
     {
         let dict: OrdMap<I, ValOrAnchor<V, E>> = iter.into_iter().cloned().collect();
-        let input = Constant::new_internal::<E>(dict);
-        OrdMapVOACollectStream::new_to_anchor(input)
+        OrdMapVOACollectStream::from_value(dict)
     }
 }
 
@@ -100,8 +98,7 @@ where
             .into_iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let input = Constant::new_internal::<E>(dict);
-        OrdMapVOACollectStream::new_to_anchor(input)
+        OrdMapVOACollectStream::from_value(dict)
     }
 }
 
