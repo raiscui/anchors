@@ -219,7 +219,9 @@ impl Engine {
             let mut retry = 0u8;
             loop {
                 if anchor_node.anchor_locked.get() {
-                    graph.queue_recalc(anchor_node);
+                    // 若节点残留锁且未在栈上重算，强制解锁并入队补偿，避免永远卡死。
+                    anchor_node.anchor_locked.set(false);
+                    graph.queue_recalc_force(anchor_node);
                     self.stabilize0();
                     retry = retry.saturating_add(1);
                     if retry > 3 {
@@ -316,11 +318,29 @@ impl Engine {
     fn stabilize0(&self) {
         trace!("stabilize0");
         self.graph.with(|graph| {
+            // 可选调试：检测重算队列是否异常“打转”。设置 `ANCHORS_DEBUG_SPIN=1` 时启用。
+            let mut spin_counter: usize = 0;
+            let spin_debug = std::env::var("ANCHORS_DEBUG_SPIN")
+                .map(|v| v != "0")
+                .unwrap_or(false);
             #[cfg(feature = "anchors_slotmap")]
             {
                 graph.retry_pending_free();
             }
             while let Some((height, node)) = graph.recalc_pop_next() {
+                if spin_debug {
+                    spin_counter = spin_counter.saturating_add(1);
+                    println!(
+                        "STABILIZE_SPIN #{spin_counter} height={height} node={}",
+                        node.debug_info.get()._to_string()
+                    );
+                    if spin_counter > 50_000 {
+                        panic!(
+                            "stabilize0 spin detected: 超过 50_000 次重算仍未收敛，最后节点={}",
+                            node.debug_info.get()._to_string()
+                        );
+                    }
+                }
                 let calculation_complete = if graph2::height(node) == height {
                     trace!("recalculate height");
 
@@ -457,10 +477,32 @@ impl Engine {
                 if let Some(key) = self.trace_key.take() {
                     let _ = lock_trace_take(key);
                 }
+                if std::env::var("ANCHORS_DEBUG_REQUEUE")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "REQUEUE check node={:?} pending_recalc={}",
+                        self.node.debug_info.get()._to_string(),
+                        self.node.pending_recalc.get()
+                    );
+                }
                 // 若锁期间收到“补偿重算”标记，解锁后再入队自身，既避免重入也不丢更新。
                 if self.node.pending_recalc.get() {
+                    if std::env::var("ANCHORS_DEBUG_REQUEUE")
+                        .map(|v| v != "0")
+                        .unwrap_or(false)
+                    {
+                        println!(
+                            "REQUEUE pending node={:?} state_before={:?} height={}",
+                            self.node.debug_info.get()._to_string(),
+                            graph2::recalc_state(self.node),
+                            graph2::height(self.node)
+                        );
+                    }
                     self.node.pending_recalc.set(false);
-                    self.graph.queue_recalc(self.node);
+                    // 强制入队：跳过 locked/Pending 判定。
+                    self.graph.queue_recalc_force(self.node);
                 }
             }
         }
@@ -537,6 +579,16 @@ impl Engine {
         let pending_on_anchor_get = ecx.pending_on_anchor_get;
         match poll_result {
             Poll::Pending => {
+                if std::env::var("ANCHORS_DEBUG_PENDING")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "PENDING node={:?} pending_on_anchor_get={}",
+                        node.debug_info.get()._to_string(),
+                        pending_on_anchor_get
+                    );
+                }
                 if pending_on_anchor_get {
                     // looks like we requested an anchor that isn't yet calculated, so we
                     // reinsert into the graph directly; our height either was higher than this
@@ -857,6 +909,16 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
             if parent.anchor_locked.get() {
                 // 父节点正在重算，记录一次补偿重算请求，解锁后再统一入队，避免 strict 模式下的重入 panic。
                 parent.pending_recalc.set(true);
+                if std::env::var("ANCHORS_DEBUG_DIRTY_FLOW")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "DIRTY flow skip queue (parent locked) child={:?} parent={:?}",
+                        node.debug_info.get()._to_string(),
+                        parent.debug_info.get()._to_string()
+                    );
+                }
                 if lock_trace_enabled() {
                     tracing::warn!(
                         target: "anchors",
@@ -865,7 +927,8 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
                         parent.debug_info.get()._to_string()
                     );
                 }
-                // 父节点正在重算，延迟到当前调用栈结束后再由现有流程触发，无需重复入队。
+                // 直接补偿入队一次：如果当下锁未释放，队列弹出时会跳过，等解锁后可正常重算。
+                graph.queue_recalc_force(parent);
                 continue;
             }
             graph.queue_recalc(parent);
@@ -880,6 +943,21 @@ fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
     let mut pending = parent.pending_dirty.borrow_mut();
     if !pending.iter().any(|k| *k == child) {
         pending.push(child);
+        if std::env::var("ANCHORS_DEBUG_DIRTY_FLOW")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "PENDING_DIRTY child={:?} ({}) -> parent={:?} ({})",
+                child.raw_token(),
+                unsafe { child.ptr.lookup_unchecked() }
+                    .debug_info
+                    .get()
+                    ._to_string(),
+                parent.key().raw_token(),
+                parent.debug_info.get()._to_string()
+            );
+        }
     }
 }
 
@@ -1020,6 +1098,17 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
             child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
             self.graph.queue_recalc(child);
+            if std::env::var("ANCHORS_DEBUG_REQUEST")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+            {
+                println!(
+                    "REQUEST pending child={:?} state={:?} parent={:?}",
+                    child.debug_info.get()._to_string(),
+                    graph2::recalc_state(child),
+                    self.node.debug_info.get()._to_string()
+                );
+            }
             if necessary && self_is_necessary {
                 self.node.add_necessary_child(child);
             }

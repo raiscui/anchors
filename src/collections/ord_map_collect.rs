@@ -19,6 +19,21 @@ use std::panic::Location;
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║ 从静态字典或迭代器直接构建 Anchor<OrdMap<..>>，内部统一走流式收集器以规避重入 ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
+/// 兼容旧 API：保留类型名，内部委派给流式收集器。
+pub struct OrdMapCollect;
+impl OrdMapCollect {
+    #[track_caller]
+    pub fn new_to_anchor<I, V, E>(anchors: OrdMap<I, Anchor<V, E>>) -> Anchor<OrdMap<I, V>, E>
+    where
+        <E as Engine>::AnchorHandle: PartialOrd + Ord,
+        V: Clone + 'static,
+        I: 'static + Clone + std::cmp::Ord,
+        E: Engine,
+    {
+        OrdMapCollectStream::from_value(anchors)
+    }
+}
+
 impl<I, V, E> From<OrdMap<I, Anchor<V, E>>> for Anchor<OrdMap<I, V>, E>
 where
     <E as Engine>::AnchorHandle: PartialOrd + Ord,
@@ -265,6 +280,16 @@ where
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         let mut changed = false;
+
+        if std::env::var("ANCHORS_DEBUG_COLLECT")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "OrdMapCollectStream poll: dirty={} loc={:?}",
+                self.dirty, self.location
+            );
+        }
 
         // 只有一个输入：整张字典 Anchor。更新/脏时重建输出。
         if self.dirty {

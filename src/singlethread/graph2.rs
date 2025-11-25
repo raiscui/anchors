@@ -573,6 +573,16 @@ impl<'a> NodeGuard<'a> {
                 .iter()
                 .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() })),
         );
+        if std::env::var("ANCHORS_DEBUG_PARENT_FLOW")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "CLEAN_PARENTS node={:?} count={}",
+                self.debug_info.get()._to_string(),
+                out.len()
+            );
+        }
         out
     }
 
@@ -580,6 +590,16 @@ impl<'a> NodeGuard<'a> {
         let res = self.clean_parents();
         self.ptrs.clean_parent0.set(None);
         self.ptrs.clean_parents.borrow_mut().clear();
+        if std::env::var("ANCHORS_DEBUG_PARENT_FLOW")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "DRAIN_CLEAN_PARENTS node={:?} drained={}",
+                self.debug_info.get()._to_string(),
+                res.len()
+            );
+        }
         res
     }
 
@@ -676,6 +696,17 @@ impl<'gg> Graph2Guard<'gg> {
                 node.ptrs.prev.set(None);
                 node.ptrs.next.set(None);
                 node.ptrs.recalc_state.set(RecalcState::Ready);
+                if std::env::var("ANCHORS_DEBUG_QUEUE")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "QUEUE POP height={} token={:?} debug={}",
+                        self.graph.recalc_min_height.get(),
+                        node.key().raw_token(),
+                        node.debug_info.get()._to_string()
+                    );
+                }
                 return Some((self.graph.recalc_min_height.get(), node));
             } else {
                 self.graph
@@ -715,6 +746,17 @@ impl<'gg> Graph2Guard<'gg> {
             }
             node.pending_recalc.set(true);
             return;
+        }
+        if std::env::var("ANCHORS_DEBUG_QUEUE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "queue_recalc enqueue token={:?} height={} debug={}",
+                node.key().raw_token(),
+                height(node),
+                node.debug_info.get()._to_string()
+            );
         }
         #[cfg(debug_assertions)]
         if crate::singlethread::lock_trace_enabled() {
@@ -759,6 +801,18 @@ impl<'gg> Graph2Guard<'gg> {
             }
         }
         recalc_queues[node_height] = Some(node.0.make_ptr());
+    }
+
+    /// 强制入队：无视 Pending/locked 状态，先摘旧队列再入队（主要用于解锁后补偿重算）。
+    pub fn queue_recalc_force(&self, node: NodeGuard<'gg>) {
+        // 若已挂在 Pending 队列，先摘除再重排。
+        if node.ptrs.recalc_state.get() == RecalcState::Pending {
+            dequeue_calc(self.graph, node);
+            node.ptrs.recalc_state.set(RecalcState::Ready);
+        }
+        // 解锁后走常规入队逻辑，避免重复维护 prev/next。
+        node.anchor_locked.set(false);
+        self.queue_recalc(node);
     }
 }
 
@@ -961,6 +1015,24 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     }
     node.visited.set(false);
     Ok(())
+}
+
+/// 辅助：当节点已经 Pending 但需要“重新排队”时，先摘下旧位置再重新入队，避免 recalc_min_height 已越过导致饥饿。
+pub fn requeue_pending<'gg>(graph: Graph2Guard<'gg>, node: NodeGuard<'gg>) {
+    // 仅处理 Pending 节点，其余保持原逻辑。
+    if node.ptrs.recalc_state.get() != RecalcState::Pending {
+        return;
+    }
+    // 先摘出旧的队列位置。
+    dequeue_calc(graph.graph, node);
+    node.ptrs.recalc_state.set(RecalcState::Ready);
+    // 再按 queue_recalc 正常入队，保证 recalc_min_height/prev/next 更新。
+    graph.queue_recalc(node);
+}
+
+/// 将节点状态强制置为 Ready（不改动队列指针），用于锁释放后无条件重新入队。
+pub fn set_recalc_ready(node: NodeGuard<'_>) {
+    node.ptrs.recalc_state.set(RecalcState::Ready);
 }
 
 fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {

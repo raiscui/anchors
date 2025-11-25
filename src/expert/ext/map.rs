@@ -45,6 +45,18 @@ macro_rules! impl_tuple_map {
                     return Poll::Unchanged;
                 }
 
+                if std::env::var("ANCHORS_DEBUG_MAP")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "MAP poll output_stale={} has_output={} loc={:?}",
+                        self.output_stale,
+                        self.output.is_some(),
+                        self.location
+                    );
+                }
+
                 let mut found_pending = false;
                 let mut found_updated = false;
 
@@ -71,6 +83,16 @@ macro_rules! impl_tuple_map {
                 if self.output.is_none() || found_updated {
                     let new_val = Some((self.f)($(ctx.get(&self.anchors.$num)),+));
                     if new_val != self.output {
+                        if std::env::var("ANCHORS_DEBUG_MAP")
+                            .map(|v| v != "0")
+                            .unwrap_or(false)
+                        {
+                            println!(
+                                "MAP 更新 loc={:?} type={} (值已变更)",
+                                self.location,
+                                std::any::type_name::<Out>(),
+                            );
+                        }
                         self.output = new_val;
                         return Poll::Updated
                     }

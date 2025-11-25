@@ -29,14 +29,6 @@ macro_rules! impl_tuple_then {
                     return;
                 }
 
-                // 输出 Anchor 变化也会让结果失效，需触发重新 request。
-                if let Some(ref out_anchor) = self.f_anchor {
-                    if edge == &out_anchor.token() {
-                        self.output_stale = true;
-                        return;
-                    }
-                }
-
                 $(
                     // only invalidate f_anchor if one of the lhs anchors is invalidated
                     if edge == &self.anchors.$num.data.token() {
@@ -51,6 +43,17 @@ macro_rules! impl_tuple_then {
                 ctx: &mut G,
             ) -> Poll {
                 if self.f_anchor.is_none() || self.output_stale {
+                    if std::env::var("ANCHORS_DEBUG_THEN")
+                        .map(|v| v != "0")
+                        .unwrap_or(false)
+                    {
+                        println!(
+                            "THEN poll: output_stale={} f_anchor_present={} loc={:?}",
+                            self.output_stale,
+                            self.f_anchor.is_some(),
+                            self.location
+                        );
+                    }
                     let mut found_pending = false;
 
                     $(
