@@ -29,6 +29,14 @@ macro_rules! impl_tuple_then {
                     return;
                 }
 
+                // 输出 Anchor 变化也会让结果失效，需触发重新 request。
+                if let Some(ref out_anchor) = self.f_anchor {
+                    if edge == &out_anchor.token() {
+                        self.output_stale = true;
+                        return;
+                    }
+                }
+
                 $(
                     // only invalidate f_anchor if one of the lhs anchors is invalidated
                     if edge == &self.anchors.$num.data.token() {
@@ -44,15 +52,15 @@ macro_rules! impl_tuple_then {
             ) -> Poll {
                 if self.f_anchor.is_none() || self.output_stale {
                     let mut found_pending = false;
-                    let mut found_updated = false;
 
                     $(
                         match ctx.request(&self.anchors.$num, true) {
                             Poll::Pending => {
                                 found_pending = true;
+                                self.output_stale = true;
                             }
                             Poll::Updated => {
-                                found_updated = true;
+                                self.output_stale = true;
                             }
                             Poll::Unchanged => {
                                 // do nothing
@@ -61,22 +69,47 @@ macro_rules! impl_tuple_then {
                     )+
 
                     if found_pending {
+                        #[cfg(debug_assertions)]
+                        {
+                            tracing::warn!(
+                                target: "anchors",
+                                "then pending: loc={:?} anchors={}",
+                                self.location,
+                                stringify!($($output_type),+)
+                            );
+                        }
                         return Poll::Pending;
                     }
 
                     self.output_stale = false;
-
-                    if self.f_anchor.is_none() || found_updated {
-                        let new_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
-                        match self.f_anchor.as_ref() {
-                            Some(outdated_anchor) if outdated_anchor != &new_anchor => {
-                                // changed, so unfollow old
-                                ctx.unrequest(outdated_anchor);
+                    let new_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
+                    match self.f_anchor.as_ref() {
+                        Some(outdated_anchor) if outdated_anchor != &new_anchor => {
+                            #[cfg(debug_assertions)]
+                            tracing::warn!(
+                                target: "anchors",
+                                "then switching output anchor old={:?} new={:?} loc={:?}",
+                                outdated_anchor.token(),
+                                new_anchor.token(),
+                                self.location
+                            );
+                            if std::env::var("ANCHORS_DEBUG_THEN").map(|v| v != "0").unwrap_or(false) {
+                                println!(
+                                    "THEN 切换输出 Anchor old={:?} new={:?} loc={:?}",
+                                    outdated_anchor.token(),
+                                    new_anchor.token(),
+                                    self.location
+                                );
                             }
-                            _ => {
-                            }
+                            ctx.unrequest(outdated_anchor);
+                            self.f_anchor = Some(new_anchor);
                         }
-                        self.f_anchor = Some(new_anchor);
+                        None => {
+                            self.f_anchor = Some(new_anchor);
+                        }
+                        _ => {
+                            // 相同输出 Anchor，复用即可
+                        }
                     }
                 }
 

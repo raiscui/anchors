@@ -270,6 +270,7 @@ mod node_store {
             guard.ptrs.recalc_state.set(super::RecalcState::Needed);
             guard.recalc_retry.set(0);
             guard.pending_dirty.borrow_mut().clear();
+            guard.pending_recalc.set(false);
             guard.anchor_locked.set(false);
 
             let free_head = &graph.free_head;
@@ -407,6 +408,8 @@ pub struct Node {
     pub recalc_retry: Cell<u8>,
     /// 累积 deferred dirty 的子节点 token，借用冲突恢复后统一处理。
     pub pending_dirty: RefCell<Vec<NodeKey>>,
+    /// 锁期间被请求重算的标记，解锁时统一补偿入队，避免抢锁重入又不丢更新。
+    pub pending_recalc: Cell<bool>,
 
     /// Some() if this node is still active, None otherwise
     pub anchor: UnsafeCell<Option<Box<dyn GenericAnchor>>>,
@@ -542,6 +545,21 @@ impl<'a> NodeGuard<'a> {
                 .borrow_mut()
                 .push(parent.0.make_ptr())
         }
+        if std::env::var("ANCHORS_DEBUG_PARENT_LINK")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            // 调试输出：带上节点的 debug_info，便于定位父子是谁
+            let child_dbg = self.debug_info.get()._to_string();
+            let parent_dbg = parent.debug_info.get()._to_string();
+            println!(
+                "add_clean_parent child={:?} ({}) parent={:?} ({})",
+                self.key().raw_token(),
+                child_dbg,
+                parent.key().raw_token(),
+                parent_dbg
+            );
+        }
     }
 
     pub fn clean_parents(&self) -> Vec<NodeGuard<'a>> {
@@ -671,8 +689,50 @@ impl<'gg> Graph2Guard<'gg> {
 
     pub fn queue_recalc(&self, node: NodeGuard<'gg>) {
         if node.ptrs.recalc_state.get() == RecalcState::Pending {
+            if std::env::var("ANCHORS_DEBUG_QUEUE")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+            {
+                println!(
+                    "queue_recalc skip (already pending) token={:?} debug={}",
+                    node.key().raw_token(),
+                    node.debug_info.get()._to_string()
+                );
+            }
             // already in recalc queue
             return;
+        }
+        // 如果节点正在重算（anchor_locked=true），跳过此次入队，改为标记“需补偿”，由 AnchorLockGuard 在解锁时入队，避免 strict 下的重入同时不丢更新。
+        if node.anchor_locked.get() {
+            #[cfg(debug_assertions)]
+            if crate::singlethread::lock_trace_enabled() {
+                tracing::warn!(
+                    target: "anchors",
+                    "queue_recalc skip locked node token={:?} debug={}",
+                    node.key().raw_token(),
+                    node.debug_info.get()._to_string()
+                );
+            }
+            node.pending_recalc.set(true);
+            return;
+        }
+        #[cfg(debug_assertions)]
+        if crate::singlethread::lock_trace_enabled() {
+            use std::backtrace::Backtrace;
+            let bt = Backtrace::force_capture();
+            tracing::warn!(
+                target: "anchors",
+                "queue_recalc: token={:?} locked={} height={} debug={}",
+                node.key().raw_token(),
+                node.anchor_locked.get(),
+                height(node),
+                node.debug_info.get()._to_string()
+            );
+            println!(
+                "QUEUE_RECALC TRACE token={:?}\n{:?}",
+                node.key().raw_token(),
+                bt
+            );
         }
         node.ptrs.recalc_state.set(RecalcState::Pending);
         let node_height = height(node);
@@ -815,6 +875,7 @@ impl Graph2 {
                 guard.last_update.set(None);
                 guard.recalc_retry.set(0);
                 guard.pending_dirty.replace(vec![]);
+                guard.pending_recalc.set(false);
                 unsafe {
                     *guard.anchor.get() = Some(anchor);
                 }
@@ -842,6 +903,7 @@ impl Graph2 {
                     last_update: Cell::new(None),
                     recalc_retry: Cell::new(0),
                     pending_dirty: RefCell::new(vec![]),
+                    pending_recalc: Cell::new(false),
                     anchor: UnsafeCell::new(Some(anchor)),
                     anchor_locked: Cell::new(false),
                 };

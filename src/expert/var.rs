@@ -198,6 +198,12 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
             inner.value_changed = false;
             if !Rc::ptr_eq(&self.val, &inner.val) {
                 self.val = Rc::clone(&inner.val);
+                if std::env::var("ANCHORS_DEBUG_VAR")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!("VAR 更新 type={}", std::any::type_name::<T>());
+                }
                 Poll::Updated
             } else {
                 Poll::Unchanged

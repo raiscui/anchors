@@ -269,9 +269,14 @@ where
         // 只有一个输入：整张字典 Anchor。更新/脏时重建输出。
         if self.dirty {
             match ctx.request(&self.input, true) {
-                Poll::Pending => return Poll::Pending,
-                _ => {}
-            }
+                Poll::Pending => {
+                    // 输入仍在计算，延后本节点重建，避免在持锁期间重复入队。
+                    return Poll::Pending;
+                }
+                Poll::Updated | Poll::Unchanged => {
+                    // Updated 直接继续重建即可（已确保依赖顺序），重入风险低于 Pending。
+                }
+            };
 
             let dict_in = ctx.get(&self.input);
             let entries: Vec<(I, Anchor<V, E>)> = dict_in
@@ -287,6 +292,17 @@ where
                     _ => {}
                 }
                 dict.insert(i, ctx.get(&anchor).clone());
+            }
+
+            if std::env::var("ANCHORS_DEBUG_COLLECT")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+            {
+                println!(
+                    "OrdMapCollectStream 重建完成，条目={} loc={:?}",
+                    dict.len(),
+                    self.location
+                );
             }
 
             self.vals = Some(dict);

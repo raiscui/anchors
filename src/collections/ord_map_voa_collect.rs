@@ -199,9 +199,13 @@ where
 
         if self.dirty {
             match ctx.request(&self.input, true) {
-                Poll::Pending => return Poll::Pending,
-                _ => {}
-            }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+                Poll::Updated | Poll::Unchanged => {
+                    // Updated 直接继续重建。
+                }
+            };
 
             let dict_in = ctx.get(&self.input);
             let entries: Vec<(I, ValOrAnchor<V, E>)> = dict_in

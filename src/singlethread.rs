@@ -198,6 +198,8 @@ impl Engine {
     /// Retrieves the value of an Anchor, recalculating dependencies as necessary to get the
     /// latest value.
     pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
+        // 在读取前主动标记为 observed，确保父链路必要关系被建立，避免 clean_parents 被回收后无法向上脏传播。
+        self.mark_observed(anchor);
         // stabilize once before, since the stabilization process may mark our requested node
         // as dirty
         self.stabilize();
@@ -250,6 +252,7 @@ impl Engine {
         anchor: &Anchor<O>,
         func: F,
     ) -> R {
+        self.mark_observed(anchor);
         // stabilize once before, since the stabilization process may mark our requested node
         // as dirty
         self.stabilize();
@@ -285,6 +288,8 @@ impl Engine {
             for dirty in dirty_marks {
                 if let Some(node) = graph.get(dirty) {
                     mark_dirty(graph, node, false);
+                    // 确保自身也进入重算队列，避免特殊情况下 dirty 未触发队列（例如必要关系缺失）。
+                    graph.queue_recalc(node);
                 } else {
                     #[cfg(feature = "anchors_slotmap")]
                     tracing::warn!(
@@ -443,12 +448,19 @@ impl Engine {
         struct AnchorLockGuard<'a> {
             flag: &'a Cell<bool>,
             trace_key: Option<u64>,
+            node: NodeGuard<'a>,
+            graph: Graph2Guard<'a>,
         }
         impl Drop for AnchorLockGuard<'_> {
             fn drop(&mut self) {
                 self.flag.set(false);
                 if let Some(key) = self.trace_key.take() {
                     let _ = lock_trace_take(key);
+                }
+                // 若锁期间收到“补偿重算”标记，解锁后再入队自身，既避免重入也不丢更新。
+                if self.node.pending_recalc.get() {
+                    self.node.pending_recalc.set(false);
+                    self.graph.queue_recalc(self.node);
                 }
             }
         }
@@ -459,12 +471,14 @@ impl Engine {
             // ╚═══════════════════════════════════════════════════════════════╝
             if lock_strict_enabled() {
                 let trace = lock_trace_peek(node.key().raw_token());
+                let bt_now = Backtrace::force_capture();
                 panic!(
-                    "slotmap: detected anchor_locked while strict mode enabled,疑似重入缺陷 {:?}\n上次持锁位置: {}",
+                    "slotmap: detected anchor_locked while strict mode enabled,疑似重入缺陷 {:?}\n上次持锁位置: {}\n当前回溯:\n{:?}",
                     node.debug_info.get()._to_string(),
                     trace.unwrap_or_else(|| {
                         "未记录 trace，请开启 ANCHORS_LOCK_TRACE 以获取更多定位信息".to_string()
-                    })
+                    }),
+                    bt_now
                 );
             }
             let retry = node.recalc_retry.get().saturating_add(1);
@@ -481,6 +495,14 @@ impl Engine {
         }
         node.anchor_locked.set(true);
 
+        // 可选调试：设置 `ANCHORS_RECALC_TRACE=1` 可打印正在重算的节点信息，便于跟踪依赖链。
+        if std::env::var("ANCHORS_RECALC_TRACE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!("RECALC {:?}", node.debug_info.get()._to_string());
+        }
+
         let trace_key = if lock_trace_enabled() {
             Some(node.key().raw_token())
         } else {
@@ -493,6 +515,8 @@ impl Engine {
         let _lock_guard = AnchorLockGuard {
             flag: &node.anchor_locked,
             trace_key,
+            node,
+            graph,
         };
 
         let anchor_ref = unsafe {
@@ -525,6 +549,17 @@ impl Engine {
                 }
             }
             Poll::Updated => {
+                if std::env::var("ANCHORS_DEBUG_PARENTS")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    let parents = node.clean_parents();
+                    println!(
+                        "UPDATED {:?} parents={}",
+                        node.debug_info.get()._to_string(),
+                        parents.len()
+                    );
+                }
                 // make sure all parents are marked as dirty, and observed parents are recalculated
                 mark_dirty(graph, node, true);
                 node.last_update.set(Some(self.generation));
@@ -790,14 +825,49 @@ impl Default for Engine {
     }
 }
 
+// 全局可用的锁 trace 开关，供 mark_dirty 等非 recalc 路径复用。
+fn lock_trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("ANCHORS_LOCK_TRACE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 // skip_self = true indicates output has *definitely* changed, but node has been recalculated
 // skip_self = false indicates node has not yet been recalculated
 fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) {
     trace!("mark_dirty {:?} ", node.debug_info.get(),);
     if skip_self {
+        if std::env::var("ANCHORS_DEBUG_MARK")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            let parents_len = node.clean_parents().len();
+            println!(
+                "mark_dirty skip_self node={:?} parents={}",
+                node.debug_info.get()._to_string(),
+                parents_len
+            );
+        }
         let parents = node.drain_clean_parents();
         for parent in parents {
             push_pending_dirty(parent, node.key());
+            if parent.anchor_locked.get() {
+                // 父节点正在重算，记录一次补偿重算请求，解锁后再统一入队，避免 strict 模式下的重入 panic。
+                parent.pending_recalc.set(true);
+                if lock_trace_enabled() {
+                    tracing::warn!(
+                        target: "anchors",
+                        "skip queue_recalc: parent locked; child={:?} parent={:?}",
+                        node.debug_info.get()._to_string(),
+                        parent.debug_info.get()._to_string()
+                    );
+                }
+                // 父节点正在重算，延迟到当前调用栈结束后再由现有流程触发，无需重复入队。
+                continue;
+            }
             graph.queue_recalc(parent);
             mark_dirty0(graph, parent);
         }
@@ -817,14 +887,29 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
     trace!("mark_dirty0 {:?}", next);
     let id = next.key();
     if Engine::check_observed_raw(next) != ObservedState::Unnecessary {
-        graph.queue_recalc(next);
+        // 如果节点当前正处于重算（anchor_locked=true），说明父链路已在调用栈上，无需再次入队以免触发重入检测。
+        if !next.anchor_locked.get() {
+            graph.queue_recalc(next);
+        }
     } else if graph2::recalc_state(next) == RecalcState::Ready {
         graph2::needs_recalc(next);
-        let parents = next.drain_clean_parents();
+        let parents = next.clean_parents();
+        if std::env::var("ANCHORS_DEBUG_MARK")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "mark_dirty0 unnecessary node={:?} parents={}",
+                next.debug_info.get()._to_string(),
+                parents.len()
+            );
+        }
         for parent in parents {
             push_pending_dirty(parent, id);
-            graph.queue_recalc(parent);
-            mark_dirty0(graph, parent);
+            if !parent.anchor_locked.get() {
+                graph.queue_recalc(parent);
+                mark_dirty0(graph, parent);
+            }
         }
     }
 }
@@ -915,9 +1000,24 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
             }
         };
 
+        if std::env::var("ANCHORS_DEBUG_REQUEST")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "REQUEST parent={:?} child={:?} ready={:?} height_ok={}",
+                self.node.debug_info.get()._to_string(),
+                child.debug_info.get()._to_string(),
+                graph2::recalc_state(child),
+                height_already_increased
+            );
+        }
+
         let self_is_necessary = Engine::check_observed_raw(self.node) != ObservedState::Unnecessary;
 
         if graph2::recalc_state(child) != RecalcState::Ready {
+            // 即便子节点尚未计算完成，也先登记父链，避免后续 dirty 无父可递归导致更新丢失。
+            child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
             self.graph.queue_recalc(child);
             if necessary && self_is_necessary {
@@ -925,6 +1025,8 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
             }
             Poll::Pending
         } else if !height_already_increased {
+            // 高度刚被抬升，还没正式记录依赖；先挂上父链，确保第一次重算完成后 dirty 能向上传播。
+            child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
             Poll::Pending
         } else {
