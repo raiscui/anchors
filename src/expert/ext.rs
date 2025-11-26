@@ -157,6 +157,73 @@ where
         })
     }
 
+    /// 与 `then` 类似，但要求输入实现 `Clone + PartialEq`，当本轮输入与上一轮等价时复用旧输出 Anchor，
+    /// 避免频繁切换 token 导致的高度回填和重算。
+    #[track_caller]
+    pub fn then_dedupe<F, Out>(&self, f: F) -> Anchor<Out, E>
+    where
+        Out: 'static,
+        F: 'static,
+        O1: Clone + PartialEq + 'static,
+        then::ThenDedupe1<O1, Out, F, E>: AnchorInner<E, Output = Out>,
+    {
+        E::mount(then::ThenDedupe1 {
+            anchor: self.clone(),
+            f,
+            f_anchor: None,
+            location: Location::caller(),
+            output_stale: true,
+            cached_input: None,
+        })
+    }
+
+    /// 两入参去重版：输入实现 Clone + PartialEq 时，等价输入复用旧输出 Anchor。
+    #[track_caller]
+    pub fn then_dedupe2<O2, F, Out>(&self, other: &Anchor<O2, E>, f: F) -> Anchor<Out, E>
+    where
+        Out: 'static,
+        F: 'static,
+        O1: Clone + PartialEq + 'static,
+        O2: Clone + PartialEq + 'static,
+        then::ThenDedupe<(Anchor<O1, E>, Anchor<O2, E>), Out, F, E>: AnchorInner<E, Output = Out>,
+    {
+        E::mount(then::ThenDedupe {
+            anchors: (self.clone(), other.clone()),
+            f,
+            f_anchor: None,
+            cached_inputs: None,
+            location: Location::caller(),
+            output_stale: true,
+        })
+    }
+
+    /// 三入参去重版。
+    #[track_caller]
+    pub fn then_dedupe3<O2, O3, F, Out>(
+        &self,
+        o2: &Anchor<O2, E>,
+        o3: &Anchor<O3, E>,
+        f: F,
+    ) -> Anchor<Out, E>
+    where
+        Out: 'static,
+        F: 'static,
+        O1: Clone + PartialEq + 'static,
+        O2: Clone + PartialEq + 'static,
+        O3: Clone + PartialEq + 'static,
+        then::ThenDedupe<(Anchor<O1, E>, Anchor<O2, E>, Anchor<O3, E>), Out, F, E>:
+            AnchorInner<E, Output = Out>,
+    {
+        E::mount(then::ThenDedupe {
+            anchors: (self.clone(), o2.clone(), o3.clone()),
+            f,
+            f_anchor: None,
+            cached_inputs: None,
+            location: Location::caller(),
+            output_stale: true,
+        })
+    }
+
     #[track_caller]
     pub fn either<F, Out>(&self, f: F) -> Anchor<Out, E>
     where
