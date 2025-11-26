@@ -587,6 +587,14 @@ impl Engine {
             graph,
         };
 
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ 兜底保护：节点可能在入队后被回收（handle_count 归零），       │
+        // │ 此时 anchor 已被置空，继续重算只会 panic；直接跳过即可。       │
+        // └─────────────────────────────────────────────────────────────┘
+        if unsafe { (*this_anchor.get()).is_none() } {
+            return true;
+        }
+
         let anchor_ref = unsafe {
             (*this_anchor.get())
                 .as_mut()

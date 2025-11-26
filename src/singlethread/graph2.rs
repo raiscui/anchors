@@ -698,6 +698,23 @@ impl<'gg> Graph2Guard<'gg> {
                 node.ptrs.prev.set(None);
                 node.ptrs.next.set(None);
                 node.ptrs.recalc_state.set(RecalcState::Ready);
+                // ┌─────────────────────────────────────────────────────────────┐
+                // │ 队列可能残留“已回收节点”（anchor 已置空、handle_count 归零）。│
+                // │ 这些节点若继续出队将触发重算 panic，故在此直接跳过。           │
+                // └─────────────────────────────────────────────────────────────┘
+                if unsafe { (*node.anchor.get()).is_none() } {
+                    if std::env::var("ANCHORS_DEBUG_QUEUE")
+                        .map(|v| v != "0")
+                        .unwrap_or(false)
+                    {
+                        println!(
+                            "QUEUE POP skip freed token={:?} debug={}",
+                            node.key().raw_token(),
+                            node.debug_info.get()._to_string()
+                        );
+                    }
+                    continue;
+                }
                 if std::env::var("ANCHORS_DEBUG_QUEUE")
                     .map(|v| v != "0")
                     .unwrap_or(false)
@@ -1299,6 +1316,28 @@ mod test {
 
             assert_eq!(None, guard.recalc_pop_next().map(|(_, v)| v));
         })
+    }
+
+    #[test]
+    fn stale_queue_entries_are_skipped_after_free() {
+        let graph = Graph2::new(10);
+        graph.with(|guard| {
+            let node = guard.insert_testing_guard();
+            set_min_height(node, 1).unwrap();
+            guard.queue_recalc(node);
+
+            // ── 模拟：节点在入队后被回收（anchor 清空），但队列仍残留旧指针。
+            unsafe {
+                *node.anchor.get() = None;
+            }
+            node.ptrs.handle_count.set(0);
+
+            // 修复前这里会返回 Some(node)，后续重算 panic；修复后应直接跳过。
+            assert!(
+                guard.recalc_pop_next().is_none(),
+                "已移除的 anchor 不应再次出队重算"
+            );
+        });
     }
 
     #[test]

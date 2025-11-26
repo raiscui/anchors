@@ -9,11 +9,15 @@ use anchors::{
     expert::MultiAnchor,
     singlethread::{Engine, Var},
 };
-use criterion::{criterion_group, criterion_main, Criterion, black_box};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 /// 单轮工作负载：set 一次、get 一次，触发稳定化。
 fn workload(strict: bool, c: &mut Criterion) {
-    let label = if strict { "lock_strict_on" } else { "lock_strict_off" };
+    let label = if strict {
+        "lock_strict_on"
+    } else {
+        "lock_strict_off"
+    };
 
     // 保存旧值，基准结束后恢复，避免影响其他基准或外部环境。
     let old_env = std::env::var("ANCHORS_LOCK_STRICT").ok();
