@@ -13,6 +13,7 @@ repository = "https://github.com/lord/anchors"
 # crate-type = ["dylib", "rlib"]
 
 [features]
+# default = ["generic_size_voa"]
 default = ["generic_size_voa", "anchors_slotmap", "lock_strict"]
 # pool = ["im-rc/pool"]
 # pool = []

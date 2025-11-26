@@ -1028,21 +1028,25 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     if node.visited.get() {
         return Err(());
     }
+    // 进入递归时先打上 visited 标记，退出前无论成功/失败都要清理，避免后续调用误判成环。
     node.visited.set(true);
-    if height(node) < min_height {
-        node.ptrs.height.set(min_height);
-        let mut did_err = false;
-        for parent in node.clean_parents() {
-            if let Err(_loop_ids) = set_min_height(parent, min_height + 1) {
-                did_err = true;
+    let res = (|| {
+        if height(node) < min_height {
+            node.ptrs.height.set(min_height);
+            let mut did_err = false;
+            for parent in node.clean_parents() {
+                if let Err(_loop_ids) = set_min_height(parent, min_height + 1) {
+                    did_err = true;
+                }
+            }
+            if did_err {
+                return Err(());
             }
         }
-        if did_err {
-            return Err(());
-        }
-    }
+        Ok(())
+    })();
     node.visited.set(false);
-    Ok(())
+    res
 }
 
 /// 辅助：当节点已经 Pending 但需要“重新排队”时，先摘下旧位置再重新入队，避免 recalc_min_height 已越过导致饥饿。
@@ -1067,32 +1071,61 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
     if node.ptrs.recalc_state.get() != RecalcState::Pending {
         return;
     }
-    if let Some(prev) = node.ptrs.prev.get() {
-        unsafe { prev.lookup_unchecked() }
+    // ─────────────────────────────────────────────────────────────
+    // 说明：高度可能在 Pending 队列期间被提升，prev/next 指针也可能失效。
+    // 这里通过遍历队列重新定位节点，防御性摘除，避免断言直接崩溃。
+    let height_idx = node.ptrs.height.get();
+    let mut recalc_queues = graph.recalc_queues.borrow_mut();
+    let mut head_ptr = recalc_queues.get(height_idx).copied().flatten();
+
+    let target_ptr = unsafe { node.0.make_ptr() };
+    let mut found_prev: Option<NodePtr> = None;
+    let mut found_cur: Option<NodePtr> = None;
+
+    while let Some(cur_ptr) = head_ptr {
+        if cur_ptr == target_ptr {
+            found_cur = Some(cur_ptr);
+            break;
+        }
+        found_prev = head_ptr;
+        head_ptr = unsafe { cur_ptr.lookup_unchecked() }.ptrs.next.get();
+    }
+
+    // 若队列中已找不到该节点，直接重置状态后返回，避免 panic 连环崩溃。
+    let Some(cur_ptr) = found_cur else {
+        if cfg!(debug_assertions) {
+            tracing::warn!(
+                target: "anchors",
+                "dequeue_calc: pending 节点在队列中缺失，直接跳过 token={:?} debug={}",
+                node.key().raw_token(),
+                node.debug_info.get()._to_string()
+            );
+        }
+        node.ptrs.recalc_state.set(RecalcState::Ready);
+        node.ptrs.prev.set(None);
+        node.ptrs.next.set(None);
+        return;
+    };
+
+    let cur_guard = unsafe { cur_ptr.lookup_unchecked() };
+    let next_ptr = cur_guard.ptrs.next.get();
+
+    if let Some(prev_ptr) = found_prev {
+        unsafe { prev_ptr.lookup_unchecked() }
             .ptrs
             .next
-            .set(node.ptrs.next.get());
+            .set(next_ptr);
     } else {
-        // node was first in queue, need to set queue head to next
-        let mut recalc_queues = graph.recalc_queues.borrow_mut();
-        let height = node.ptrs.height.get();
-        let next = node.ptrs.next.get();
-        assert_eq!(
-            recalc_queues[height].map(|ptr| unsafe { ptr.lookup_unchecked() }),
-            Some(node.0)
-        );
-        recalc_queues[height] = next;
+        recalc_queues[height_idx] = next_ptr;
     }
 
-    if let Some(next) = node.ptrs.next.get() {
-        unsafe { next.lookup_unchecked() }
-            .ptrs
-            .next
-            .set(node.ptrs.prev.get());
+    if let Some(next) = next_ptr {
+        unsafe { next.lookup_unchecked() }.ptrs.prev.set(found_prev);
     }
 
-    node.ptrs.prev.set(None);
-    node.ptrs.next.set(None);
+    cur_guard.ptrs.prev.set(None);
+    cur_guard.ptrs.next.set(None);
+    cur_guard.ptrs.recalc_state.set(RecalcState::Ready);
 }
 
 #[cfg(feature = "anchors_slotmap")]

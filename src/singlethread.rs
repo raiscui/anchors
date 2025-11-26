@@ -1117,7 +1117,14 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
         let height_already_increased = match graph2::ensure_height_increases(child, self.node) {
             Ok(v) => v,
             Err(()) => {
-                panic!("loop detected in anchors!\n");
+                // 依赖环路会导致后续高度更新无限递归，直接跳过本次 request 并记录诊断信息，避免用户态崩溃。
+                tracing::error!(
+                    target: "anchors",
+                    "检测到依赖环，跳过本次 request，parent={:?} child={:?}",
+                    self.node.debug_info.get()._to_string(),
+                    child.debug_info.get()._to_string()
+                );
+                return Poll::Unchanged;
             }
         };
 
