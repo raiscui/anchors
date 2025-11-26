@@ -53,6 +53,10 @@ harness = false
 name = "stabilize_linear_nodes_simple"
 harness = false
 
+[[bench]]
+name = "lock_strict_overhead"
+harness = false
+
 # [profile.release]
 # debug = true
 
