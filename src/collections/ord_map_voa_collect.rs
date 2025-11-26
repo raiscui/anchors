@@ -212,22 +212,36 @@ where
                 .iter()
                 .map(|(k, voa)| (k.clone(), voa.clone()))
                 .collect();
-            let pool = ordmap::OrdMapPool::new(entries.len());
-            let mut dict = OrdMap::with_pool(&pool);
+            // 先遍历并请求所有子 Anchor，避免遇到 Pending 直接早退导致需要多次调度。
+            let mut pending_child = false;
+            let mut ready_entries: Vec<(I, V)> = Vec::with_capacity(entries.len());
 
             for (k, voa) in entries {
-                let v = match voa {
-                    ValOrAnchor::Val(v) => v,
+                match voa {
+                    ValOrAnchor::Val(v) => {
+                        ready_entries.push((k, v));
+                    }
                     ValOrAnchor::Anchor(an) => {
                         match ctx.request(&an, true) {
-                            Poll::Pending => return Poll::Pending,
+                            Poll::Pending => {
+                                pending_child = true;
+                                continue;
+                            }
                             _ => {}
                         }
-                        ctx.get(&an).clone()
+                        ready_entries.push((k, ctx.get(&an).clone()));
                     }
-                };
-                dict.insert(k, v);
+                }
             }
+
+            if pending_child {
+                // 有未就绪子节点，保持 dirty 状态，等待下一轮统一重算。
+                return Poll::Pending;
+            }
+
+            let pool = ordmap::OrdMapPool::new(ready_entries.len());
+            let mut dict = OrdMap::with_pool(&pool);
+            ready_entries.into_iter().collect_into(&mut dict);
 
             self.vals = Some(dict);
             self.dirty = false;

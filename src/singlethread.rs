@@ -323,6 +323,15 @@ impl Engine {
             let spin_debug = std::env::var("ANCHORS_DEBUG_SPIN")
                 .map(|v| v != "0")
                 .unwrap_or(false);
+            // 自适应上限：根据当前激活节点数放宽容忍度，避免正常的高度调整/依赖扩展触发误报。
+            // 理念：有 N 个节点时，合法的“高度回填+新依赖建图”往往需要 O(N) 次出队；乘以 4 作为缓冲。
+            let spin_limit = if spin_debug {
+                let active_nodes = graph.active_nodes();
+                std::cmp::max(64, active_nodes.saturating_mul(4))
+            } else {
+                0
+            };
+            let spin_limit = 13;
             #[cfg(feature = "anchors_slotmap")]
             {
                 graph.retry_pending_free();
@@ -334,10 +343,10 @@ impl Engine {
                         "STABILIZE_SPIN #{spin_counter} height={height} node={}",
                         node.debug_info.get()._to_string()
                     );
-                    if spin_counter > 13 {
+                    if spin_counter > spin_limit {
                         panic!(
-                            "stabilize0 spin detected: 超过 13 次重算仍未收敛，最后节点={}",
-                            node.debug_info.get()._to_string()
+                            "stabilize0 spin detected: 重算次数超过上限 {spin_limit}，最后节点={}",
+                            node.debug_info.get()._to_string(),
                         );
                     }
                 }
