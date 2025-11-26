@@ -308,7 +308,7 @@ type NodePtr = ag::NodePtr<Node>;
 impl<'gg> fmt::Debug for NodeGuard<'gg> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeGuard")
-            .field("ptr", &self.0.make_ptr())
+            .field("ptr", &unsafe { self.0.make_ptr() })
             .field("slot_token", &self.slot_token.get())
             .finish()
     }
@@ -531,19 +531,21 @@ impl<'a> std::ops::Deref for NodeGuard<'a> {
 impl<'a> NodeGuard<'a> {
     pub fn key(self) -> NodeKey {
         NodeKey {
-            ptr: self.0.make_ptr(),
+            ptr: unsafe { self.0.make_ptr() },
             token: self.slot_token.get(),
         }
     }
 
     pub fn add_clean_parent(self, parent: NodeGuard<'a>) {
         if self.ptrs.clean_parent0.get().is_none() {
-            self.ptrs.clean_parent0.set(Some(parent.0.make_ptr()))
+            self.ptrs
+                .clean_parent0
+                .set(Some(unsafe { parent.0.make_ptr() }))
         } else {
             self.ptrs
                 .clean_parents
                 .borrow_mut()
-                .push(parent.0.make_ptr())
+                .push(unsafe { parent.0.make_ptr() })
         }
         if std::env::var("ANCHORS_DEBUG_PARENT_LINK")
             .map(|v| v != "0")
@@ -605,7 +607,7 @@ impl<'a> NodeGuard<'a> {
 
     pub fn add_necessary_child(self, child: NodeGuard<'a>) {
         let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = child.0.make_ptr();
+        let child_ptr = unsafe { child.0.make_ptr() };
         if let Err(i) = necessary_children.binary_search(&child_ptr) {
             necessary_children.insert(i, child_ptr);
             child.necessary_count.set(child.necessary_count.get() + 1)
@@ -614,7 +616,7 @@ impl<'a> NodeGuard<'a> {
 
     pub fn remove_necessary_child(&self, child: NodeGuard<'a>) {
         let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = child.0.make_ptr();
+        let child_ptr = unsafe { child.0.make_ptr() };
         if let Ok(i) = necessary_children.binary_search(&child_ptr) {
             necessary_children.remove(i);
             child.necessary_count.set(child.necessary_count.get() - 1)
@@ -790,7 +792,7 @@ impl<'gg> Graph2Guard<'gg> {
             NodeGuard(unsafe { old.lookup_unchecked() })
                 .ptrs
                 .prev
-                .set(Some(node.0.make_ptr()));
+                .set(Some(unsafe { node.0.make_ptr() }));
             node.ptrs.next.set(Some(old));
         } else {
             if self.graph.recalc_min_height.get() > node_height {
@@ -800,7 +802,7 @@ impl<'gg> Graph2Guard<'gg> {
                 self.graph.recalc_max_height.set(node_height);
             }
         }
-        recalc_queues[node_height] = Some(node.0.make_ptr());
+        recalc_queues[node_height] = Some(unsafe { node.0.make_ptr() });
     }
 
     /// 强制入队：无视 Pending/locked 状态，先摘旧队列再入队（主要用于解锁后补偿重算）。
@@ -1095,7 +1097,9 @@ unsafe fn free(ptr: NodePtr) {
     let free_head = &graph.free_head;
     let old_free = free_head.get();
     if let Some(old_free) = old_free {
-        guard.0.lookup_ptr(old_free).ptrs.prev.set(Some(ptr));
+        unsafe {
+            guard.0.lookup_ptr(old_free).ptrs.prev.set(Some(ptr));
+        }
     }
     guard.ptrs.next.set(old_free);
     free_head.set(Some(ptr));

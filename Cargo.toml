@@ -58,6 +58,10 @@ harness = false
 name = "lock_strict_overhead"
 harness = false
 
+[[bench]]
+name = "slotmap_feature_overhead"
+harness = false
+
 # [profile.release]
 # debug = true
 

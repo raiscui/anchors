@@ -326,8 +326,16 @@ impl Engine {
             // 自适应上限：根据当前激活节点数放宽容忍度，避免正常的高度调整/依赖扩展触发误报。
             // 理念：有 N 个节点时，合法的“高度回填+新依赖建图”往往需要 O(N) 次出队；乘以 4 作为缓冲。
             let spin_limit = if spin_debug {
-                let active_nodes = graph.active_nodes();
-                std::cmp::max(64, active_nodes.saturating_mul(4))
+                #[cfg(feature = "anchors_slotmap")]
+                {
+                    let active_nodes = graph.active_nodes();
+                    std::cmp::max(64, active_nodes.saturating_mul(4))
+                }
+                #[cfg(not(feature = "anchors_slotmap"))]
+                {
+                    // 非 slotmap 后端暂无 active_nodes 统计，使用固定阈值以维持基本保护。
+                    64
+                }
             } else {
                 0
             };
@@ -484,43 +492,44 @@ impl Engine {
         }
 
         struct AnchorLockGuard<'a> {
-            flag: &'a Cell<bool>,
             trace_key: Option<u64>,
-            node: NodeGuard<'a>,
+            node_key: NodeKey,
             graph: Graph2Guard<'a>,
         }
-        impl Drop for AnchorLockGuard<'_> {
+        impl<'a> Drop for AnchorLockGuard<'a> {
             fn drop(&mut self) {
-                self.flag.set(false);
-                if let Some(key) = self.trace_key.take() {
-                    let _ = lock_trace_take(key);
-                }
-                if std::env::var("ANCHORS_DEBUG_REQUEUE")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
-                    println!(
-                        "REQUEUE check node={:?} pending_recalc={}",
-                        self.node.debug_info.get()._to_string(),
-                        self.node.pending_recalc.get()
-                    );
-                }
-                // 若锁期间收到“补偿重算”标记，解锁后再入队自身，既避免重入也不丢更新。
-                if self.node.pending_recalc.get() {
+                if let Some(node) = self.graph.get(self.node_key) {
+                    node.anchor_locked.set(false);
                     if std::env::var("ANCHORS_DEBUG_REQUEUE")
                         .map(|v| v != "0")
                         .unwrap_or(false)
                     {
                         println!(
-                            "REQUEUE pending node={:?} state_before={:?} height={}",
-                            self.node.debug_info.get()._to_string(),
-                            graph2::recalc_state(self.node),
-                            graph2::height(self.node)
+                            "REQUEUE check node={:?} pending_recalc={}",
+                            node.debug_info.get()._to_string(),
+                            node.pending_recalc.get()
                         );
                     }
-                    self.node.pending_recalc.set(false);
-                    // 强制入队：跳过 locked/Pending 判定。
-                    self.graph.queue_recalc_force(self.node);
+                    // 若锁期间收到“补偿重算”标记，解锁后再入队自身，既避免重入也不丢更新。
+                    if node.pending_recalc.get() {
+                        if std::env::var("ANCHORS_DEBUG_REQUEUE")
+                            .map(|v| v != "0")
+                            .unwrap_or(false)
+                        {
+                            println!(
+                                "REQUEUE pending node={:?} state_before={:?} height={}",
+                                node.debug_info.get()._to_string(),
+                                graph2::recalc_state(node),
+                                graph2::height(node)
+                            );
+                        }
+                        node.pending_recalc.set(false);
+                        // 强制入队：跳过 locked/Pending 判定。
+                        self.graph.queue_recalc_force(node);
+                    }
+                }
+                if let Some(key) = self.trace_key.take() {
+                    let _ = lock_trace_take(key);
                 }
             }
         }
@@ -573,9 +582,8 @@ impl Engine {
         }
 
         let _lock_guard = AnchorLockGuard {
-            flag: &node.anchor_locked,
             trace_key,
-            node,
+            node_key: node.key(),
             graph,
         };
 
