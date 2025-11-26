@@ -592,6 +592,15 @@ impl Engine {
         // │ 此时 anchor 已被置空，继续重算只会 panic；直接跳过即可。       │
         // └─────────────────────────────────────────────────────────────┘
         if unsafe { (*this_anchor.get()).is_none() } {
+            if cfg!(debug_assertions) {
+                // 若 anchor 为空但持有者计数大于 0，说明释放链路异常，应当尽快排查。
+                debug_assert!(
+                    node.handle_count() == 0,
+                    "recalculate: anchor=None 但 handle_count>0，疑似非法释放路径，token={:?} debug={}",
+                    node.key().raw_token(),
+                    node.debug_info.get()._to_string()
+                );
+            }
             return true;
         }
 

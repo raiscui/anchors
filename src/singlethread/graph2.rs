@@ -713,6 +713,15 @@ impl<'gg> Graph2Guard<'gg> {
                             node.debug_info.get()._to_string()
                         );
                     }
+                    if cfg!(debug_assertions) {
+                        // 理论上 anchor 置空时 handle_count 也应归零；若未归零则说明存在异常释放路径。
+                        debug_assert!(
+                            node.handle_count() == 0,
+                            "queue_pop: anchor=None 但 handle_count>0，疑似非法释放路径，token={:?} debug={}",
+                            node.key().raw_token(),
+                            node.debug_info.get()._to_string()
+                        );
+                    }
                     continue;
                 }
                 if std::env::var("ANCHORS_DEBUG_QUEUE")
