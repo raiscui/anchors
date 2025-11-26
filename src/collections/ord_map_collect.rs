@@ -308,16 +308,29 @@ where
                 .iter()
                 .map(|(i, anchor)| (i.clone(), anchor.clone()))
                 .collect();
-            let pool = ordmap::OrdMapPool::new(entries.len());
-            let mut dict = OrdMap::with_pool(&pool);
+            // 一次性请求全部子 Anchor，避免遇到第一个 Pending 就早退导致多轮调度。
+            let mut pending_child = false;
+            let mut ready_entries: Vec<(I, V)> = Vec::with_capacity(entries.len());
 
             for (i, anchor) in entries {
                 match ctx.request(&anchor, true) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        pending_child = true;
+                        continue;
+                    }
                     _ => {}
                 }
-                dict.insert(i, ctx.get(&anchor).clone());
+                ready_entries.push((i, ctx.get(&anchor).clone()));
             }
+
+            if pending_child {
+                // 子节点尚未全部就绪，保持 dirty，等待下一轮统一重建。
+                return Poll::Pending;
+            }
+
+            let pool = ordmap::OrdMapPool::new(ready_entries.len());
+            let mut dict = OrdMap::with_pool(&pool);
+            ready_entries.into_iter().collect_into(&mut dict);
 
             if std::env::var("ANCHORS_DEBUG_COLLECT")
                 .map(|v| v != "0")
