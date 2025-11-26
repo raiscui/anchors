@@ -393,15 +393,24 @@ impl Engine {
             pending_on_anchor_get: false,
         };
         /// ══════════════════════════════════════════════════════════════════════
-        /// 锁严格模式开关：设置环境变量 `ANCHORS_LOCK_STRICT=1` 时，检测到遗留锁会直接 panic，
-        /// 便于在本地/CI 及时暴露潜在的重入缺陷；默认模式则会抢占解锁继续重算，避免卡死。
+        /// 锁严格模式开关：
+        /// - 现在由编译特征 `lock_strict` 控制，默认启用；关闭该特征则彻底禁用严格检测。
+        /// - 在开启特征时仍可用环境变量调节：`ANCHORS_LOCK_STRICT=0` 临时放宽；缺省或非 0 则保持严格。
         fn lock_strict_enabled() -> bool {
-            static STRICT: OnceLock<bool> = OnceLock::new();
-            *STRICT.get_or_init(|| {
-                std::env::var("ANCHORS_LOCK_STRICT")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-            })
+            #[cfg(feature = "lock_strict")]
+            {
+                static STRICT: OnceLock<bool> = OnceLock::new();
+                return *STRICT.get_or_init(|| {
+                    std::env::var("ANCHORS_LOCK_STRICT")
+                        .map(|v| v != "0")
+                        .unwrap_or(true)
+                });
+            }
+
+            #[cfg(not(feature = "lock_strict"))]
+            {
+                false
+            }
         }
 
         /// ══════════════════════════════════════════════════════════════════════

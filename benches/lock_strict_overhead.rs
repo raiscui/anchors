@@ -1,7 +1,8 @@
 /*
- * @Description: 比较 ANCHORS_LOCK_STRICT 开关下的稳定化开销。
+ * @Description: 比较锁严格模式开关下的稳定化开销（编译特征 `lock_strict` 默认开启）。
  *  - 基准：简单两节点求和，反复 set + get。
  *  - 场景：strict=0 与 strict=1 各自独立基准，环境变量在基准前后切换回原值，避免交叉污染。
+ *  - 若使用 `--no-default-features` 关闭 `lock_strict`，对应 strict=1 的基准会被跳过。
  */
 
 use anchors::{
@@ -19,6 +20,12 @@ fn workload(strict: bool, c: &mut Criterion) {
     // std 环境操作在本基准中可控，显式标记 unsafe 以通过编译检查。
     unsafe {
         std::env::set_var("ANCHORS_LOCK_STRICT", if strict { "1" } else { "0" });
+    }
+
+    // 若编译时关闭了 lock_strict 特征，严格模式无法生效，跳过对应基准以免误导。
+    if strict && !cfg!(feature = "lock_strict") {
+        eprintln!("lock_strict feature disabled，跳过 lock_strict_on 基准");
+        return;
     }
 
     let mut group = c.benchmark_group("lock_strict_overhead");
