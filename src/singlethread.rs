@@ -199,7 +199,7 @@ impl Engine {
     /// latest value.
     pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
         // 在读取前主动标记为 observed，确保父链路必要关系被建立，避免 clean_parents 被回收后无法向上脏传播。
-        self.mark_observed(anchor);
+        // self.mark_observed(anchor);
         // stabilize once before, since the stabilization process may mark our requested node
         // as dirty
         self.stabilize();
@@ -254,7 +254,7 @@ impl Engine {
         anchor: &Anchor<O>,
         func: F,
     ) -> R {
-        self.mark_observed(anchor);
+        // self.mark_observed(anchor);
         // stabilize once before, since the stabilization process may mark our requested node
         // as dirty
         self.stabilize();
@@ -334,9 +334,9 @@ impl Engine {
                         "STABILIZE_SPIN #{spin_counter} height={height} node={}",
                         node.debug_info.get()._to_string()
                     );
-                    if spin_counter > 50_000 {
+                    if spin_counter > 13 {
                         panic!(
-                            "stabilize0 spin detected: 超过 50_000 次重算仍未收敛，最后节点={}",
+                            "stabilize0 spin detected: 超过 13 次重算仍未收敛，最后节点={}",
                             node.debug_info.get()._to_string()
                         );
                     }
