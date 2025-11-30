@@ -808,10 +808,22 @@ impl<'gg> Graph2Guard<'gg> {
         let node_height = height(node);
         let mut recalc_queues = self.graph.recalc_queues.borrow_mut();
         if node_height >= recalc_queues.len() {
-            panic!(
-                "too large height error {} \n debug_info:{:?}",
-                &node_height,
-                node.debug_info.get()
+            let old_len = recalc_queues.len();
+            // NOTE: anchors 链路在复杂 UI 中深度可能远超默认 256，为避免 panic，直接扩容到所需高度+1。
+            let target_len = node_height.saturating_add(1);
+            recalc_queues.resize(target_len, None);
+            if self.graph.recalc_min_height.get() >= old_len {
+                // 队列原本为空（min==len），扩容后同步更新哨兵值，确保后续 pop 逻辑不越界。
+                self.graph.recalc_min_height.set(target_len);
+            }
+            tracing::warn!(
+                target: "anchors",
+                token = node.key().raw_token(),
+                old_capacity = old_len,
+                new_capacity = target_len,
+                required_height = node_height,
+                debug = %node.debug_info.get()._to_string(),
+                "recalc_queues 容量不足，自动扩容"
             );
         }
         if let Some(old) = recalc_queues[node_height] {
@@ -1383,14 +1395,26 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    fn test_insert_above_max_height() {
+    fn queue_recalc_auto_expands_capacity() {
+        let graph = Graph2::new(4);
+        graph.with(|guard| {
+            let node = guard.insert_testing_guard();
+            // 人工设置较大的高度，模拟深链依赖场景。
+            node.ptrs.height.set(12);
+            guard.queue_recalc(node);
+        });
+        assert!(graph.recalc_queues.borrow().len() >= 13);
+    }
+
+    #[test]
+    fn insert_above_initial_height_does_not_panic() {
         let graph = Graph2::new(10);
         graph.with(|guard| {
             let a = guard.insert_testing_guard();
             set_min_height(a, 10).unwrap();
             guard.queue_recalc(a);
-        })
+        });
+        assert!(graph.recalc_queues.borrow().len() >= 11);
     }
 
     #[test]
