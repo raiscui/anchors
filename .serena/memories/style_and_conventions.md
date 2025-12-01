@@ -1,0 +1,5 @@
+- Library heavily macro-driven (impl_tuple_then, dedupe variants) to implement AnchorInner for tuples; follow trait bounds/pattern seen in src/expert/ext/then.rs.
+- Comments often bilingual (English+Chinese) but lean toward concise technical context; keep doc-comments explaining purpose of specialized structs (Then, ThenDedupe, etc.).
+- Engine code expects immut borrow discipline before mutation (drop borrows before assignments) and uses tracing warn blocks guarded by cfg(debug_assertions).
+- Default formatting via rustfmt; prefer inline format args ("format!("{value}")" style).
+- Observed instructions emphasize keeping functions small, minimal branching, reusing anchors when possible to avoid churn.

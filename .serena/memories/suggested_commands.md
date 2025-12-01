@@ -1,0 +1,6 @@
+- `cargo fmt` — default formatting.
+- `cargo clippy --all-targets --all-features` — linting static analysis.
+- `cargo test --all-features` — run unit + integration tests.
+- `cargo bench --bench benchmarks` or other bench names (stabilize_linear_nodes_simple, lock_strict_overhead, slotmap_feature_overhead) for performance regression checks.
+- `cargo doc --open` — build API docs for Anchors library.
+- `RUSTFLAGS="-Awarnings" cargo check --quiet` — per repo instructions to keep logs concise when iterating.

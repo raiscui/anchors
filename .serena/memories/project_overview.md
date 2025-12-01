@@ -1,0 +1,5 @@
+- Rust crate providing incremental/"self-adjusting" computation graph primitives called Anchors (Vars, map, then, etc.).
+- Engine allows hybrid Adapton- plus Incremental-style push updates; designed for efficient recomputation via observed nodes.
+- Repo has `src` library, `examples` showcasing usage, `benchmarks` under `benches`, and `tests` dir for integration tests.
+- Target toolchain: Rust edition 2024 with optional features like `generic_size_voa`, `anchors_slotmap`, `lock_strict` (enabled by default).
+- Depends on arena-graph, im-rc, slotmap, smallvec, tracing, emg_common/hasher; uses Criterion + insta for benches/tests.
