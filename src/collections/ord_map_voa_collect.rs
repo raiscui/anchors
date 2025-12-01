@@ -199,7 +199,7 @@ where
 
         if self.dirty {
             match ctx.request(&self.input, true) {
-                Poll::Pending => {
+                Poll::Pending | Poll::PendingDefer => {
                     return Poll::Pending;
                 }
                 Poll::Updated | Poll::Unchanged => {
@@ -223,7 +223,7 @@ where
                     }
                     ValOrAnchor::Anchor(an) => {
                         match ctx.request(&an, true) {
-                            Poll::Pending => {
+                            Poll::Pending | Poll::PendingDefer => {
                                 pending_child = true;
                                 continue;
                             }
@@ -248,7 +248,7 @@ where
             changed = true;
         } else {
             match ctx.request(&self.input, true) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending | Poll::PendingDefer => return Poll::Pending,
                 Poll::Updated => {
                     self.dirty = true;
                     return Poll::Pending;

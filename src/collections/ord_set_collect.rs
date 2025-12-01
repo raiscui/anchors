@@ -77,7 +77,7 @@ where
             let pending_exists = self
                 .anchors
                 .iter()
-                .any(|anchor| ctx.request(anchor, true) == Poll::Pending);
+                .any(|anchor| ctx.request(anchor, true).is_pending());
             if pending_exists {
                 return Poll::Pending;
             }

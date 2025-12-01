@@ -18,6 +18,28 @@ use tracing::trace;
 pub use graph2::AnchorHandle;
 pub use graph2::NodeKey as AnchorToken;
 
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Default)]
+struct PendingStatsInner {
+    total_enqueued: Cell<u64>,
+    total_drained: Cell<u64>,
+    max_queue_len: Cell<usize>,
+    last_enqueue_len: Cell<usize>,
+    last_drain_remaining: Cell<usize>,
+    last_drain_drained: Cell<usize>,
+}
+
+/// Pending 队列统计快照，用于在 demo/测试后导出指标。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnchorsPendingStats {
+    pub total_enqueued: u64,
+    pub total_drained: u64,
+    pub max_queue_len: usize,
+    pub last_enqueue_len: usize,
+    pub last_drain_remaining: usize,
+    pub last_drain_drained: usize,
+}
+
 /// The main struct of the Anchors library. Represents a single value on the singlethread recomputation graph.
 ///
 /// You should basically never need to create these with `Anchor::new_from_expert`; instead call functions like `Var::new` and `MultiAnchor::map`
@@ -50,6 +72,7 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 // ─────────────────────────────────────────────────────────────────────────────
 
+
 pub fn into_ea<T>(x: impl Into<ValOrAnchor<T>>) -> ValOrAnchor<T> {
     x.into()
 }
@@ -76,6 +99,42 @@ pub enum ObservedState {
     Unnecessary,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PendingPriority {
+    BackgroundLow = 0,
+    StateNormal = 1,
+    LayoutHigh = 2,
+    RenderCritical = 3,
+}
+
+impl PendingPriority {
+    fn default_for(request_necessary: bool, parent_is_necessary: bool) -> Self {
+        if request_necessary && parent_is_necessary {
+            PendingPriority::RenderCritical
+        } else if parent_is_necessary {
+            PendingPriority::LayoutHigh
+        } else if request_necessary {
+            PendingPriority::StateNormal
+        } else {
+            PendingPriority::BackgroundLow
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Clone, Copy, Debug)]
+struct PendingRequest {
+    parent: NodeKey,
+    child: NodeKey,
+    necessary: bool,
+    priority: PendingPriority,
+    order: u64,
+}
+
 /// The main execution engine of Singlethread.
 pub struct Engine {
     // TODO store Nodes on heap directly?? maybe try for Rc<RefCell<SlotMap>> now
@@ -84,6 +143,12 @@ pub struct Engine {
 
     // tracks the current stabilization generation; incremented on every stabilize
     generation: Generation,
+    #[cfg(feature = "anchors_slotmap")]
+    pending_requests: Rc<RefCell<Vec<PendingRequest>>>,
+    #[cfg(feature = "anchors_slotmap")]
+    pending_seq: Cell<u64>,
+    #[cfg(feature = "anchors_slotmap")]
+    pending_stats: Rc<PendingStatsInner>,
 }
 
 struct Mounter {
@@ -108,6 +173,37 @@ impl crate::expert::Engine for Engine {
 }
 
 impl Engine {
+    #[cfg(feature = "anchors_slotmap")]
+    fn debug_pending_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ANCHORS_DEBUG_PENDING")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    #[inline]
+    fn debug_pending_enabled() -> bool {
+        false
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn defer_disabled() -> bool {
+        static DISABLED: OnceLock<bool> = OnceLock::new();
+        *DISABLED.get_or_init(|| {
+            std::env::var("ANCHORS_DEFER_DISABLED")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    #[inline]
+    fn defer_disabled() -> bool {
+        true
+    }
     #[cfg(feature = "anchors_slotmap")]
     fn current_rss_bytes() -> u64 {
         // getrusage 在 macOS 返回 bytes，Linux 返回 KB；这里统一转换成字节后再比较。
@@ -141,6 +237,34 @@ impl Engine {
             graph,
             dirty_marks: Default::default(),
             generation: Generation::new(),
+            #[cfg(feature = "anchors_slotmap")]
+            pending_requests: Rc::new(RefCell::new(Vec::new())),
+            #[cfg(feature = "anchors_slotmap")]
+            pending_seq: Cell::new(0),
+            #[cfg(feature = "anchors_slotmap")]
+            pending_stats: Rc::new(PendingStatsInner::default()),
+        }
+    }
+
+    /// 输出 pending 队列的聚合指标，便于在 demo/集成测试后记录基线。
+    #[must_use]
+    pub fn pending_stats_snapshot(&self) -> AnchorsPendingStats {
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            let stats = &self.pending_stats;
+            return AnchorsPendingStats {
+                total_enqueued: stats.total_enqueued.get(),
+                total_drained: stats.total_drained.get(),
+                max_queue_len: stats.max_queue_len.get(),
+                last_enqueue_len: stats.last_enqueue_len.get(),
+                last_drain_remaining: stats.last_drain_remaining.get(),
+                last_drain_drained: stats.last_drain_drained.get(),
+            };
+        }
+
+        #[cfg(not(feature = "anchors_slotmap"))]
+        {
+            AnchorsPendingStats::default()
         }
     }
 
@@ -182,6 +306,63 @@ impl Engine {
             node.observed.set(false);
             Self::update_necessary_children(node);
         })
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn enqueue_pending_keys(
+        &self,
+        parent: NodeKey,
+        child: NodeKey,
+        necessary: bool,
+        priority: PendingPriority,
+    ) -> bool {
+        if Self::defer_disabled() {
+            return false;
+        }
+
+        let mut queue = self.pending_requests.borrow_mut();
+        let order = self.pending_seq.get();
+        self.pending_seq.set(order.saturating_add(1));
+        queue.push(PendingRequest {
+            parent,
+            child,
+            necessary,
+            priority,
+            order,
+        });
+        let queue_len = queue.len();
+        self.pending_stats
+            .total_enqueued
+            .set(self.pending_stats.total_enqueued.get().saturating_add(1));
+        if queue_len > self.pending_stats.max_queue_len.get() {
+            self.pending_stats.max_queue_len.set(queue_len);
+        }
+        self.pending_stats.last_enqueue_len.set(queue_len);
+
+        if Self::debug_pending_enabled() {
+            tracing::debug!(
+                target: "anchors",
+                parent_token = parent.raw_token(),
+                child_token = child.raw_token(),
+                priority = priority.as_u8(),
+                queue_len,
+                "enqueue pending request"
+            );
+        }
+
+        true
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    #[inline]
+    fn enqueue_pending_keys(
+        &self,
+        _parent: NodeKey,
+        _child: NodeKey,
+        _necessary: bool,
+        _priority: PendingPriority,
+    ) -> bool {
+        false
     }
 
     fn update_necessary_children(node: NodeGuard<'_>) {
@@ -388,7 +569,84 @@ impl Engine {
                 }
             }
         });
+        #[cfg(feature = "anchors_slotmap")]
+        self.process_pending_requests();
         trace!("...stabilize0");
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn process_pending_requests(&self) {
+        if Self::defer_disabled() {
+            self.pending_requests.borrow_mut().clear();
+            return;
+        }
+
+        let drained: Vec<PendingRequest> = {
+            let mut queue = self.pending_requests.borrow_mut();
+            if queue.is_empty() {
+                return;
+            }
+            queue.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| a.order.cmp(&b.order))
+            });
+            queue.drain(..).collect()
+        };
+        let total_to_retry = drained.len();
+        if total_to_retry > 0 {
+            self.pending_stats.total_drained.set(
+                self.pending_stats
+                    .total_drained
+                    .get()
+                    .saturating_add(total_to_retry as u64),
+            );
+            self.pending_stats.last_drain_drained.set(total_to_retry);
+        }
+
+        for req in drained {
+            if Self::debug_pending_enabled() {
+                tracing::debug!(
+                    target: "anchors",
+                    parent_token = req.parent.raw_token(),
+                    child_token = req.child.raw_token(),
+                    priority = req.priority.as_u8(),
+                    queue_len = total_to_retry,
+                    "drain pending request"
+                );
+            }
+
+            let mut need_retry = false;
+            self.graph.with(|graph| {
+                let Some(parent) = graph.get(req.parent) else {
+                    return;
+                };
+                let Some(child) = graph.get(req.child) else {
+                    return;
+                };
+
+                let mut ctx = EngineContextMut {
+                    engine: self,
+                    graph,
+                    node: parent,
+                    pending_on_anchor_get: false,
+                };
+                let poll = ctx.request_node(child, req.necessary);
+                if matches!(poll, Poll::PendingDefer) {
+                    need_retry = true;
+                }
+            });
+
+            if need_retry {
+                let mut queue = self.pending_requests.borrow_mut();
+                let order = self.pending_seq.get();
+                self.pending_seq.set(order.saturating_add(1));
+                queue.push(PendingRequest { order, ..req });
+            }
+        }
+
+        let remaining = self.pending_requests.borrow().len();
+        self.pending_stats.last_drain_remaining.set(remaining);
     }
 
     /// returns false if calculation is still pending
@@ -621,7 +879,7 @@ impl Engine {
         node.recalc_retry.set(0);
         let pending_on_anchor_get = ecx.pending_on_anchor_get;
         match poll_result {
-            Poll::Pending => {
+            Poll::Pending | Poll::PendingDefer => {
                 if std::env::var("ANCHORS_DEBUG_PENDING")
                     .map(|v| v != "0")
                     .unwrap_or(false)
@@ -1114,10 +1372,30 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
         let child =
             self.engine
                 .expect_node(&self.graph, anchor.token(), "EngineContextMut::request");
+        self.request_node(child, necessary)
+    }
+
+    fn unrequest<'out, O: 'static>(&mut self, anchor: &Anchor<O>) {
+        let child =
+            self.engine
+                .expect_node(&self.graph, anchor.token(), "EngineContextMut::unrequest");
+        self.node.remove_necessary_child(child);
+        Engine::update_necessary_children(child);
+    }
+
+    fn dirty_handle(&mut self) -> DirtyHandle {
+        DirtyHandle {
+            num: self.node.key(),
+            dirty_marks: self.engine.dirty_marks.clone(),
+        }
+    }
+}
+
+impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
+    fn request_node(&mut self, child: NodeGuard<'gg>, necessary: bool) -> Poll {
         let height_already_increased = match graph2::ensure_height_increases(child, self.node) {
             Ok(v) => v,
             Err(()) => {
-                // 依赖环路会导致后续高度更新无限递归，直接跳过本次 request 并记录诊断信息，避免用户态崩溃。
                 tracing::error!(
                     target: "anchors",
                     "检测到依赖环，跳过本次 request，parent={:?} child={:?}",
@@ -1144,7 +1422,6 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
         let self_is_necessary = Engine::check_observed_raw(self.node) != ObservedState::Unnecessary;
 
         if graph2::recalc_state(child) != RecalcState::Ready {
-            // 即便子节点尚未计算完成，也先登记父链，避免后续 dirty 无父可递归导致更新丢失。
             child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
             self.graph.queue_recalc(child);
@@ -1162,12 +1439,11 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
             if necessary && self_is_necessary {
                 self.node.add_necessary_child(child);
             }
-            Poll::Pending
+            self.defer_or_pending(child, necessary, self_is_necessary)
         } else if !height_already_increased {
-            // 高度刚被抬升，还没正式记录依赖；先挂上父链，确保第一次重算完成后 dirty 能向上传播。
             child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
-            Poll::Pending
+            self.defer_or_pending(child, necessary, self_is_necessary)
         } else {
             child.add_clean_parent(self.node);
             if necessary && self_is_necessary {
@@ -1180,18 +1456,20 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
         }
     }
 
-    fn unrequest<'out, O: 'static>(&mut self, anchor: &Anchor<O>) {
-        let child =
-            self.engine
-                .expect_node(&self.graph, anchor.token(), "EngineContextMut::unrequest");
-        self.node.remove_necessary_child(child);
-        Engine::update_necessary_children(child);
-    }
-
-    fn dirty_handle(&mut self) -> DirtyHandle {
-        DirtyHandle {
-            num: self.node.key(),
-            dirty_marks: self.engine.dirty_marks.clone(),
+    fn defer_or_pending(
+        &mut self,
+        child: NodeGuard<'gg>,
+        necessary: bool,
+        self_is_necessary: bool,
+    ) -> Poll {
+        let priority = PendingPriority::default_for(necessary, self_is_necessary);
+        if self
+            .engine
+            .enqueue_pending_keys(self.node.key(), child.key(), necessary, priority)
+        {
+            Poll::PendingDefer
+        } else {
+            Poll::Pending
         }
     }
 }

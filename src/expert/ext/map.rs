@@ -62,7 +62,7 @@ macro_rules! impl_tuple_map {
 
                 $(
                     match ctx.request(&self.anchors.$num, true) {
-                        Poll::Pending => {
+                        Poll::Pending | Poll::PendingDefer => {
                             found_pending = true;
                         }
                         Poll::Updated => {

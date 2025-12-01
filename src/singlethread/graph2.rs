@@ -2,8 +2,6 @@ use super::{AnchorDebugInfo, Generation, GenericAnchor};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 
-#[cfg(feature = "anchors_slotmap")]
-use crate::telemetry::{SlotmapEventKind, record_slotmap_event};
 
 #[cfg(feature = "anchors_slotmap")]
 mod node_store {
@@ -210,14 +208,10 @@ mod node_store {
             // unsafe: graph 指针由 slotmap 生成，与当前节点同生灭。
             let graph: &super::Graph2 = unsafe { &*guard.ptrs.graph };
             if guard.anchor_locked.get() {
-                graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
                 return false;
             }
 
             if unsafe { (&*guard.anchor.get()).is_none() } {
-                graph
-                    .node_metrics
-                    .record(super::SlotmapEventKind::GcSkipped);
                 return true;
             }
 
@@ -231,7 +225,6 @@ mod node_store {
                     children.clear();
                     true
                 } else {
-                    graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
                     false
                 };
             if !drained_children {
@@ -245,7 +238,6 @@ mod node_store {
                 parents.clear();
                 true
             } else {
-                graph.node_metrics.record(super::SlotmapEventKind::FreeSkip);
                 false
             };
             if !drained_parents {
@@ -256,9 +248,6 @@ mod node_store {
 
             let anchor_slot = unsafe { &mut *guard.anchor.get() };
             if anchor_slot.is_none() {
-                graph
-                    .node_metrics
-                    .record(super::SlotmapEventKind::GcSkipped);
                 return true;
             }
             *anchor_slot = None;
@@ -285,7 +274,6 @@ mod node_store {
             graph
                 .active_nodes
                 .set(graph.active_nodes.get().saturating_sub(1));
-            graph.node_metrics.record(super::SlotmapEventKind::Free);
             true
         }
     }
@@ -319,30 +307,6 @@ type AgGuard<'gg> = ag::NodeStoreGuard<'gg, Node>;
 #[cfg(not(feature = "anchors_slotmap"))]
 type AgGuard<'gg> = ag::GraphGuard<'gg, Node>;
 
-#[cfg(feature = "anchors_slotmap")]
-#[derive(Default)]
-struct NodeStoreMetrics {
-    alloc: Cell<u64>,
-    free: Cell<u64>,
-    gc_skipped: Cell<u64>,
-    free_skip: Cell<u64>,
-}
-
-#[cfg(feature = "anchors_slotmap")]
-impl NodeStoreMetrics {
-    fn record(&self, kind: SlotmapEventKind) {
-        let counter = match kind {
-            SlotmapEventKind::Alloc => &self.alloc,
-            SlotmapEventKind::Free => &self.free,
-            SlotmapEventKind::GcSkipped => &self.gc_skipped,
-            SlotmapEventKind::FreeSkip => &self.free_skip,
-        };
-        let next = counter.get().saturating_add(1);
-        counter.set(next);
-        record_slotmap_event(kind, next);
-    }
-}
-
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RecalcState {
     #[default]
@@ -365,8 +329,6 @@ pub struct Graph2 {
     #[cfg(feature = "anchors_slotmap")]
     pending_free: RefCell<Vec<NodePtr>>,
     graph_token: u32,
-    #[cfg(feature = "anchors_slotmap")]
-    node_metrics: NodeStoreMetrics,
     #[cfg(feature = "anchors_slotmap")]
     token_counter: Cell<u64>,
 
@@ -490,21 +452,11 @@ impl Drop for AnchorHandle {
 
         let guard = unsafe { self.num.ptr.lookup_unchecked() };
         if guard.slot_token.get() != self.num.token {
-            #[cfg(feature = "anchors_slotmap")]
-            {
-                let graph: &Graph2 = unsafe { &*guard.ptrs.graph };
-                graph.node_metrics.record(SlotmapEventKind::FreeSkip);
-            }
             return;
         }
         let count = &guard.ptrs.handle_count;
         let current = count.get();
         if current == 0 {
-            #[cfg(feature = "anchors_slotmap")]
-            {
-                let graph: &Graph2 = unsafe { &*guard.ptrs.graph };
-                graph.node_metrics.record(SlotmapEventKind::FreeSkip);
-            }
             return;
         }
         let new_count = current - 1;
@@ -908,8 +860,6 @@ impl Graph2 {
                 n
             }),
             #[cfg(feature = "anchors_slotmap")]
-            node_metrics: NodeStoreMetrics::default(),
-            #[cfg(feature = "anchors_slotmap")]
             token_counter: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             active_nodes: Cell::new(0),
@@ -1004,8 +954,6 @@ impl Graph2 {
                 NodeGuard(nodes.insert(node))
             };
             let num = guard.key();
-            #[cfg(feature = "anchors_slotmap")]
-            self.node_metrics.record(SlotmapEventKind::Alloc);
             #[cfg(feature = "anchors_slotmap")]
             self.active_nodes
                 .set(self.active_nodes.get().saturating_add(1));

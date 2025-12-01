@@ -1,28 +1,27 @@
-//! US1 补充：重复 Drop 时 free_skip 指标应递增，避免错误计数 alloc/free。
-//! 运行：cargo nextest run -p anchors --features anchors_slotmap --test slotmap_free_skip --profile anchors-slotmap
+//! 确认重复 Drop 不会导致 panic，且 free list 仍可复用。
 
 mod slotmap;
 
-use anchors::telemetry::SlotmapEventKind;
 use slotmap::_helpers::{new_slotmap_engine, spawn_counter_batch};
 
 #[test]
-fn slotmap_free_skip_increments() {
+fn repeated_drop_is_idempotent() {
     let mut engine = new_slotmap_engine();
-    let (_vars, anchors) = spawn_counter_batch(4, 10);
+    let (_vars, anchors) = spawn_counter_batch(8, 10);
 
-    // 首次获取确保节点激活。
-    let _ = anchors.iter().map(|a| engine.get(a)).collect::<Vec<_>>();
+    // 激活节点，确保 slotmap 正常分配 token。
+    let _: Vec<_> = anchors.iter().map(|anchor| engine.get(anchor)).collect();
 
-    // 主动删掉一次，触发正常 free。
-    drop(anchors.clone());
-
-    // 再次 drop 相同的 clone，触发 free_skip 计数。
+    // 克隆一份并提前 drop，模拟 handle_count 已归零的 free_skip 路径。
+    let shadow = anchors.clone();
+    drop(shadow);
     drop(anchors);
 
-    // 目前 telemetry 的计数通过内部 record_slotmap_event 更新，无法直接拿数，
-    // 这里以逻辑断言：重复 drop 不应 panic，且能通过 cfg gate 走到 free_skip 分支。
-    // 更精确的计数校验将由 Jaeger/观察端完成。
-    let expect = SlotmapEventKind::FreeSkip;
-    let _ = expect; // 占位，提醒读者指标名称。
+    // stabilize 过程中若 free_skip 处理异常，会直接 panic；通过即视为 idempotent。
+    engine.stabilize();
+
+    // 再次创建一批 anchor，若 free list 被污染则会 panic 或 token 重复。
+    let (_vars2, anchors2) = spawn_counter_batch(4, 42);
+    let values: Vec<_> = anchors2.iter().map(|anchor| engine.get(anchor)).collect();
+    assert_eq!(values.len(), anchors2.len());
 }

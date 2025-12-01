@@ -136,7 +136,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorVOACollect<T, E> {
                     }
                     ValOrAnchor::Anchor(an) => {
                         let s = ctx.request(an, true);
-                        if s == Poll::Pending {
+                        if s.is_pending() {
                             None
                         } else {
                             acc.push((s, Some(an)));

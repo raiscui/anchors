@@ -569,7 +569,7 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
                     }
                 }
             };
-            if poll == Poll::Pending {
+            if poll.is_pending() {
                 debug!("a pending");
                 return Poll::Pending;
             }

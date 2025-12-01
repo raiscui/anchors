@@ -22,6 +22,17 @@ pub enum Poll {
     /// Indicates the polled value is not ready for reading, but has been queued for recalculation.
     /// The output value will eventually switch to Updated or Unchanged.
     Pending,
+
+    /// Indicates该节点尚未完成计算，并且被延迟到下一轮 `stabilize`/drain
+    /// 再次尝试，通常用于打断同帧内的循环请求。
+    PendingDefer,
+}
+
+impl Poll {
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending | Self::PendingDefer)
+    }
 }
 
 /// The main struct of the Anchors library. Represents a single value on the recomputation graph.

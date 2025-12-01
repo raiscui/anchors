@@ -58,7 +58,7 @@ impl<T: 'static + Clone, E: Engine, const S: usize> AnchorInner<E> for SmallVecC
         if self.dirty {
             let polls = self.anchors.iter().try_fold(vec![], |mut acc, anchor| {
                 let s = ctx.request(anchor, true);
-                if s != Poll::Pending {
+                if !s.is_pending() {
                     acc.push((s, anchor));
                     Some(acc)
                 } else {

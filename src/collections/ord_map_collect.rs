@@ -294,7 +294,7 @@ where
         // 只有一个输入：整张字典 Anchor。更新/脏时重建输出。
         if self.dirty {
             match ctx.request(&self.input, true) {
-                Poll::Pending => {
+                Poll::Pending | Poll::PendingDefer => {
                     // 输入仍在计算，延后本节点重建，避免在持锁期间重复入队。
                     return Poll::Pending;
                 }
@@ -314,7 +314,7 @@ where
 
             for (i, anchor) in entries {
                 match ctx.request(&anchor, true) {
-                    Poll::Pending => {
+                    Poll::Pending | Poll::PendingDefer => {
                         pending_child = true;
                         continue;
                     }
@@ -349,7 +349,7 @@ where
         } else {
             // 保持依赖以便高度/必要关系正确
             match ctx.request(&self.input, true) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending | Poll::PendingDefer => return Poll::Pending,
                 Poll::Updated => {
                     self.dirty = true;
                     return Poll::Pending;
