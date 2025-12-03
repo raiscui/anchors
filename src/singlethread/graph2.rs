@@ -760,8 +760,16 @@ impl<'gg> Graph2Guard<'gg> {
         let mut recalc_queues = self.graph.recalc_queues.borrow_mut();
         if node_height >= recalc_queues.len() {
             let old_len = recalc_queues.len();
-            // NOTE: anchors 链路在复杂 UI 中深度可能远超默认 256，为避免 panic，直接扩容到所需高度+1。
-            let target_len = node_height.saturating_add(1);
+            // ── 以 1.2 倍扩容减少每次只增加一个槽位导致的高频 warn，同时仍确保覆盖必需高度。
+            let required_len = node_height.saturating_add(1);
+            let ratio_len = {
+                let scaled = old_len
+                    .saturating_mul(12)
+                    .saturating_add(9)
+                    / 10;
+                scaled.max(old_len.saturating_add(1))
+            };
+            let target_len = required_len.max(ratio_len);
             recalc_queues.resize(target_len, None);
             if self.graph.recalc_min_height.get() >= old_len {
                 // 队列原本为空（min==len），扩容后同步更新哨兵值，确保后续 pop 逻辑不越界。
@@ -772,6 +780,7 @@ impl<'gg> Graph2Guard<'gg> {
                 token = node.key().raw_token(),
                 old_capacity = old_len,
                 new_capacity = target_len,
+                ratio_target = ratio_len,
                 required_height = node_height,
                 debug = %node.debug_info.get()._to_string(),
                 "recalc_queues 容量不足，自动扩容"
@@ -1351,6 +1360,18 @@ mod test {
             guard.queue_recalc(node);
         });
         assert!(graph.recalc_queues.borrow().len() >= 13);
+    }
+
+    #[test]
+    fn queue_recalc_prefers_ratio_growth() {
+        let graph = Graph2::new(10);
+        graph.with(|guard| {
+            let node = guard.insert_testing_guard();
+            // ── 高度刚好落在旧容量边界，验证扩容会按 1.2 倍执行而非只补足 1 个槽位。
+            node.ptrs.height.set(10);
+            guard.queue_recalc(node);
+        });
+        assert_eq!(12, graph.recalc_queues.borrow().len());
     }
 
     #[test]
