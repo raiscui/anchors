@@ -2,7 +2,6 @@ use super::{AnchorDebugInfo, Generation, GenericAnchor};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 
-
 #[cfg(feature = "anchors_slotmap")]
 mod node_store {
     use slotmap::{DefaultKey, SlotMap};

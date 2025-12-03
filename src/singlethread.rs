@@ -72,7 +72,6 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 // ─────────────────────────────────────────────────────────────────────────────
 
-
 pub fn into_ea<T>(x: impl Into<ValOrAnchor<T>>) -> ValOrAnchor<T> {
     x.into()
 }
