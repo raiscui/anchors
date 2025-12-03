@@ -763,10 +763,7 @@ impl<'gg> Graph2Guard<'gg> {
             // ── 以 1.2 倍扩容减少每次只增加一个槽位导致的高频 warn，同时仍确保覆盖必需高度。
             let required_len = node_height.saturating_add(1);
             let ratio_len = {
-                let scaled = old_len
-                    .saturating_mul(12)
-                    .saturating_add(9)
-                    / 10;
+                let scaled = old_len.saturating_mul(12).saturating_add(9) / 10;
                 scaled.max(old_len.saturating_add(1))
             };
             let target_len = required_len.max(ratio_len);
