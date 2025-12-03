@@ -135,8 +135,8 @@ fn pending_queue_defers_new_dependency_until_ready() {
     );
 
     let stats = engine.pending_stats_snapshot();
-    assert!(stats.total_enqueued >= 1);
-    assert_eq!(stats.total_enqueued, stats.total_drained);
+    assert!(stats.total_enqueued_unique >= 1);
+    assert_eq!(stats.total_enqueued_unique, stats.total_drained);
     assert!(stats.max_queue_len >= 1);
     assert_eq!(stats.last_drain_remaining, 0);
 }

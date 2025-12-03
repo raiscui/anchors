@@ -21,7 +21,9 @@ pub use graph2::NodeKey as AnchorToken;
 #[cfg(feature = "anchors_slotmap")]
 #[derive(Default)]
 struct PendingStatsInner {
-    total_enqueued: Cell<u64>,
+    total_enqueued_raw: Cell<u64>,
+    total_enqueued_unique: Cell<u64>,
+    dedup_hits: Cell<u64>,
     total_drained: Cell<u64>,
     max_queue_len: Cell<usize>,
     last_enqueue_len: Cell<usize>,
@@ -32,7 +34,9 @@ struct PendingStatsInner {
 /// Pending 队列统计快照，用于在 demo/测试后导出指标。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnchorsPendingStats {
-    pub total_enqueued: u64,
+    pub total_enqueued_raw: u64,
+    pub total_enqueued_unique: u64,
+    pub dedup_hits: u64,
     pub total_drained: u64,
     pub max_queue_len: usize,
     pub last_enqueue_len: usize,
@@ -58,6 +62,8 @@ use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 
 use generation::Generation;
 #[cfg(feature = "anchors_slotmap")]
+use indexmap::IndexMap;
+#[cfg(feature = "anchors_slotmap")]
 use libc::RUSAGE_SELF;
 #[cfg(feature = "anchors_slotmap")]
 use libc::getrusage;
@@ -67,6 +73,8 @@ use std::any::Any;
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+#[cfg(feature = "anchors_slotmap")]
+use std::collections::{BTreeMap, HashSet};
 use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -131,7 +139,152 @@ struct PendingRequest {
     child: NodeKey,
     necessary: bool,
     priority: PendingPriority,
-    order: u64,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Default)]
+struct PendingQueue {
+    buckets: BTreeMap<PendingPriority, IndexMap<NodeKey, PendingRequest>>,
+    index: HashMap<NodeKey, PendingPriority>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Default)]
+struct PendingSubsetFilter {
+    /// 需要立刻冲刷的节点 token 集，触发 subset stabilize 时仅处理这些节点。
+    tokens: HashSet<NodeKey>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl PendingSubsetFilter {
+    fn new(tokens: &[NodeKey]) -> Self {
+        Self {
+            tokens: tokens.iter().copied().collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    fn contains(&self, token: &NodeKey) -> bool {
+        self.tokens.contains(token)
+    }
+}
+
+#[cfg(feature = "anchors_slotmap")]
+type PendingSubsetArg<'a> = Option<&'a PendingSubsetFilter>;
+#[cfg(not(feature = "anchors_slotmap"))]
+type PendingSubsetArg<'a> = Option<&'a ()>;
+
+#[cfg(feature = "anchors_slotmap")]
+enum PendingEnqueueOutcome {
+    Inserted,
+    Replaced,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl PendingQueue {
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    fn insert(&mut self, entry: PendingRequest) -> PendingEnqueueOutcome {
+        if let Some(old_priority) = self.index.get(&entry.child).copied() {
+            let (mut existing, empty_after_remove) = {
+                let bucket = self
+                    .buckets
+                    .get_mut(&old_priority)
+                    .expect("priority bucket missing");
+                let existing = bucket
+                    .shift_remove(&entry.child)
+                    .expect("pending entry missing");
+                (existing, bucket.is_empty())
+            };
+            if empty_after_remove {
+                self.buckets.remove(&old_priority);
+            }
+            let target_priority = old_priority.max(entry.priority);
+            existing.parent = entry.parent;
+            existing.necessary |= entry.necessary;
+            existing.priority = target_priority;
+            self.buckets
+                .entry(target_priority)
+                .or_insert_with(IndexMap::new)
+                .insert(entry.child, existing);
+            self.index.insert(entry.child, target_priority);
+            PendingEnqueueOutcome::Replaced
+        } else {
+            self.index.insert(entry.child, entry.priority);
+            self.buckets
+                .entry(entry.priority)
+                .or_insert_with(IndexMap::new)
+                .insert(entry.child, entry);
+            PendingEnqueueOutcome::Inserted
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<PendingRequest> {
+        let mut empty_priorities = Vec::new();
+        let mut result = None;
+        for (&priority, bucket) in self.buckets.iter_mut().rev() {
+            if let Some(token) = bucket.keys().next().copied() {
+                let entry = bucket.shift_remove(&token).expect("pending entry missing");
+                self.index.remove(&token);
+                result = Some(entry);
+            }
+            if bucket.is_empty() {
+                empty_priorities.push(priority);
+            }
+            if result.is_some() {
+                break;
+            }
+        }
+        for priority in empty_priorities {
+            self.buckets.remove(&priority);
+        }
+        result
+    }
+
+    fn drain_all(&mut self) -> Vec<PendingRequest> {
+        let mut drained = Vec::with_capacity(self.len());
+        while let Some(entry) = self.pop_front() {
+            drained.push(entry);
+        }
+        drained
+    }
+
+    fn drain_subset(&mut self, filter: &PendingSubsetFilter) -> Vec<PendingRequest> {
+        if filter.is_empty() {
+            return Vec::new();
+        }
+        let mut drained = Vec::new();
+        let mut empty_priorities = Vec::new();
+        for (&priority, bucket) in self.buckets.iter_mut().rev() {
+            let keys: Vec<NodeKey> = bucket.keys().copied().collect();
+            for token in keys {
+                if !filter.contains(&token) {
+                    continue;
+                }
+                let entry = bucket
+                    .shift_remove(&token)
+                    .expect("pending entry missing while draining subset");
+                self.index.remove(&token);
+                drained.push(entry);
+            }
+            if bucket.is_empty() {
+                empty_priorities.push(priority);
+            }
+        }
+        for priority in empty_priorities {
+            self.buckets.remove(&priority);
+        }
+        drained
+    }
 }
 
 /// The main execution engine of Singlethread.
@@ -143,9 +296,7 @@ pub struct Engine {
     // tracks the current stabilization generation; incremented on every stabilize
     generation: Generation,
     #[cfg(feature = "anchors_slotmap")]
-    pending_requests: Rc<RefCell<Vec<PendingRequest>>>,
-    #[cfg(feature = "anchors_slotmap")]
-    pending_seq: Cell<u64>,
+    pending_requests: Rc<RefCell<PendingQueue>>,
     #[cfg(feature = "anchors_slotmap")]
     pending_stats: Rc<PendingStatsInner>,
 }
@@ -237,9 +388,7 @@ impl Engine {
             dirty_marks: Default::default(),
             generation: Generation::new(),
             #[cfg(feature = "anchors_slotmap")]
-            pending_requests: Rc::new(RefCell::new(Vec::new())),
-            #[cfg(feature = "anchors_slotmap")]
-            pending_seq: Cell::new(0),
+            pending_requests: Rc::new(RefCell::new(PendingQueue::default())),
             #[cfg(feature = "anchors_slotmap")]
             pending_stats: Rc::new(PendingStatsInner::default()),
         }
@@ -252,7 +401,9 @@ impl Engine {
         {
             let stats = &self.pending_stats;
             return AnchorsPendingStats {
-                total_enqueued: stats.total_enqueued.get(),
+                total_enqueued_raw: stats.total_enqueued_raw.get(),
+                total_enqueued_unique: stats.total_enqueued_unique.get(),
+                dedup_hits: stats.dedup_hits.get(),
                 total_drained: stats.total_drained.get(),
                 max_queue_len: stats.max_queue_len.get(),
                 last_enqueue_len: stats.last_enqueue_len.get(),
@@ -319,26 +470,45 @@ impl Engine {
             return false;
         }
 
-        let mut queue = self.pending_requests.borrow_mut();
-        let order = self.pending_seq.get();
-        self.pending_seq.set(order.saturating_add(1));
-        queue.push(PendingRequest {
-            parent,
-            child,
-            necessary,
-            priority,
-            order,
-        });
-        let queue_len = queue.len();
-        self.pending_stats
-            .total_enqueued
-            .set(self.pending_stats.total_enqueued.get().saturating_add(1));
-        if queue_len > self.pending_stats.max_queue_len.get() {
-            self.pending_stats.max_queue_len.set(queue_len);
+        let outcome = {
+            let mut queue = self.pending_requests.borrow_mut();
+            let outcome = queue.insert(PendingRequest {
+                parent,
+                child,
+                necessary,
+                priority,
+            });
+            let queue_len = queue.len();
+            self.pending_stats
+                .max_queue_len
+                .set(self.pending_stats.max_queue_len.get().max(queue_len));
+            self.pending_stats.last_enqueue_len.set(queue_len);
+            outcome
+        };
+        self.pending_stats.total_enqueued_raw.set(
+            self.pending_stats
+                .total_enqueued_raw
+                .get()
+                .saturating_add(1),
+        );
+        match outcome {
+            PendingEnqueueOutcome::Inserted => {
+                self.pending_stats.total_enqueued_unique.set(
+                    self.pending_stats
+                        .total_enqueued_unique
+                        .get()
+                        .saturating_add(1),
+                );
+            }
+            PendingEnqueueOutcome::Replaced => {
+                self.pending_stats
+                    .dedup_hits
+                    .set(self.pending_stats.dedup_hits.get().saturating_add(1));
+            }
         }
-        self.pending_stats.last_enqueue_len.set(queue_len);
 
         if Self::debug_pending_enabled() {
+            let queue_len = self.pending_requests.borrow().len();
             tracing::debug!(
                 target: "anchors",
                 parent_token = parent.raw_token(),
@@ -490,12 +660,38 @@ impl Engine {
         trace!("stabilize");
         self.update_dirty_marks();
         self.generation.increment();
-        self.stabilize0();
+        self.stabilize_with_pending_subset(None);
         trace!("....stabilize");
+    }
+
+    pub fn stabilize_subset(&mut self, tokens: &[NodeKey]) {
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            if tokens.is_empty() {
+                return;
+            }
+            trace!("stabilize_subset");
+            self.update_dirty_marks();
+            self.generation.increment();
+            let filter = PendingSubsetFilter::new(tokens);
+            self.stabilize_with_pending_subset(Some(&filter));
+            trace!("....stabilize_subset");
+            return;
+        }
+
+        #[cfg(not(feature = "anchors_slotmap"))]
+        {
+            let _ = tokens;
+            self.stabilize();
+        }
     }
 
     /// internal function for stabilization. does not update dirty marks or increment the stabilization number
     fn stabilize0(&self) {
+        self.stabilize_with_pending_subset(None);
+    }
+
+    fn stabilize_with_pending_subset(&self, pending_subset: PendingSubsetArg<'_>) {
         trace!("stabilize0");
         self.graph.with(|graph| {
             // 可选调试：检测重算队列是否异常“打转”。设置 `ANCHORS_DEBUG_SPIN=1` 时启用。
@@ -569,14 +765,16 @@ impl Engine {
             }
         });
         #[cfg(feature = "anchors_slotmap")]
-        self.process_pending_requests();
+        self.process_pending_requests(pending_subset);
         trace!("...stabilize0");
     }
 
     #[cfg(feature = "anchors_slotmap")]
-    fn process_pending_requests(&self) {
+    fn process_pending_requests(&self, pending_subset: PendingSubsetArg<'_>) {
         if Self::defer_disabled() {
-            self.pending_requests.borrow_mut().clear();
+            let mut queue = self.pending_requests.borrow_mut();
+            queue.buckets.clear();
+            queue.index.clear();
             return;
         }
 
@@ -585,12 +783,10 @@ impl Engine {
             if queue.is_empty() {
                 return;
             }
-            queue.sort_by(|a, b| {
-                b.priority
-                    .cmp(&a.priority)
-                    .then_with(|| a.order.cmp(&b.order))
-            });
-            queue.drain(..).collect()
+            match pending_subset {
+                Some(filter) => queue.drain_subset(filter),
+                None => queue.drain_all(),
+            }
         };
         let total_to_retry = drained.len();
         if total_to_retry > 0 {
@@ -637,10 +833,15 @@ impl Engine {
             });
 
             if need_retry {
-                let mut queue = self.pending_requests.borrow_mut();
-                let order = self.pending_seq.get();
-                self.pending_seq.set(order.saturating_add(1));
-                queue.push(PendingRequest { order, ..req });
+                let queue_len = {
+                    let mut queue = self.pending_requests.borrow_mut();
+                    queue.insert(req);
+                    queue.len()
+                };
+                self.pending_stats
+                    .max_queue_len
+                    .set(self.pending_stats.max_queue_len.get().max(queue_len));
+                self.pending_stats.last_enqueue_len.set(queue_len);
             }
         }
 

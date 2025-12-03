@@ -38,6 +38,7 @@ emg_hasher = { path = "../emg_hasher" }
 
 emg_common = { path = "../emg_common", optional = true }
 libc = { version = "0.2", optional = true }
+indexmap = "2.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "plotters"] }
