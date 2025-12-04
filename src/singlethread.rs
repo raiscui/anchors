@@ -170,6 +170,18 @@ impl PendingSubsetFilter {
     fn contains(&self, token: &NodeKey) -> bool {
         self.tokens.contains(token)
     }
+
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    fn sample_raw_tokens(&self, limit: usize) -> Vec<u64> {
+        self.tokens
+            .iter()
+            .take(limit)
+            .map(|token| token.raw_token())
+            .collect()
+    }
 }
 
 #[cfg(feature = "anchors_slotmap")]
@@ -282,6 +294,52 @@ impl PendingQueue {
         }
         for priority in empty_priorities {
             self.buckets.remove(&priority);
+        }
+        if tracing::enabled!(tracing::Level::INFO) {
+            const SAMPLE: usize = 5;
+            let remaining_after = self.len();
+            let drained_sample: Vec<u64> = drained
+                .iter()
+                .take(SAMPLE)
+                .map(|req| req.child.raw_token())
+                .collect();
+            let mut drained_hist = BTreeMap::new();
+            for req in &drained {
+                *drained_hist.entry(req.priority.as_u8()).or_insert(0usize) += 1;
+            }
+            let mut remaining_hist = BTreeMap::new();
+            for (priority, bucket) in self.buckets.iter() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                remaining_hist.insert(priority.as_u8(), bucket.len());
+            }
+            let drained_set: HashSet<NodeKey> = drained.iter().map(|req| req.child).collect();
+            let unmatched_sample: Vec<u64> = filter
+                .tokens
+                .iter()
+                .filter(|token| !drained_set.contains(token))
+                .take(SAMPLE)
+                .map(|token| token.raw_token())
+                .collect();
+            let requested_total = filter.len();
+            let drained_total = drained.len();
+            let unmatched_total = requested_total.saturating_sub(drained_total);
+            let filter_sample = filter.sample_raw_tokens(SAMPLE);
+            tracing::info!(
+                target: "anchors",
+                log_event = "pending_subset_drain",
+                requested_tokens = requested_total,
+                drained_tokens = drained_total,
+                unmatched_tokens = unmatched_total,
+                remaining_after,
+                sample_filter = ?filter_sample,
+                sample_drained = ?drained_sample,
+                sample_unmatched = ?unmatched_sample,
+                drained_priority_hist = ?drained_hist,
+                remaining_priority_hist = ?remaining_hist,
+                "pending subset drain stats"
+            );
         }
         drained
     }
