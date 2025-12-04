@@ -196,6 +196,27 @@ enum PendingEnqueueOutcome {
 }
 
 #[cfg(feature = "anchors_slotmap")]
+struct PendingDrainOutcome {
+    requests: Vec<PendingRequest>,
+    subset_stats: Option<PendingSubsetDrainStats>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+struct PendingSubsetDrainStats {
+    requested_tokens: usize,
+    drained_tokens: usize,
+    unmatched_tokens: usize,
+    remaining_after: usize,
+    parent_match_hits: usize,
+    sample_filter: Vec<NodeKey>,
+    sample_drained: Vec<NodeKey>,
+    sample_unmatched: Vec<NodeKey>,
+    sample_remaining: Vec<NodeKey>,
+    drained_priority_hist: BTreeMap<u8, usize>,
+    remaining_priority_hist: BTreeMap<u8, usize>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
 impl PendingQueue {
     fn len(&self) -> usize {
         self.index.len()
@@ -262,22 +283,29 @@ impl PendingQueue {
         result
     }
 
-    fn drain_all(&mut self) -> Vec<PendingRequest> {
+    fn drain_all(&mut self) -> PendingDrainOutcome {
         let mut drained = Vec::with_capacity(self.len());
         while let Some(entry) = self.pop_front() {
             drained.push(entry);
         }
-        drained
+        PendingDrainOutcome {
+            requests: drained,
+            subset_stats: None,
+        }
     }
 
-    fn drain_subset(&mut self, filter: &PendingSubsetFilter) -> Vec<PendingRequest> {
+    fn drain_subset(&mut self, filter: &PendingSubsetFilter) -> PendingDrainOutcome {
         if filter.is_empty() {
-            return Vec::new();
+            return PendingDrainOutcome {
+                requests: Vec::new(),
+                subset_stats: None,
+            };
         }
         let mut drained = Vec::new();
         let mut empty_priorities = Vec::new();
         let mut parent_match_hits = 0usize;
         let mut allowed = filter.tokens.clone();
+        const SAMPLE: usize = 5;
         for (&priority, bucket) in self.buckets.iter_mut().rev() {
             let mut pending_keys: Vec<NodeKey> = bucket.keys().copied().collect();
             let mut progressed = true;
@@ -318,58 +346,57 @@ impl PendingQueue {
         for priority in empty_priorities {
             self.buckets.remove(&priority);
         }
-        if tracing::enabled!(tracing::Level::INFO) {
-            const SAMPLE: usize = 5;
-            let remaining_after = self.len();
-            let drained_sample: Vec<u64> = drained
-                .iter()
-                .take(SAMPLE)
-                .map(|req| req.child.raw_token())
-                .collect();
-            let mut drained_hist = BTreeMap::new();
-            for req in &drained {
-                *drained_hist.entry(req.priority.as_u8()).or_insert(0usize) += 1;
-            }
-            let mut remaining_hist = BTreeMap::new();
-            for (priority, bucket) in self.buckets.iter() {
-                if bucket.is_empty() {
-                    continue;
-                }
-                remaining_hist.insert(priority.as_u8(), bucket.len());
-            }
-            let drained_set: HashSet<NodeKey> = drained.iter().map(|req| req.child).collect();
-            let unmatched_sample: Vec<u64> = filter
-                .tokens
-                .iter()
-                .filter(|token| !drained_set.contains(token))
-                .take(SAMPLE)
-                .map(|token| token.raw_token())
-                .collect();
-            let requested_total = filter.len();
-            let drained_total = drained.len();
-            let unmatched_total = filter
-                .tokens
-                .iter()
-                .filter(|token| !drained_set.contains(token))
-                .count();
-            let filter_sample = filter.sample_raw_tokens(SAMPLE);
-            tracing::info!(
-                target: "anchors",
-                log_event = "pending_subset_drain",
-                requested_tokens = requested_total,
-                drained_tokens = drained_total,
-                unmatched_tokens = unmatched_total,
-                remaining_after,
-                parent_match_hits,
-                sample_filter = ?filter_sample,
-                sample_drained = ?drained_sample,
-                sample_unmatched = ?unmatched_sample,
-                drained_priority_hist = ?drained_hist,
-                remaining_priority_hist = ?remaining_hist,
-                "pending subset drain stats"
-            );
+        let requested_total = filter.len();
+        let drained_set: HashSet<NodeKey> = drained.iter().map(|req| req.child).collect();
+        let unmatched_total = filter
+            .tokens
+            .iter()
+            .filter(|token| !drained_set.contains(token))
+            .count();
+        let mut drained_hist = BTreeMap::new();
+        for req in &drained {
+            *drained_hist.entry(req.priority.as_u8()).or_insert(0usize) += 1;
         }
-        drained
+        let mut remaining_hist = BTreeMap::new();
+        for (priority, bucket) in self.buckets.iter() {
+            if bucket.is_empty() {
+                continue;
+            }
+            remaining_hist.insert(priority.as_u8(), bucket.len());
+        }
+        let sample_filter: Vec<NodeKey> = filter.tokens.iter().take(SAMPLE).copied().collect();
+        let sample_drained: Vec<NodeKey> =
+            drained.iter().take(SAMPLE).map(|req| req.child).collect();
+        let sample_unmatched: Vec<NodeKey> = filter
+            .tokens
+            .iter()
+            .filter(|token| !drained_set.contains(token))
+            .take(SAMPLE)
+            .copied()
+            .collect();
+        let sample_remaining: Vec<NodeKey> = self
+            .buckets
+            .values()
+            .flat_map(|bucket| bucket.values().map(|req| req.child))
+            .take(SAMPLE)
+            .collect();
+        let stats = PendingSubsetDrainStats {
+            requested_tokens: requested_total,
+            drained_tokens: drained.len(),
+            unmatched_tokens: unmatched_total,
+            remaining_after: self.len(),
+            parent_match_hits,
+            sample_filter,
+            sample_drained,
+            sample_unmatched,
+            sample_remaining,
+            drained_priority_hist: drained_hist,
+            remaining_priority_hist: remaining_hist,
+        };
+        PendingDrainOutcome {
+            requests: drained,
+            subset_stats: Some(stats),
+        }
     }
 }
 
@@ -911,7 +938,7 @@ impl Engine {
             return;
         }
 
-        let drained: Vec<PendingRequest> = {
+        let outcome = {
             let mut queue = self.pending_requests.borrow_mut();
             if queue.is_empty() {
                 return;
@@ -921,6 +948,10 @@ impl Engine {
                 None => queue.drain_all(),
             }
         };
+        let drained = outcome.requests;
+        if let Some(stats) = outcome.subset_stats {
+            self.log_pending_subset_stats(stats);
+        }
         let total_to_retry = drained.len();
         if total_to_retry > 0 {
             self.pending_stats.total_drained.set(
@@ -980,6 +1011,62 @@ impl Engine {
 
         let remaining = self.pending_requests.borrow().len();
         self.pending_stats.last_drain_remaining.set(remaining);
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn log_pending_subset_stats(&self, stats: PendingSubsetDrainStats) {
+        if !tracing::enabled!(tracing::Level::INFO) {
+            return;
+        }
+        let sample_filter = Self::raw_tokens(&stats.sample_filter);
+        let sample_drained = Self::raw_tokens(&stats.sample_drained);
+        let sample_unmatched = Self::raw_tokens(&stats.sample_unmatched);
+        let sample_remaining = Self::raw_tokens(&stats.sample_remaining);
+        let sample_filter_debug = self.describe_tokens(&stats.sample_filter);
+        let sample_unmatched_debug = self.describe_tokens(&stats.sample_unmatched);
+        let sample_remaining_debug = self.describe_tokens(&stats.sample_remaining);
+        tracing::info!(
+            target: "anchors",
+            log_event = "pending_subset_drain",
+            requested_tokens = stats.requested_tokens,
+            drained_tokens = stats.drained_tokens,
+            unmatched_tokens = stats.unmatched_tokens,
+            remaining_after = stats.remaining_after,
+            parent_match_hits = stats.parent_match_hits,
+            sample_filter = ?sample_filter,
+            sample_filter_debug = ?sample_filter_debug,
+            sample_drained = ?sample_drained,
+            sample_unmatched = ?sample_unmatched,
+            sample_unmatched_debug = ?sample_unmatched_debug,
+            sample_remaining = ?sample_remaining,
+            sample_remaining_debug = ?sample_remaining_debug,
+            drained_priority_hist = ?stats.drained_priority_hist,
+            remaining_priority_hist = ?stats.remaining_priority_hist,
+            "pending subset drain stats"
+        );
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn describe_tokens(&self, tokens: &[NodeKey]) -> Vec<String> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        self.graph.with(|graph| {
+            tokens
+                .iter()
+                .map(|token| {
+                    graph
+                        .get(*token)
+                        .map(|node| node.debug_info.get()._to_string())
+                        .unwrap_or_else(|| format!("#{}", token.raw_token()))
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn raw_tokens(tokens: &[NodeKey]) -> Vec<u64> {
+        tokens.iter().map(|token| token.raw_token()).collect()
     }
 
     /// returns false if calculation is still pending
