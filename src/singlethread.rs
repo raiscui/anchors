@@ -276,17 +276,40 @@ impl PendingQueue {
         }
         let mut drained = Vec::new();
         let mut empty_priorities = Vec::new();
+        let mut parent_match_hits = 0usize;
+        let mut allowed = filter.tokens.clone();
         for (&priority, bucket) in self.buckets.iter_mut().rev() {
-            let keys: Vec<NodeKey> = bucket.keys().copied().collect();
-            for token in keys {
-                if !filter.contains(&token) {
-                    continue;
+            let mut pending_keys: Vec<NodeKey> = bucket.keys().copied().collect();
+            let mut progressed = true;
+            while progressed && !pending_keys.is_empty() {
+                progressed = false;
+                let mut remaining = Vec::with_capacity(pending_keys.len());
+                for token in pending_keys {
+                    let matches_child = allowed.contains(&token);
+                    let matches_parent = if matches_child {
+                        false
+                    } else {
+                        bucket
+                            .get(&token)
+                            .map(|req| allowed.contains(&req.parent))
+                            .unwrap_or(false)
+                    };
+                    if !matches_child && !matches_parent {
+                        remaining.push(token);
+                        continue;
+                    }
+                    progressed = true;
+                    let entry = bucket
+                        .shift_remove(&token)
+                        .expect("pending entry missing while draining subset");
+                    if matches_parent {
+                        parent_match_hits = parent_match_hits.saturating_add(1);
+                    }
+                    self.index.remove(&token);
+                    allowed.insert(entry.child);
+                    drained.push(entry);
                 }
-                let entry = bucket
-                    .shift_remove(&token)
-                    .expect("pending entry missing while draining subset");
-                self.index.remove(&token);
-                drained.push(entry);
+                pending_keys = remaining;
             }
             if bucket.is_empty() {
                 empty_priorities.push(priority);
@@ -324,7 +347,11 @@ impl PendingQueue {
                 .collect();
             let requested_total = filter.len();
             let drained_total = drained.len();
-            let unmatched_total = requested_total.saturating_sub(drained_total);
+            let unmatched_total = filter
+                .tokens
+                .iter()
+                .filter(|token| !drained_set.contains(token))
+                .count();
             let filter_sample = filter.sample_raw_tokens(SAMPLE);
             tracing::info!(
                 target: "anchors",
@@ -333,6 +360,7 @@ impl PendingQueue {
                 drained_tokens = drained_total,
                 unmatched_tokens = unmatched_total,
                 remaining_after,
+                parent_match_hits,
                 sample_filter = ?filter_sample,
                 sample_drained = ?drained_sample,
                 sample_unmatched = ?unmatched_sample,
