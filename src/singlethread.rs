@@ -74,7 +74,7 @@ use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 #[cfg(feature = "anchors_slotmap")]
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -742,6 +742,53 @@ impl Engine {
             let _ = tokens;
             self.stabilize();
         }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn collect_related_tokens(&self, roots: &[NodeKey], depth: usize) -> Vec<NodeKey> {
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        if depth == 0 {
+            return roots.to_vec();
+        }
+
+        let mut visited: HashSet<NodeKey> = HashSet::new();
+        let mut queue: VecDeque<(NodeKey, usize)> = VecDeque::new();
+        for &root in roots {
+            if visited.insert(root) {
+                queue.push_back((root, 0));
+            }
+        }
+
+        self.graph.with(|graph| {
+            while let Some((token, level)) = queue.pop_front() {
+                if level >= depth {
+                    continue;
+                }
+                if let Some(node) = graph.get(token) {
+                    for parent in node.clean_parents() {
+                        let key = parent.key();
+                        if visited.insert(key) {
+                            queue.push_back((key, level + 1));
+                        }
+                    }
+                    for child in node.necessary_children() {
+                        let key = child.key();
+                        if visited.insert(key) {
+                            queue.push_back((key, level + 1));
+                        }
+                    }
+                }
+            }
+        });
+
+        visited.into_iter().collect()
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    pub fn collect_related_tokens(&self, roots: &[NodeKey], _depth: usize) -> Vec<NodeKey> {
+        roots.to_vec()
     }
 
     /// internal function for stabilization. does not update dirty marks or increment the stabilization number
