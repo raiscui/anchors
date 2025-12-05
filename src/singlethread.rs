@@ -767,6 +767,21 @@ impl Engine {
         })
     }
 
+    /// 读取已 Ready 节点的输出副本，不触发重算，仅在 anchors_slotmap 下可用。
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn peek_value<O: Clone + 'static>(&self, anchor: &Anchor<O>) -> Option<O> {
+        self.graph.with(|graph| {
+            let anchor_node = self.expect_node(&graph, anchor.token(), "peek_value 读取节点");
+            if anchor_node.anchor_locked.get() {
+                return None;
+            }
+            if graph2::recalc_state(anchor_node) != RecalcState::Ready {
+                return None;
+            }
+            Some(graph.output_cached(self, anchor_node))
+        })
+    }
+
     pub(crate) fn update_dirty_marks(&mut self) {
         trace!("update_dirty_marks");
         self.graph.with(|graph| {

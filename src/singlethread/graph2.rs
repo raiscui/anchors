@@ -1,4 +1,4 @@
-use super::{AnchorDebugInfo, Generation, GenericAnchor};
+use super::{AnchorDebugInfo, Engine, EngineContext, Generation, GenericAnchor};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 
@@ -810,6 +810,21 @@ impl<'gg> Graph2Guard<'gg> {
         // 解锁后走常规入队逻辑，避免重复维护 prev/next。
         node.anchor_locked.set(false);
         self.queue_recalc(node);
+    }
+
+    /// 读取已 Ready 节点的输出副本，不触发额外 request，仅限 anchors_slotmap。
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn output_cached<O: Clone + 'static>(&self, engine: &Engine, node: NodeGuard<'gg>) -> O {
+        let anchor_impl = unsafe {
+            (*node.anchor.get())
+                .as_ref()
+                .expect("slotmap: anchor 缺失，无法读取缓存输出")
+        };
+        anchor_impl
+            .output(&mut EngineContext { engine })
+            .downcast_ref::<O>()
+            .expect("slotmap: output_cached 类型不匹配")
+            .clone()
     }
 }
 

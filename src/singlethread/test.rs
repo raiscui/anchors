@@ -74,6 +74,26 @@ fn test_mark_observed() {
     assert_eq!(engine.dirty_marks.borrow().len(), 0);
 }
 
+#[cfg(feature = "anchors_slotmap")]
+#[test]
+fn peek_value_respects_ready() {
+    let mut engine = Engine::new();
+    let (anchor_watch, anchor_setter) = {
+        let var = crate::expert::Var::new(1i32);
+        (var.watch(), var)
+    };
+    let derived = anchor_watch.map(|v| v + 1);
+
+    // 首次 get 驱动计算，随后可直接 peek。
+    assert_eq!(engine.get(&derived), 2);
+    assert_eq!(engine.peek_value(&derived), Some(2));
+
+    // set 后再次读取，peek 与 get 保持一致。
+    anchor_setter.set(5);
+    assert_eq!(engine.get(&derived), 6);
+    assert_eq!(engine.peek_value(&derived), Some(6));
+}
+
 #[test]
 fn test_cutoff_simple_observed() {
     let mut engine = Engine::new();
