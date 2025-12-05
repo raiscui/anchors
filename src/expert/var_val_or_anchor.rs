@@ -504,8 +504,6 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
         }
         if let ValOrAnchor::<T, E>::Anchor(an) = &*inner.val {
             if &an.token() == edge {
-                // debug!("dirty...output_stale=true, VarEitherAnchor");
-                // println!("dirty...output_stale=true, VarEitherAnchor");
                 inner.output_stale = true;
             }
         } else {

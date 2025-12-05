@@ -1978,10 +1978,14 @@ pub struct AnchorDebugInfo {
 }
 
 impl AnchorDebugInfo {
-    fn _to_string(&self) -> String {
+    pub fn to_display(&self) -> String {
         match self.location {
             Some((name, location)) => format!("{} ({})", location, name),
             None => self.type_info.to_string(),
         }
+    }
+    // 兼容旧日志调用
+    pub fn _to_string(&self) -> String {
+        self.to_display()
     }
 }
