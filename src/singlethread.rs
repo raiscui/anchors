@@ -412,6 +412,10 @@ pub struct Engine {
     pending_requests: Rc<RefCell<PendingQueue>>,
     #[cfg(feature = "anchors_slotmap")]
     pending_stats: Rc<PendingStatsInner>,
+    #[cfg(feature = "anchors_slotmap")]
+    last_subset_remaining: Rc<RefCell<Vec<NodeKey>>>,
+    #[cfg(feature = "anchors_slotmap")]
+    last_subset_remaining_debug: Rc<RefCell<Vec<String>>>,
 }
 
 struct Mounter {
@@ -504,6 +508,10 @@ impl Engine {
             pending_requests: Rc::new(RefCell::new(PendingQueue::default())),
             #[cfg(feature = "anchors_slotmap")]
             pending_stats: Rc::new(PendingStatsInner::default()),
+            #[cfg(feature = "anchors_slotmap")]
+            last_subset_remaining: Rc::new(RefCell::new(Vec::new())),
+            #[cfg(feature = "anchors_slotmap")]
+            last_subset_remaining_debug: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -529,6 +537,19 @@ impl Engine {
         {
             AnchorsPendingStats::default()
         }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn take_last_subset_remaining_samples(&self) -> (Vec<AnchorToken>, Vec<String>) {
+        let tokens = {
+            let mut slot = self.last_subset_remaining.borrow_mut();
+            slot.drain(..).collect::<Vec<_>>()
+        };
+        let debugs = {
+            let mut slot = self.last_subset_remaining_debug.borrow_mut();
+            slot.drain(..).collect::<Vec<_>>()
+        };
+        (tokens, debugs)
     }
 
     #[inline]
@@ -1025,6 +1046,16 @@ impl Engine {
         let sample_filter_debug = self.describe_tokens(&stats.sample_filter);
         let sample_unmatched_debug = self.describe_tokens(&stats.sample_unmatched);
         let sample_remaining_debug = self.describe_tokens(&stats.sample_remaining);
+        {
+            let mut slot = self.last_subset_remaining.borrow_mut();
+            slot.clear();
+            slot.extend(stats.sample_remaining.iter().copied());
+        }
+        {
+            let mut slot = self.last_subset_remaining_debug.borrow_mut();
+            slot.clear();
+            slot.extend(sample_remaining_debug.iter().cloned());
+        }
         tracing::info!(
             target: "anchors",
             log_event = "pending_subset_drain",
