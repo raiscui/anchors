@@ -11,6 +11,8 @@ use tracing::{debug, error, trace};
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext, Var,
 };
+use crate::singlethread::AnchorToken;
+use emg_common::better_any::TidExt;
 
 use std::{cell::RefCell, fmt::Debug};
 use std::{fmt::Display, rc::Rc};
@@ -512,7 +514,6 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
                 target:"anchors",
                 "dirty,  edge: {:?},  ,type: {:?}",
                 edge,
-                // ng.debug_info.get(),
                 std::any::type_name::<T>(),
             );
         };
