@@ -1609,6 +1609,18 @@ impl Engine {
         out.push_str("digraph Anchors {\n");
         out.push_str("  rankdir=LR;\n");
         out.push_str("  node [shape=box, fontsize=10];\n");
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            let audit = self.token_audit_snapshot();
+            let last = audit
+                .last_deleted_token
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "None".to_string());
+            out.push_str(&format!(
+                "  labelloc=\"t\";\n  label=\"token_next={} | last_deleted={}\";\n",
+                audit.next_token, last
+            ));
+        }
 
         // 打印节点
         for (tok, label) in labels.iter() {
