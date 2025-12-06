@@ -4,7 +4,8 @@ use std::collections::HashSet;
 
 mod slotmap;
 use slotmap::_helpers::{
-    SlotmapStressConfig, new_slotmap_engine, run_creation_drop_cycles, summarize_snapshot_for_snapshots,
+    SlotmapStressConfig, new_slotmap_engine, run_creation_drop_cycles,
+    summarize_snapshot_for_snapshots,
 };
 
 #[test]
