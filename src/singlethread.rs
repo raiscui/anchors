@@ -44,6 +44,15 @@ pub struct AnchorsPendingStats {
     pub last_drain_drained: usize,
 }
 
+/// GUI/观测用的轻量运行时指标。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnchorsMetrics {
+    /// 当前活跃节点数量（仅 slotmap 模式有效）。
+    pub active_nodes: usize,
+    /// 当前进程 RSS，单位字节。
+    pub rss_bytes: u64,
+}
+
 /// The main struct of the Anchors library. Represents a single value on the singlethread recomputation graph.
 ///
 /// You should basically never need to create these with `Anchor::new_from_expert`; instead call functions like `Var::new` and `MultiAnchor::map`
@@ -573,6 +582,25 @@ impl Engine {
         #[cfg(not(feature = "anchors_slotmap"))]
         {
             AnchorsPendingStats::default()
+        }
+    }
+
+    /// 输出 active_nodes 与 RSS，便于 GUI 与日志实时显示。
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> AnchorsMetrics {
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            let active = self.graph.with(|graph| graph.active_nodes());
+            let rss = Self::current_rss_bytes();
+            return AnchorsMetrics {
+                active_nodes: active,
+                rss_bytes: rss,
+            };
+        }
+
+        #[cfg(not(feature = "anchors_slotmap"))]
+        {
+            AnchorsMetrics::default()
         }
     }
 
