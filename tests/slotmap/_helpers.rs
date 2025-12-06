@@ -111,6 +111,6 @@ pub fn summarize_snapshot_for_snapshots(snapshot: &SlotmapCycleSnapshot) -> Vec<
         .tokens
         .iter()
         .zip(snapshot.values.iter())
-        .map(|(token, value)| format!("token={token:?}, value={value}"))
+        .map(|(token, value)| format!("token={}, value={value}", token.raw_token()))
         .collect()
 }

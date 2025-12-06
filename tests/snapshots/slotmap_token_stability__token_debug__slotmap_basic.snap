@@ -1,0 +1,19 @@
+---
+source: anchors/tests/slotmap_token_stability.rs
+assertion_line: 68
+expression: "lines.join(\"\\n\")"
+---
+round #0
+token=0, value=1
+token=1, value=2
+token=2, value=3
+token=3, value=4
+token=4, value=5
+token=5, value=6
+round #1
+token=6, value=2
+token=7, value=3
+token=8, value=4
+token=9, value=5
+token=10, value=6
+token=11, value=7

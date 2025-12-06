@@ -53,6 +53,13 @@ pub struct AnchorsMetrics {
     pub rss_bytes: u64,
 }
 
+/// token 审计信息：用于验证单调递增与删除记录。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenAudit {
+    pub next_token: u64,
+    pub last_deleted_token: Option<u64>,
+}
+
 /// The main struct of the Anchors library. Represents a single value on the singlethread recomputation graph.
 ///
 /// You should basically never need to create these with `Anchor::new_from_expert`; instead call functions like `Var::new` and `MultiAnchor::map`
@@ -601,6 +608,25 @@ impl Engine {
         #[cfg(not(feature = "anchors_slotmap"))]
         {
             AnchorsMetrics::default()
+        }
+    }
+
+    /// 读取 token 计数与最近删除记录，便于验证“单调且不复用”。
+    #[must_use]
+    pub fn token_audit_snapshot(&self) -> TokenAudit {
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            let next = self.graph.token_counter();
+            let last_deleted = self.graph.last_deleted_token();
+            return TokenAudit {
+                next_token: next,
+                last_deleted_token: last_deleted,
+            };
+        }
+
+        #[cfg(not(feature = "anchors_slotmap"))]
+        {
+            TokenAudit::default()
         }
     }
 

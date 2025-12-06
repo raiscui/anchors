@@ -249,6 +249,7 @@ mod node_store {
             if anchor_slot.is_none() {
                 return true;
             }
+            let deleted_token = guard.slot_token.get();
             *anchor_slot = None;
 
             guard.ptrs.handle_count.set(0);
@@ -273,6 +274,7 @@ mod node_store {
             graph
                 .active_nodes
                 .set(graph.active_nodes.get().saturating_sub(1));
+            graph.last_deleted_token.set(Some(deleted_token));
             true
         }
     }
@@ -330,6 +332,8 @@ pub struct Graph2 {
     graph_token: u32,
     #[cfg(feature = "anchors_slotmap")]
     token_counter: Cell<u64>,
+    #[cfg(feature = "anchors_slotmap")]
+    last_deleted_token: Cell<Option<u64>>,
 
     still_alive: Rc<Cell<bool>>,
 
@@ -837,6 +841,16 @@ impl Graph2 {
     }
 
     #[cfg(feature = "anchors_slotmap")]
+    pub fn token_counter(&self) -> u64 {
+        self.token_counter.get()
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn last_deleted_token(&self) -> Option<u64> {
+        self.last_deleted_token.get()
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
     fn enqueue_free_retry(&self, ptr: NodePtr) {
         let mut pending = self.pending_free.borrow_mut();
         if !pending.iter().any(|p| *p == ptr) {
@@ -885,6 +899,8 @@ impl Graph2 {
             active_nodes: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             pending_free: RefCell::new(vec![]),
+            #[cfg(feature = "anchors_slotmap")]
+            last_deleted_token: Cell::new(None),
             recalc_queues: RefCell::new(vec![None; max_height]),
             recalc_min_height: Cell::new(max_height),
             recalc_max_height: Cell::new(0),
