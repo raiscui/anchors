@@ -301,11 +301,36 @@ impl PendingQueue {
                 subset_stats: None,
             };
         }
+        if Self::debug_pending_queue_sample_enabled() && self.len() > 0 {
+            // 仅采样前 20 条 pending 子节点，辅助定位未命中的种子链路
+            const SAMPLE_LIMIT: usize = 20;
+            let mut sample_tokens = Vec::with_capacity(SAMPLE_LIMIT);
+            for bucket in self.buckets.values() {
+                for token in bucket.keys().copied() {
+                    sample_tokens.push(token);
+                    if sample_tokens.len() >= SAMPLE_LIMIT {
+                        break;
+                    }
+                }
+                if sample_tokens.len() >= SAMPLE_LIMIT {
+                    break;
+                }
+            }
+            let sample_raw: Vec<u64> = sample_tokens.iter().map(NodeKey::raw_token).collect();
+            tracing::info!(
+                target: "anchors",
+                log_event = "pending_subset_queue_sample",
+                queue_len = self.len(),
+                sample_raw = ?sample_raw,
+                "pending queue sample before subset drain"
+            );
+        }
         let mut drained = Vec::new();
         let mut empty_priorities = Vec::new();
         let mut parent_match_hits = 0usize;
         let mut allowed = filter.tokens.clone();
-        const SAMPLE: usize = 5;
+        // 采样规模：扩大到 64，便于 subset retry/backfill 捕获更多剩余/未命中 token
+        const SAMPLE: usize = 64;
         for (&priority, bucket) in self.buckets.iter_mut().rev() {
             let mut pending_keys: Vec<NodeKey> = bucket.keys().copied().collect();
             let mut progressed = true;
@@ -397,6 +422,18 @@ impl PendingQueue {
             requests: drained,
             subset_stats: Some(stats),
         }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn debug_pending_queue_sample_enabled() -> bool {
+        use std::sync::OnceLock;
+
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ANCHORS_PENDING_DEBUG_SAMPLE")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -1107,6 +1144,18 @@ impl Engine {
                         .unwrap_or_else(|| format!("#{}", token.raw_token()))
                 })
                 .collect()
+        })
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn debug_pending_queue_sample_enabled() -> bool {
+        use std::sync::OnceLock;
+
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ANCHORS_PENDING_DEBUG_SAMPLE")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+                .unwrap_or(false)
         })
     }
 
