@@ -13,7 +13,7 @@ pub struct Constant<T> {
 }
 
 impl<T: 'static> Constant<T> {
-    /// Creates a new Constant Anchor from some value.
+    // Creates a new Constant Anchor from some value.
     // #[track_caller]
     // #[deprecated]
     // pub fn new<E: Engine>(val: T) -> Anchor<T, E> {

@@ -79,8 +79,7 @@ pub use crate::expert::MultiAnchor;
 use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 
 use generation::Generation;
-#[cfg(feature = "anchors_slotmap")]
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 #[cfg(feature = "anchors_slotmap")]
 use libc::RUSAGE_SELF;
 #[cfg(feature = "anchors_slotmap")]
@@ -90,9 +89,9 @@ use libc::rusage;
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 #[cfg(feature = "anchors_slotmap")]
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -163,14 +162,14 @@ struct PendingRequest {
 #[derive(Default)]
 struct PendingQueue {
     buckets: BTreeMap<PendingPriority, IndexMap<NodeKey, PendingRequest>>,
-    index: HashMap<NodeKey, PendingPriority>,
+    index: IndexMap<NodeKey, PendingPriority>,
 }
 
 #[cfg(feature = "anchors_slotmap")]
 #[derive(Default)]
 struct PendingSubsetFilter {
     /// 需要立刻冲刷的节点 token 集，触发 subset stabilize 时仅处理这些节点。
-    tokens: HashSet<NodeKey>,
+    tokens: IndexSet<NodeKey>,
 }
 
 #[cfg(feature = "anchors_slotmap")]
@@ -285,7 +284,7 @@ impl PendingQueue {
         for (&priority, bucket) in self.buckets.iter_mut().rev() {
             if let Some(token) = bucket.keys().next().copied() {
                 let entry = bucket.shift_remove(&token).expect("pending entry missing");
-                self.index.remove(&token);
+                self.index.shift_remove(&token);
                 result = Some(entry);
             }
             if bucket.is_empty() {
@@ -376,7 +375,7 @@ impl PendingQueue {
                     if matches_parent {
                         parent_match_hits = parent_match_hits.saturating_add(1);
                     }
-                    self.index.remove(&token);
+                    self.index.shift_remove(&token);
                     allowed.insert(entry.child);
                     drained.push(entry);
                 }
@@ -390,11 +389,11 @@ impl PendingQueue {
             self.buckets.remove(&priority);
         }
         let requested_total = filter.len();
-        let drained_set: HashSet<NodeKey> = drained.iter().map(|req| req.child).collect();
+        let drained_set: IndexSet<u64> = drained.iter().map(|req| req.child.raw_token()).collect();
         let unmatched_total = filter
             .tokens
             .iter()
-            .filter(|token| !drained_set.contains(token))
+            .filter(|token| !drained_set.contains(&token.raw_token()))
             .count();
         let mut drained_hist = BTreeMap::new();
         for req in &drained {
@@ -413,7 +412,7 @@ impl PendingQueue {
         let sample_unmatched: Vec<NodeKey> = filter
             .tokens
             .iter()
-            .filter(|token| !drained_set.contains(token))
+            .filter(|token| !drained_set.contains(&token.raw_token()))
             .take(SAMPLE)
             .copied()
             .collect();
@@ -969,7 +968,7 @@ impl Engine {
             return roots.to_vec();
         }
 
-        let mut visited: HashSet<NodeKey> = HashSet::new();
+        let mut visited: IndexSet<NodeKey> = IndexSet::new();
         let mut queue: VecDeque<(NodeKey, usize)> = VecDeque::new();
         for &root in roots {
             if visited.insert(root) {
@@ -1319,10 +1318,10 @@ impl Engine {
             if !lock_trace_enabled() {
                 return;
             }
-            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<IndexMap<u64, LockTraceRecord>>> = OnceLock::new();
             let record = LockTraceRecord { info: info.clone() };
             TRACE_MAP
-                .get_or_init(|| Mutex::new(HashMap::new()))
+                .get_or_init(|| Mutex::new(IndexMap::new()))
                 .lock()
                 .expect("lock trace poisoned")
                 .insert(key, record);
@@ -1333,12 +1332,12 @@ impl Engine {
             if !lock_trace_enabled() {
                 return None;
             }
-            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<IndexMap<u64, LockTraceRecord>>> = OnceLock::new();
             let removed = TRACE_MAP
-                .get_or_init(|| Mutex::new(HashMap::new()))
+                .get_or_init(|| Mutex::new(IndexMap::new()))
                 .lock()
                 .ok()
-                .and_then(|mut map| map.remove(&key));
+                .and_then(|mut map| map.shift_remove(&key));
             if let Some(ref info) = removed {
                 println!(
                     "ANCHORS_LOCK_TRACE: unlock token={} info(first line)={}",
@@ -1353,9 +1352,9 @@ impl Engine {
             if !lock_trace_enabled() {
                 return None;
             }
-            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<IndexMap<u64, LockTraceRecord>>> = OnceLock::new();
             TRACE_MAP
-                .get_or_init(|| Mutex::new(HashMap::new()))
+                .get_or_init(|| Mutex::new(IndexMap::new()))
                 .lock()
                 .ok()
                 .and_then(|map| {
@@ -1428,6 +1427,7 @@ impl Engine {
             }
             let retry = node.recalc_retry.get().saturating_add(1);
             node.recalc_retry.set(retry);
+            #[allow(clippy::manual_is_multiple_of)]
             if retry % 8 == 0 {
                 tracing::warn!(
                     target: "anchors",
@@ -1591,10 +1591,8 @@ impl Engine {
     /// println!("{}", dot);
     /// ```
     pub fn export_dot_from_tokens(&self, roots: &[AnchorToken]) -> String {
-        use std::collections::{HashMap, HashSet, VecDeque};
-
         // 使用 BFS 遍历从 roots 可达的子图
-        let mut visited: HashSet<AnchorToken> = HashSet::new();
+        let mut visited: IndexSet<AnchorToken> = IndexSet::new();
         let mut queue: VecDeque<AnchorToken> = VecDeque::new();
 
         for &r in roots {
@@ -1611,7 +1609,7 @@ impl Engine {
         }
 
         let mut edges: Vec<(AnchorToken, AnchorToken, EdgeKind)> = Vec::new();
-        let mut labels: HashMap<AnchorToken, String> = HashMap::new();
+        let mut labels: IndexMap<AnchorToken, String> = IndexMap::new();
 
         self.graph.with(|graph| {
             while let Some(tok) = queue.pop_front() {
@@ -1701,11 +1699,9 @@ impl Engine {
     pub fn export_dot_from_tokens_with_names(
         &self,
         roots: &[AnchorToken],
-        names: &std::collections::HashMap<AnchorToken, String>,
+        names: &IndexMap<AnchorToken, String>,
     ) -> String {
-        use std::collections::{HashMap, HashSet, VecDeque};
-
-        let mut visited: HashSet<AnchorToken> = HashSet::new();
+        let mut visited: IndexSet<AnchorToken> = IndexSet::new();
         let mut queue: VecDeque<AnchorToken> = VecDeque::new();
         for &r in roots {
             if visited.insert(r) {
@@ -1720,7 +1716,7 @@ impl Engine {
         }
 
         let mut edges: Vec<(AnchorToken, AnchorToken, EdgeKind)> = Vec::new();
-        let mut labels: HashMap<AnchorToken, String> = HashMap::new();
+        let mut labels: IndexMap<AnchorToken, String> = IndexMap::new();
 
         self.graph.with(|graph| {
             while let Some(tok) = queue.pop_front() {
@@ -1871,7 +1867,7 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
 
 fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
     let mut pending = parent.pending_dirty.borrow_mut();
-    if !pending.iter().any(|k| *k == child) {
+    if !pending.contains(&child) {
         pending.push(child);
         if std::env::var("ANCHORS_DEBUG_DIRTY_FLOW")
             .map(|v| v != "0")

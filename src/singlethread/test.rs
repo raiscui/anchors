@@ -20,7 +20,7 @@ fn global_anima_running_add(running: Anchor<bool>) {
     });
 }
 
-fn global_anima_running_build(e: &mut Engine) -> Anchor<bool> {
+fn global_anima_running_build(_engine: &mut Engine) -> Anchor<bool> {
     let watch: Anchor<Vector<bool>> = G_ANIMA_RUNNING_STATE.with(|am| am.watch().into());
     let running: Anchor<bool> = watch.map(|list: &Vector<bool>| list.contains(&true));
     // e.mark_observed(&running);

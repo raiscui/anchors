@@ -1,6 +1,6 @@
 #![cfg(feature = "anchors_slotmap")]
 
-use std::collections::HashSet;
+use indexmap::IndexSet;
 
 mod slotmap;
 use slotmap::_helpers::{
@@ -18,7 +18,7 @@ fn tokens_monotonic_and_not_reused_across_reuse() {
     };
     let snapshots = run_creation_drop_cycles(&mut engine, cfg);
 
-    let mut seen = HashSet::new();
+    let mut seen = IndexSet::new();
     let mut last = None;
     for snap in snapshots {
         for token in snap.tokens {

@@ -225,7 +225,7 @@ mod tests {
     use tracing::debug;
 
     use crate::{
-        expert::{MultiAnchor, var_val_or_anchor::CastIntoValOrAnchor},
+        expert::MultiAnchor,
         singlethread::{Engine, Var, VarVOA},
     };
 

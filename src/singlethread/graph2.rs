@@ -328,7 +328,7 @@ type NodePtr = ag::NodePtr<Node>;
 impl<'gg> fmt::Debug for NodeGuard<'gg> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeGuard")
-            .field("ptr", &unsafe { self.0.make_ptr() })
+            .field("ptr", &self.make_ptr())
             .field("slot_token", &self.slot_token.get())
             .finish()
     }
@@ -368,6 +368,7 @@ pub struct Graph2 {
     free_attempts: Cell<u64>,
     #[cfg(feature = "anchors_slotmap")]
     free_succeeded: Cell<u64>,
+    #[cfg(not(feature = "anchors_slotmap"))]
     graph_token: u32,
     #[cfg(feature = "anchors_slotmap")]
     token_counter: Cell<u64>,
@@ -387,7 +388,7 @@ pub struct Graph2 {
 
 #[derive(Clone, Copy)]
 pub struct Graph2Guard<'gg> {
-    nodes: AgGuard<'gg>,
+    _nodes: AgGuard<'gg>,
     graph: &'gg Graph2,
 }
 
@@ -523,23 +524,30 @@ impl<'a> std::ops::Deref for NodeGuard<'a> {
 }
 
 impl<'a> NodeGuard<'a> {
+    #[inline]
+    fn make_ptr(&self) -> NodePtr {
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            self.0.make_ptr()
+        }
+        #[cfg(not(feature = "anchors_slotmap"))]
+        {
+            unsafe { self.0.make_ptr() }
+        }
+    }
+
     pub fn key(self) -> NodeKey {
         NodeKey {
-            ptr: unsafe { self.0.make_ptr() },
+            ptr: self.make_ptr(),
             token: self.slot_token.get(),
         }
     }
 
     pub fn add_clean_parent(self, parent: NodeGuard<'a>) {
         if self.ptrs.clean_parent0.get().is_none() {
-            self.ptrs
-                .clean_parent0
-                .set(Some(unsafe { parent.0.make_ptr() }))
+            self.ptrs.clean_parent0.set(Some(parent.make_ptr()))
         } else {
-            self.ptrs
-                .clean_parents
-                .borrow_mut()
-                .push(unsafe { parent.0.make_ptr() })
+            self.ptrs.clean_parents.borrow_mut().push(parent.make_ptr())
         }
         if std::env::var("ANCHORS_DEBUG_PARENT_LINK")
             .map(|v| v != "0")
@@ -629,7 +637,7 @@ impl<'a> NodeGuard<'a> {
 
     pub fn add_necessary_child(self, child: NodeGuard<'a>) {
         let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = unsafe { child.0.make_ptr() };
+        let child_ptr = child.make_ptr();
         if let Err(i) = necessary_children.binary_search(&child_ptr) {
             necessary_children.insert(i, child_ptr);
             child.necessary_count.set(child.necessary_count.get() + 1)
@@ -638,7 +646,7 @@ impl<'a> NodeGuard<'a> {
 
     pub fn remove_necessary_child(&self, child: NodeGuard<'a>) {
         let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = unsafe { child.0.make_ptr() };
+        let child_ptr = child.make_ptr();
         if let Ok(i) = necessary_children.binary_search(&child_ptr) {
             necessary_children.remove(i);
             child.necessary_count.set(child.necessary_count.get() - 1)
@@ -888,7 +896,7 @@ impl<'gg> Graph2Guard<'gg> {
             NodeGuard(unsafe { old.lookup_unchecked() })
                 .ptrs
                 .prev
-                .set(Some(unsafe { node.0.make_ptr() }));
+                .set(Some(node.make_ptr()));
             node.ptrs.next.set(Some(old));
         } else {
             if self.graph.recalc_min_height.get() > node_height {
@@ -898,7 +906,7 @@ impl<'gg> Graph2Guard<'gg> {
                 self.graph.recalc_max_height.set(node_height);
             }
         }
-        recalc_queues[node_height] = Some(unsafe { node.0.make_ptr() });
+        recalc_queues[node_height] = Some(node.make_ptr());
     }
 
     /// 强制入队：无视 Pending/locked 状态，先摘旧队列再入队（主要用于解锁后补偿重算）。
@@ -959,12 +967,14 @@ impl Graph2 {
         self.free_skip.set(self.free_skip.get().saturating_add(1));
     }
 
+    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     fn inc_free_attempt(&self) {
         self.free_attempts
             .set(self.free_attempts.get().saturating_add(1));
     }
 
+    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     fn inc_free_succeeded(&self) {
         self.free_succeeded
@@ -1020,6 +1030,7 @@ impl Graph2 {
             nodes: ag::NodeStore::new(),
             #[cfg(not(feature = "anchors_slotmap"))]
             nodes: ag::Graph::new(),
+            #[cfg(not(feature = "anchors_slotmap"))]
             graph_token: NEXT_TOKEN.with(|token| {
                 let n = token.get();
                 token.set(n + 1);
@@ -1051,7 +1062,10 @@ impl Graph2 {
 
     pub fn with<F: for<'any> FnOnce(Graph2Guard<'any>) -> R, R>(&self, func: F) -> R {
         let nodes = unsafe { self.nodes.with_unchecked() };
-        func(Graph2Guard { nodes, graph: self })
+        func(Graph2Guard {
+            _nodes: nodes,
+            graph: self,
+        })
     }
 
     #[cfg(test)]
@@ -1221,7 +1235,7 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
     let mut recalc_queues = graph.recalc_queues.borrow_mut();
     let mut head_ptr = recalc_queues.get(height_idx).copied().flatten();
 
-    let target_ptr = unsafe { node.0.make_ptr() };
+    let target_ptr = node.make_ptr();
     let mut found_prev: Option<NodePtr> = None;
     let mut found_cur: Option<NodePtr> = None;
 

@@ -14,7 +14,8 @@ mod tests {
         let tb = b.watch().token();
         // 在 arena_graph 下，同一 Graph2 内所有节点 token 应相同（graph_token），以区别 slotmap 递增行为。
         assert_eq!(
-            ta.token, tb.token,
+            ta.raw_token(),
+            tb.raw_token(),
             "fallback 预期 token 相同，表示未启用 slotmap"
         );
         assert_eq!(engine.get(&a.watch()), 1);

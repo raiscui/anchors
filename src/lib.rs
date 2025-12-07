@@ -105,7 +105,7 @@ mod xxx {
     fn ffff() {
         let mut fnn = |x: &i32, y: &i32| x + y + 1;
         let r: i32 = fnn.call_into((&2, &3));
-        let s: i64 = 1i32.into();
+        let _s: i64 = 1i32.into();
         assert_eq!(r, 6);
     }
 }

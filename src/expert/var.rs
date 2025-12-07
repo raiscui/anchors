@@ -1,4 +1,4 @@
-use tracing::{debug_span, error, trace, warn};
+use tracing::{error, trace};
 
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext,
@@ -47,7 +47,6 @@ where
 }
 
 /// A setter that can update values inside an associated `VarAnchor`.
-
 pub struct Var<T, E: Engine> {
     inner: Rc<RefCell<VarShared<T, E>>>,
     anchor: Anchor<T, E>,

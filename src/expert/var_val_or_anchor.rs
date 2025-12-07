@@ -11,8 +11,6 @@ use tracing::{debug, error, trace};
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext, Var,
 };
-use crate::singlethread::AnchorToken;
-use emg_common::better_any::TidExt;
 
 use std::{cell::RefCell, fmt::Debug};
 use std::{fmt::Display, rc::Rc};
@@ -45,7 +43,6 @@ where
 }
 
 /// A setter that can update values inside an associated `VarAnchor`.
-
 pub struct VarVOA<T, E: Engine> {
     inner: Rc<RefCell<VarEAShared<T, E>>>,
     anchor: Anchor<T, E>,

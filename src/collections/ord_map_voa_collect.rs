@@ -102,8 +102,8 @@ where
     }
 }
 
-/// 过渡器：将 `ValOrAnchor` 预先“固化”为稳定的 Anchor，再复用已有的 `OrdMapCollect`。
-/// 好处：依赖图在构造时就成型，避免在 `poll_updated` 过程中临时变更依赖链引发重入。
+// 过渡器：将 `ValOrAnchor` 预先“固化”为稳定的 Anchor，再复用已有的 `OrdMapCollect`。
+// 好处：依赖图在构造时就成型，避免在 `poll_updated` 过程中临时变更依赖链引发重入。
 // pub struct OrdMapVOACollect;
 
 // impl OrdMapVOACollect {
