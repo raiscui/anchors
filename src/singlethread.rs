@@ -779,58 +779,94 @@ impl Engine {
         }
     }
 
+    #[cfg(feature = "anchors_slotmap")]
+    #[inline]
+    fn fast_path_ready_value<O: Clone + 'static>(&self, anchor: &Anchor<O>) -> Option<O> {
+        if !self.dirty_marks.borrow().is_empty() {
+            return None;
+        }
+        if !self.pending_requests.borrow().is_empty() {
+            return None;
+        }
+        self.graph.with(|graph| {
+            if graph.has_recalc_pending() || graph.has_pending_free() {
+                return None;
+            }
+            let node = graph.get(anchor.token())?;
+            if graph2::recalc_state(node) != RecalcState::Ready {
+                return None;
+            }
+            if node.anchor_locked.get() {
+                return None;
+            }
+            Some(graph.output_cached(self, node))
+        })
+    }
+
+    #[inline]
+    fn ready_node<'gg>(
+        &self,
+        graph: &Graph2Guard<'gg>,
+        key: NodeKey,
+        context: &str,
+    ) -> graph2::NodeGuard<'gg> {
+        let mut retries: u8 = 0;
+        loop {
+            let node = self.expect_node(graph, key, context);
+            if graph2::recalc_state(node) != RecalcState::Ready {
+                graph.queue_recalc(node);
+            } else if node.anchor_locked.get() {
+                node.anchor_locked.set(false);
+                graph.queue_recalc_force(node);
+            } else {
+                return node;
+            }
+            self.stabilize0();
+            retries = retries.saturating_add(1);
+            if retries > 3 {
+                panic!(
+                    "slotmap: anchor locked or pending after stabilize {:?}",
+                    node.debug_info.get()
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn read_ready_output<O: Clone + 'static>(
+        &self,
+        node: graph2::NodeGuard<'_>,
+        context: &str,
+    ) -> O {
+        let target_anchor = unsafe { &*node.anchor.get() };
+        let inner = target_anchor.as_ref().unwrap_or_else(|| {
+            panic!(
+                "slotmap: 节点已被删除或 token 失效，无法执行操作：{}，token={:?}",
+                context,
+                node.key()
+            )
+        });
+        inner
+            .output(&mut EngineContext { engine: self })
+            .downcast_ref::<O>()
+            .unwrap()
+            .clone()
+    }
+
     /// Retrieves the value of an Anchor, recalculating dependencies as necessary to get the
     /// latest value.
     pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
+        #[cfg(feature = "anchors_slotmap")]
+        if let Some(val) = self.fast_path_ready_value(anchor) {
+            return val;
+        }
+
         // 在读取前主动标记为 observed，确保父链路必要关系被建立，避免 clean_parents 被回收后无法向上脏传播。
         // self.mark_observed(anchor);
-        // stabilize once before, since the stabilization process may mark our requested node
-        // as dirty
         self.stabilize();
         self.graph.with(|graph| {
-            let anchor_node = self.expect_node(&graph, anchor.token(), "get::<O> 读取节点");
-            if graph2::recalc_state(anchor_node) != RecalcState::Ready {
-                trace!(
-                    "graph2::recalc_state(anchor_node) != RecalcState::Ready ,{:?}",
-                    anchor_node.debug_info.get()
-                );
-                graph.queue_recalc(anchor_node);
-                // stabilize again, to make sure our target node that is now in the queue is up-to-date
-                // use stabilize0 because no dirty marks have occured since last stabilization, and we want
-                // to make sure we don't unnecessarily increment generation number
-                self.stabilize0();
-            }
-            let mut retry = 0u8;
-            loop {
-                if anchor_node.anchor_locked.get() {
-                    // 若节点残留锁且未在栈上重算，强制解锁并入队补偿，避免永远卡死。
-                    anchor_node.anchor_locked.set(false);
-                    graph.queue_recalc_force(anchor_node);
-                    self.stabilize0();
-                    retry = retry.saturating_add(1);
-                    if retry > 3 {
-                        panic!(
-                            "slotmap: anchor locked after stabilize {:?}",
-                            anchor_node.debug_info.get()
-                        );
-                    }
-                    continue;
-                }
-
-                let target_anchor = unsafe { &*anchor_node.anchor.get() };
-                if let Some(inner) = target_anchor.as_ref() {
-                    break inner
-                        .output(&mut EngineContext { engine: self })
-                        .downcast_ref::<O>()
-                        .unwrap()
-                        .clone();
-                } else {
-                    panic!(
-                        "slotmap: 节点已被删除或 token 失效，无法执行操作 get::<O> 读取节点，token={:?}",
-                        anchor.token()
-                    );
-                }
-            }
+            let anchor_node = self.ready_node(&graph, anchor.token(), "get::<O> 读取节点");
+            self.read_ready_output(anchor_node, "get::<O> 读取节点")
         })
     }
     pub fn get_with<O: Clone + 'static, F: FnOnce(&O) -> R, R>(
@@ -843,19 +879,8 @@ impl Engine {
         // as dirty
         self.stabilize();
         self.graph.with(|graph| {
-            let anchor_node = self.expect_node(&graph, anchor.token(), "get_with 读取节点");
-            if graph2::recalc_state(anchor_node) != RecalcState::Ready {
-                graph.queue_recalc(anchor_node);
-                // stabilize again, to make sure our target node that is now in the queue is up-to-date
-                // use stabilize0 because no dirty marks have occured since last stabilization, and we want
-                // to make sure we don't unnecessarily increment generation number
-                self.stabilize0();
-            }
-            let target_node = self.expect_node(&graph, anchor.token(), "get_with 读取 anchor");
-            if target_node.anchor_locked.get() {
-                graph.queue_recalc(target_node);
-                self.stabilize0();
-            }
+            let target_node =
+                self.ready_node(&graph, anchor.token(), "get_with 读取 anchor/output");
             let borrowed = unsafe { &*target_node.anchor.get() };
             let o = borrowed
                 .as_ref()
@@ -1052,13 +1077,24 @@ impl Engine {
                     let rss = Self::current_rss_bytes();
                     let active = graph.active_nodes();
                     let gc_stats = graph.gc_stats();
+                    let loss_ppm = gc_stats.loss_ppm();
+                    let loss_pct = loss_ppm as f64 / 10.0;
+                    let skip_total = gc_stats
+                        .gc_skipped
+                        .saturating_add(gc_stats.free_skip)
+                        .saturating_add(gc_stats.pending_free as u64);
                     tracing::info!(
                         target: "anchors",
                         active_nodes = active,
                         rss_bytes = rss,
                         gc_skipped = gc_stats.gc_skipped,
                         free_skip = gc_stats.free_skip,
+                        free_attempts = gc_stats.free_attempts,
+                        free_succeeded = gc_stats.free_succeeded,
                         pending_free = gc_stats.pending_free,
+                        gc_loss_ppm = loss_ppm,
+                        gc_loss_pct = loss_pct,
+                        gc_loss_n = skip_total,
                         "anchors.active_nodes snapshot"
                     );
                 }

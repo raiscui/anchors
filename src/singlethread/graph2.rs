@@ -206,6 +206,7 @@ mod node_store {
             let guard = super::NodeGuard(raw_guard);
             // unsafe: graph 指针由 slotmap 生成，与当前节点同生灭。
             let graph: &super::Graph2 = unsafe { &*guard.ptrs.graph };
+            graph.inc_free_attempt();
             if guard.anchor_locked.get() {
                 graph.inc_gc_skipped();
                 return false;
@@ -279,6 +280,7 @@ mod node_store {
                 .active_nodes
                 .set(graph.active_nodes.get().saturating_sub(1));
             graph.last_deleted_token.set(Some(deleted_token));
+            graph.inc_free_succeeded();
             true
         }
     }
@@ -302,7 +304,23 @@ pub struct NodeGuard<'gg>(ag::NodeGuard<'gg, Node>);
 pub struct GcStatsSnapshot {
     pub gc_skipped: u64,
     pub free_skip: u64,
+    pub free_attempts: u64,
+    pub free_succeeded: u64,
     pub pending_free: usize,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl GcStatsSnapshot {
+    /// 计算 gc_skipped/free_skip 与 pending_free 的总占比，单位千分比。
+    #[inline]
+    pub fn loss_ppm(&self) -> u64 {
+        let attempts = self.free_attempts.max(1);
+        let skipped = self
+            .gc_skipped
+            .saturating_add(self.free_skip)
+            .saturating_add(self.pending_free as u64);
+        skipped.saturating_mul(1000) / attempts
+    }
 }
 
 type NodePtr = ag::NodePtr<Node>;
@@ -346,6 +364,10 @@ pub struct Graph2 {
     gc_skipped: Cell<u64>,
     #[cfg(feature = "anchors_slotmap")]
     free_skip: Cell<u64>,
+    #[cfg(feature = "anchors_slotmap")]
+    free_attempts: Cell<u64>,
+    #[cfg(feature = "anchors_slotmap")]
+    free_succeeded: Cell<u64>,
     graph_token: u32,
     #[cfg(feature = "anchors_slotmap")]
     token_counter: Cell<u64>,
@@ -663,6 +685,31 @@ impl<'gg> Graph2Guard<'gg> {
     }
 
     #[cfg(feature = "anchors_slotmap")]
+    #[inline]
+    pub fn has_recalc_pending(&self) -> bool {
+        let queues = self.graph.recalc_queues.borrow();
+        let max_height = self.graph.recalc_max_height.get();
+        let mut idx = self.graph.recalc_min_height.get();
+        if queues.is_empty() || idx > max_height {
+            return false;
+        }
+        idx = idx.min(queues.len().saturating_sub(1));
+        while idx <= max_height && idx < queues.len() {
+            if queues[idx].is_some() {
+                return true;
+            }
+            idx = idx.saturating_add(1);
+        }
+        false
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    #[inline]
+    pub fn has_pending_free(&self) -> bool {
+        !self.graph.pending_free.borrow().is_empty()
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
     pub fn retry_pending_free(&self) {
         self.graph.retry_pending_free();
     }
@@ -912,11 +959,25 @@ impl Graph2 {
         self.free_skip.set(self.free_skip.get().saturating_add(1));
     }
 
+    #[inline]
+    fn inc_free_attempt(&self) {
+        self.free_attempts
+            .set(self.free_attempts.get().saturating_add(1));
+    }
+
+    #[inline]
+    fn inc_free_succeeded(&self) {
+        self.free_succeeded
+            .set(self.free_succeeded.get().saturating_add(1));
+    }
+
     #[cfg(feature = "anchors_slotmap")]
     pub fn gc_stats_snapshot(&self) -> GcStatsSnapshot {
         GcStatsSnapshot {
             gc_skipped: self.gc_skipped.get(),
             free_skip: self.free_skip.get(),
+            free_attempts: self.free_attempts.get(),
+            free_succeeded: self.free_succeeded.get(),
             pending_free: self.pending_free.borrow().len(),
         }
     }
@@ -974,6 +1035,10 @@ impl Graph2 {
             gc_skipped: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             free_skip: Cell::new(0),
+            #[cfg(feature = "anchors_slotmap")]
+            free_attempts: Cell::new(0),
+            #[cfg(feature = "anchors_slotmap")]
+            free_succeeded: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             last_deleted_token: Cell::new(None),
             recalc_queues: RefCell::new(vec![None; max_height]),
@@ -1096,6 +1161,10 @@ pub fn ensure_height_increases<'a>(
 }
 
 fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
+    // 剪枝：高度已满足，无需递归向上回填。
+    if height(node) >= min_height {
+        return Ok(());
+    }
     if node.visited.get() {
         return Err(());
     }
@@ -1105,7 +1174,10 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
         if height(node) < min_height {
             node.ptrs.height.set(min_height);
             let mut did_err = false;
-            for parent in node.clean_parents() {
+            // 迭代式堆栈，避免深链递归爆栈与重复 visited 标记。
+            let mut stack = Vec::with_capacity(4);
+            node.for_each_parent(|p| stack.push(p));
+            while let Some(parent) = stack.pop() {
                 if let Err(_loop_ids) = set_min_height(parent, min_height + 1) {
                     did_err = true;
                 }
