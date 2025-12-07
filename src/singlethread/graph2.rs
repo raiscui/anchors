@@ -207,10 +207,12 @@ mod node_store {
             // unsafe: graph 指针由 slotmap 生成，与当前节点同生灭。
             let graph: &super::Graph2 = unsafe { &*guard.ptrs.graph };
             if guard.anchor_locked.get() {
+                graph.inc_gc_skipped();
                 return false;
             }
 
             if unsafe { (&*guard.anchor.get()).is_none() } {
+                graph.inc_free_skip();
                 return true;
             }
 
@@ -227,6 +229,7 @@ mod node_store {
                     false
                 };
             if !drained_children {
+                graph.inc_gc_skipped();
                 return false;
             }
 
@@ -240,6 +243,7 @@ mod node_store {
                 false
             };
             if !drained_parents {
+                graph.inc_gc_skipped();
                 return false;
             }
 
@@ -292,6 +296,15 @@ use std::iter::Iterator;
 #[derive(PartialEq, Clone, Copy)]
 pub struct NodeGuard<'gg>(ag::NodeGuard<'gg, Node>);
 
+/// slotmap GC 计数快照，用于日志与观测。
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcStatsSnapshot {
+    pub gc_skipped: u64,
+    pub free_skip: u64,
+    pub pending_free: usize,
+}
+
 type NodePtr = ag::NodePtr<Node>;
 
 impl<'gg> fmt::Debug for NodeGuard<'gg> {
@@ -329,6 +342,10 @@ pub struct Graph2 {
     active_nodes: Cell<usize>,
     #[cfg(feature = "anchors_slotmap")]
     pending_free: RefCell<Vec<NodePtr>>,
+    #[cfg(feature = "anchors_slotmap")]
+    gc_skipped: Cell<u64>,
+    #[cfg(feature = "anchors_slotmap")]
+    free_skip: Cell<u64>,
     graph_token: u32,
     #[cfg(feature = "anchors_slotmap")]
     token_counter: Cell<u64>,
@@ -543,6 +560,34 @@ impl<'a> NodeGuard<'a> {
         out
     }
 
+    /// 遍历父节点，不分配临时 Vec，在线性链路上更轻量。
+    pub fn for_each_parent(&self, mut f: impl FnMut(NodeGuard<'a>)) {
+        if let Some(first) = self.ptrs.clean_parent0.get() {
+            f(NodeGuard(unsafe { first.lookup_unchecked() }));
+        }
+        for ptr in self.ptrs.clean_parents.borrow().iter().copied() {
+            f(NodeGuard(unsafe { ptr.lookup_unchecked() }));
+        }
+    }
+
+    /// 取出并清空父节点列表，供 mark_dirty 等热路径复用。
+    pub fn drain_parents(&self, mut f: impl FnMut(NodeGuard<'a>)) {
+        if let Some(first) = self.ptrs.clean_parent0.get() {
+            self.ptrs.clean_parent0.set(None);
+            f(NodeGuard(unsafe { first.lookup_unchecked() }));
+        }
+        let mut parents = self.ptrs.clean_parents.borrow_mut();
+        for ptr in parents.drain(..) {
+            f(NodeGuard(unsafe { ptr.lookup_unchecked() }));
+        }
+    }
+
+    /// 父节点数量，用于日志统计，避免 Vec 分配。
+    pub fn parents_len(&self) -> usize {
+        let extra = self.ptrs.clean_parents.borrow().len();
+        extra + usize::from(self.ptrs.clean_parent0.get().is_some())
+    }
+
     pub fn drain_clean_parents(&self) -> Vec<NodeGuard<'a>> {
         let res = self.clean_parents();
         self.ptrs.clean_parent0.set(None);
@@ -610,6 +655,11 @@ impl<'gg> Graph2Guard<'gg> {
     #[cfg(feature = "anchors_slotmap")]
     pub fn active_nodes(&self) -> usize {
         self.graph.active_nodes.get()
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn gc_stats(&self) -> GcStatsSnapshot {
+        self.graph.gc_stats_snapshot()
     }
 
     #[cfg(feature = "anchors_slotmap")]
@@ -851,6 +901,27 @@ impl Graph2 {
     }
 
     #[cfg(feature = "anchors_slotmap")]
+    #[inline]
+    fn inc_gc_skipped(&self) {
+        self.gc_skipped.set(self.gc_skipped.get().saturating_add(1));
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    #[inline]
+    fn inc_free_skip(&self) {
+        self.free_skip.set(self.free_skip.get().saturating_add(1));
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    pub fn gc_stats_snapshot(&self) -> GcStatsSnapshot {
+        GcStatsSnapshot {
+            gc_skipped: self.gc_skipped.get(),
+            free_skip: self.free_skip.get(),
+            pending_free: self.pending_free.borrow().len(),
+        }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
     fn enqueue_free_retry(&self, ptr: NodePtr) {
         let mut pending = self.pending_free.borrow_mut();
         if !pending.iter().any(|p| *p == ptr) {
@@ -899,6 +970,10 @@ impl Graph2 {
             active_nodes: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             pending_free: RefCell::new(vec![]),
+            #[cfg(feature = "anchors_slotmap")]
+            gc_skipped: Cell::new(0),
+            #[cfg(feature = "anchors_slotmap")]
+            free_skip: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             last_deleted_token: Cell::new(None),
             recalc_queues: RefCell::new(vec![None; max_height]),

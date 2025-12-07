@@ -16,6 +16,8 @@ use graph2::{Graph2, Graph2Guard, NodeGuard, NodeKey, RecalcState};
 use tracing::trace;
 
 pub use graph2::AnchorHandle;
+#[cfg(feature = "anchors_slotmap")]
+pub use graph2::GcStatsSnapshot;
 pub use graph2::NodeKey as AnchorToken;
 
 #[cfg(feature = "anchors_slotmap")]
@@ -611,6 +613,13 @@ impl Engine {
         }
     }
 
+    /// 读取 slotmap GC 计数（gc_skipped / free_skip / pending_free）。
+    #[cfg(feature = "anchors_slotmap")]
+    #[must_use]
+    pub fn slotmap_gc_stats(&self) -> GcStatsSnapshot {
+        self.graph.gc_stats_snapshot()
+    }
+
     /// 读取 token 计数与最近删除记录，便于验证“单调且不复用”。
     #[must_use]
     pub fn token_audit_snapshot(&self) -> TokenAudit {
@@ -1042,10 +1051,14 @@ impl Engine {
                 if std::env::var("ANCHORS_ACTIVE_NODES_LOG").is_ok() {
                     let rss = Self::current_rss_bytes();
                     let active = graph.active_nodes();
+                    let gc_stats = graph.gc_stats();
                     tracing::info!(
                         target: "anchors",
                         active_nodes = active,
                         rss_bytes = rss,
+                        gc_skipped = gc_stats.gc_skipped,
+                        free_skip = gc_stats.free_skip,
+                        pending_free = gc_stats.pending_free,
                         "anchors.active_nodes snapshot"
                     );
                 }
@@ -1778,15 +1791,14 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
             .map(|v| v != "0")
             .unwrap_or(false)
         {
-            let parents_len = node.clean_parents().len();
+            let parents_len = node.parents_len();
             println!(
                 "mark_dirty skip_self node={:?} parents={}",
                 node.debug_info.get()._to_string(),
                 parents_len
             );
         }
-        let parents = node.drain_clean_parents();
-        for parent in parents {
+        node.drain_parents(|parent| {
             push_pending_dirty(parent, node.key());
             if parent.anchor_locked.get() {
                 // 父节点正在重算，记录一次补偿重算请求，解锁后再统一入队，避免 strict 模式下的重入 panic。
@@ -1811,11 +1823,11 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
                 }
                 // 直接补偿入队一次：如果当下锁未释放，队列弹出时会跳过，等解锁后可正常重算。
                 graph.queue_recalc_force(parent);
-                continue;
+                return;
             }
             graph.queue_recalc(parent);
             mark_dirty0(graph, parent);
-        }
+        });
     } else {
         mark_dirty0(graph, node);
     }
@@ -1853,7 +1865,6 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
         }
     } else if graph2::recalc_state(next) == RecalcState::Ready {
         graph2::needs_recalc(next);
-        let parents = next.clean_parents();
         if std::env::var("ANCHORS_DEBUG_MARK")
             .map(|v| v != "0")
             .unwrap_or(false)
@@ -1861,16 +1872,16 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
             println!(
                 "mark_dirty0 unnecessary node={:?} parents={}",
                 next.debug_info.get()._to_string(),
-                parents.len()
+                next.parents_len()
             );
         }
-        for parent in parents {
+        next.for_each_parent(|parent| {
             push_pending_dirty(parent, id);
             if !parent.anchor_locked.get() {
                 graph.queue_recalc(parent);
                 mark_dirty0(graph, parent);
             }
-        }
+        });
     }
 }
 
