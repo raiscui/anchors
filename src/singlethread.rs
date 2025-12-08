@@ -78,6 +78,9 @@ pub use crate::expert::MultiAnchor;
 
 use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 
+use emg_hasher::std::HashMap;
+#[cfg(feature = "anchors_slotmap")]
+use emg_hasher::std::HashSet;
 use generation::Generation;
 use indexmap::{IndexMap, IndexSet};
 #[cfg(feature = "anchors_slotmap")]
@@ -91,9 +94,7 @@ use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
 #[cfg(feature = "anchors_slotmap")]
 use std::collections::BTreeMap;
-#[cfg(feature = "anchors_slotmap")]
-use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -1323,7 +1324,7 @@ impl Engine {
             static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             let record = LockTraceRecord { info: info.clone() };
             TRACE_MAP
-                .get_or_init(|| Mutex::new(HashMap::new()))
+                .get_or_init(|| Mutex::new(HashMap::default()))
                 .lock()
                 .expect("lock trace poisoned")
                 .insert(key, record);
@@ -1336,7 +1337,7 @@ impl Engine {
             }
             static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             let removed = TRACE_MAP
-                .get_or_init(|| Mutex::new(HashMap::new()))
+                .get_or_init(|| Mutex::new(HashMap::default()))
                 .lock()
                 .ok()
                 .and_then(|mut map| map.remove(&key));
@@ -1356,7 +1357,7 @@ impl Engine {
             }
             static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             TRACE_MAP
-                .get_or_init(|| Mutex::new(HashMap::new()))
+                .get_or_init(|| Mutex::new(HashMap::default()))
                 .lock()
                 .ok()
                 .and_then(|map| {
