@@ -91,7 +91,9 @@ use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
 #[cfg(feature = "anchors_slotmap")]
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
+#[cfg(feature = "anchors_slotmap")]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -162,7 +164,7 @@ struct PendingRequest {
 #[derive(Default)]
 struct PendingQueue {
     buckets: BTreeMap<PendingPriority, IndexMap<NodeKey, PendingRequest>>,
-    index: IndexMap<NodeKey, PendingPriority>,
+    index: HashMap<NodeKey, PendingPriority>,
 }
 
 #[cfg(feature = "anchors_slotmap")]
@@ -284,7 +286,7 @@ impl PendingQueue {
         for (&priority, bucket) in self.buckets.iter_mut().rev() {
             if let Some(token) = bucket.keys().next().copied() {
                 let entry = bucket.shift_remove(&token).expect("pending entry missing");
-                self.index.shift_remove(&token);
+                self.index.remove(&token);
                 result = Some(entry);
             }
             if bucket.is_empty() {
@@ -375,7 +377,7 @@ impl PendingQueue {
                     if matches_parent {
                         parent_match_hits = parent_match_hits.saturating_add(1);
                     }
-                    self.index.shift_remove(&token);
+                    self.index.remove(&token);
                     allowed.insert(entry.child);
                     drained.push(entry);
                 }
@@ -389,11 +391,11 @@ impl PendingQueue {
             self.buckets.remove(&priority);
         }
         let requested_total = filter.len();
-        let drained_set: IndexSet<u64> = drained.iter().map(|req| req.child.raw_token()).collect();
+        let drained_set: HashSet<NodeKey> = drained.iter().map(|req| req.child).collect();
         let unmatched_total = filter
             .tokens
             .iter()
-            .filter(|token| !drained_set.contains(&token.raw_token()))
+            .filter(|token| !drained_set.contains(token))
             .count();
         let mut drained_hist = BTreeMap::new();
         for req in &drained {
@@ -412,7 +414,7 @@ impl PendingQueue {
         let sample_unmatched: Vec<NodeKey> = filter
             .tokens
             .iter()
-            .filter(|token| !drained_set.contains(&token.raw_token()))
+            .filter(|token| !drained_set.contains(token))
             .take(SAMPLE)
             .copied()
             .collect();
@@ -1318,10 +1320,10 @@ impl Engine {
             if !lock_trace_enabled() {
                 return;
             }
-            static TRACE_MAP: OnceLock<Mutex<IndexMap<u64, LockTraceRecord>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             let record = LockTraceRecord { info: info.clone() };
             TRACE_MAP
-                .get_or_init(|| Mutex::new(IndexMap::new()))
+                .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .expect("lock trace poisoned")
                 .insert(key, record);
@@ -1332,12 +1334,12 @@ impl Engine {
             if !lock_trace_enabled() {
                 return None;
             }
-            static TRACE_MAP: OnceLock<Mutex<IndexMap<u64, LockTraceRecord>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             let removed = TRACE_MAP
-                .get_or_init(|| Mutex::new(IndexMap::new()))
+                .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .ok()
-                .and_then(|mut map| map.shift_remove(&key));
+                .and_then(|mut map| map.remove(&key));
             if let Some(ref info) = removed {
                 println!(
                     "ANCHORS_LOCK_TRACE: unlock token={} info(first line)={}",
@@ -1352,9 +1354,9 @@ impl Engine {
             if !lock_trace_enabled() {
                 return None;
             }
-            static TRACE_MAP: OnceLock<Mutex<IndexMap<u64, LockTraceRecord>>> = OnceLock::new();
+            static TRACE_MAP: OnceLock<Mutex<HashMap<u64, LockTraceRecord>>> = OnceLock::new();
             TRACE_MAP
-                .get_or_init(|| Mutex::new(IndexMap::new()))
+                .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .ok()
                 .and_then(|map| {
