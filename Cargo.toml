@@ -24,7 +24,6 @@ lock_strict = []
 
 [dependencies]
 cfg-if = "1.0.0"
-im-rc = { workspace = true }
 
 # imbl = "2.0.0"
 

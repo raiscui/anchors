@@ -6,7 +6,7 @@
  * @Description:
  */
 
-use crate::im::OrdSet;
+use crate::im_rc::OrdSet;
 use tracing::trace;
 
 use crate::expert::{
@@ -118,7 +118,7 @@ where
 #[cfg(test)]
 mod test {
 
-    use crate::im::{OrdSet, ordset};
+    use crate::im_rc::{OrdSet, ordset};
 
     use crate::singlethread::*;
 

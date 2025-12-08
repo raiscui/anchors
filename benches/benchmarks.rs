@@ -6,7 +6,7 @@ use anchors::{
 
 use smallvec::{SmallVec, smallvec};
 
-use anchors::im::{Vector, ordmap, vector};
+use anchors::im_rc::{Vector, ordmap, vector};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 fn stabilize_linear_nodes_simple(c: &mut Criterion) {

@@ -29,7 +29,7 @@ SlotMap 流程建议跑 `cargo test --test slotmap_pending_requests`.
 ## 编码风格与命名约定
 `Cargo.toml` 配置 `edition = "2024"`, 需在 nightly 下编译.
 变量保持驼峰, 模块与类型遵循 Rust 惯例.
-`im::OrdMap` 等不可变结构非常常见.
+`im_rc::OrdMap` 等不可变结构非常常见.
 需要注释解释设计, 但避免冗长.
 `singlethread.rs` 已有中文注释, 新增文本需匹配语气.
 

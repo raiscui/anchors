@@ -2,7 +2,7 @@ use tracing::debug;
 
 use crate::{
     expert::MultiAnchor,
-    im::{OrdMap, ordmap::DiffItem},
+    im_rc::{OrdMap, ordmap::DiffItem},
 };
 
 use crate::expert::{Anchor, Engine};
@@ -72,7 +72,7 @@ where
         pool_size: usize,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        let pool = crate::im::ordmap::OrdMapPool::new(pool_size);
+        let pool = crate::im_rc::ordmap::OrdMapPool::new(pool_size);
         let dict = OrdMap::with_pool(&pool);
 
         self.unordered_fold(dict, move |out, diff_item, len| {
@@ -132,7 +132,7 @@ where
         anchor: &Anchor<A, E>,
         mut f: F,
     ) -> Anchor<Dict<K, T>, E> {
-        let pool = crate::im::ordmap::OrdMapPool::new(pool_size);
+        let pool = crate::im_rc::ordmap::OrdMapPool::new(pool_size);
         let dict = OrdMap::with_pool(&pool);
 
         self.unordered_fold_with_anchor(anchor, dict, move |a, out, diff_item, len| {
@@ -321,7 +321,7 @@ where
 mod test {
 
     // use imbl::ordmap;
-    use crate::im::ordmap;
+    use crate::im_rc::ordmap;
 
     use crate::singlethread::Var;
 

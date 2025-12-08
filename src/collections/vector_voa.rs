@@ -1,13 +1,14 @@
 /*
  * @Author: Rais
  * @Date: 2023-04-04 23:56:14
- * @LastEditTime: 2023-04-18 12:22:14
+ * @LastEditTime: 2025-12-09 01:29:54
  * @LastEditors: Rais
  * @Description:
  */
-use im_rc::vector;
+use crate::im_rc::Vector;
+use crate::im_rc::vector;
 
-use crate::{expert::ValOrAnchor, im::Vector};
+use crate::expert::ValOrAnchor;
 
 use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
@@ -231,7 +232,7 @@ mod test {
 
     use crate::{
         expert::CastIntoValOrAnchor,
-        im::{Vector, vector},
+        im_rc::{Vector, vector},
     };
 
     use crate::singlethread::*;

@@ -1,12 +1,12 @@
 /*
  * @Author: Rais
  * @Date: 2023-04-03 14:30:01
- * @LastEditTime: 2025-11-24 22:55:38
+ * @LastEditTime: 2025-12-09 01:17:15
  * @LastEditors: Rais
  * @Description:
  */
 
-use im_rc::ordmap;
+use crate::im_rc::ordmap;
 
 use crate::{
     // collections::ord_map_collect::OrdMapCollect,
@@ -14,7 +14,7 @@ use crate::{
         Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext, ValOrAnchor,
         constant::Constant,
     },
-    im::OrdMap,
+    im_rc::OrdMap,
 };
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -282,7 +282,7 @@ where
 #[cfg(test)]
 mod test {
 
-    use crate::{collections::ord_map_methods::Dict, im::OrdMap};
+    use crate::{collections::ord_map_methods::Dict, im_rc::OrdMap};
 
     use crate::{dict, singlethread::*};
 

@@ -17,7 +17,7 @@ pub mod singlethread;
 // ────────────────────────────────────────────────────────────────────────────────
 
 // pub use imbl as im;
-pub use im_rc as im;
+pub use emg_hasher::im_rc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -142,14 +142,12 @@ mod tests {
     }
 }
 
-// #[macro_use]
-// use im::ordmap::OrdMap;
 #[macro_export]
 macro_rules! dict {
-    () => { $crate::im::ordmap::OrdMap::new() };
+    () => { $crate::im_rc::ordmap::OrdMap::new() };
 
     ( $( $key:expr => $value:expr ),* ) => {{
-        let mut map = $crate::im::ordmap::OrdMap::new();
+        let mut map = $crate::im_rc::ordmap::OrdMap::new();
         $({
             map.insert($key, $value);
         })*;
@@ -158,10 +156,10 @@ macro_rules! dict {
 }
 #[macro_export]
 macro_rules! dict_k_into {
-    () => { $crate::im::ordmap::OrdMap::new() };
+    () => { $crate::im_rc::ordmap::OrdMap::new() };
 
     ( $( $key:expr => $value:expr ),* ) => {{
-        let mut map = $crate::im::ordmap::OrdMap::new();
+        let mut map = $crate::im_rc::ordmap::OrdMap::new();
         $({
             map.insert($key .into(), $value);
         })*;
