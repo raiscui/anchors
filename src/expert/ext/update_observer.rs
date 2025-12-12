@@ -208,7 +208,12 @@ mod tests {
         let a = Var::new(1i32);
         let b = Var::new(2i32);
 
-        let obs = (&a.watch(), &b.watch()).update_observer();
+        let obs = (&a.watch(), &b.watch())
+            .map(|a, b| {
+                println!("Computing update observer for a={}, b={}", a, b);
+                (a + 1, b + 1)
+            })
+            .update_observer();
 
         let v1 = engine.get(&obs);
         assert_eq!(v1, 1);
@@ -224,10 +229,9 @@ mod tests {
         b.set(20);
         let v4 = engine.get(&obs);
         assert_eq!(v4, v3 + 1);
-
+        println!("end");
         // 再次读取仍然保持不变
         let v5 = engine.get(&obs);
         assert_eq!(v5, v4);
     }
 }
-
