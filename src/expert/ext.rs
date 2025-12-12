@@ -7,6 +7,7 @@ pub mod map;
 pub mod map_mut;
 pub mod refmap;
 pub mod then;
+pub mod update_observer;
 
 /// A trait automatically implemented for tuples of Anchors.
 ///
@@ -53,6 +54,15 @@ pub trait MultiAnchor<E: Engine>: Sized {
         Out: 'static,
         F: 'static,
         refmap::RefMap<Self::Target, F>: AnchorInner<E, Output = Out>;
+
+    /// 创建一个 UpdateObserverAnchor，用于观察输入 Anchor 是否发生更新。
+    ///
+    /// 返回值为单调递增版本号 Anchor：只要任一输入 Updated，版本号 +1。
+    /// 业务侧可以通过比较版本号是否变化来做“重活 gating”。
+    fn update_observer(self) -> Anchor<u64, E>
+    where
+        update_observer::UpdateObserverAnchor<Self::Target>:
+            AnchorInner<E, Output = u64>;
 }
 
 impl<O1, E> Anchor<O1, E>
@@ -331,6 +341,20 @@ where
             location: Location::caller(),
         })
     }
+
+    /// 单 Anchor 版本的更新观察器。
+    ///
+    /// 典型用途：把某个关键 Anchor 的更新压缩成版本号，
+    /// 下游按需决定是否重建 Snapshot 或刷新命中数据。
+    #[track_caller]
+    pub fn update_observer(&self) -> Anchor<u64, E> {
+        E::mount(update_observer::UpdateObserverAnchor {
+            anchors: (self.clone(),),
+            version: 0,
+            output_stale: true,
+            location: Location::caller(),
+        })
+    }
     #[track_caller]
     pub fn debounce(&self) -> Anchor<O1, E>
     where
@@ -479,6 +503,20 @@ macro_rules! impl_tuple_ext {
                 E::mount(cutoff::Cutoff {
                     anchors: ($(self.$num.clone(),)+),
                     f,
+                    location: Location::caller(),
+                })
+            }
+
+            #[track_caller]
+            fn update_observer(self) -> Anchor<u64, E>
+            where
+                update_observer::UpdateObserverAnchor<Self::Target>:
+                    AnchorInner<E, Output = u64>,
+            {
+                E::mount(update_observer::UpdateObserverAnchor {
+                    anchors: ($(self.$num.clone(),)+),
+                    version: 0,
+                    output_stale: true,
                     location: Location::caller(),
                 })
             }

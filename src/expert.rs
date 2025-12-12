@@ -236,6 +236,7 @@ pub use ext::map;
 pub use ext::map_mut;
 pub use ext::refmap;
 pub use ext::then;
+pub use ext::update_observer;
 pub(crate) mod constant;
 mod var;
 mod var_val_or_anchor;
