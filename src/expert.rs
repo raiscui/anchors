@@ -231,6 +231,7 @@ pub trait AnchorInner<E: Engine + ?Sized> {
 mod ext;
 pub use ext::MultiAnchor;
 pub use ext::cutoff;
+pub use ext::dirty_observer;
 pub use ext::either;
 pub use ext::map;
 pub use ext::map_mut;

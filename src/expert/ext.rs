@@ -3,6 +3,7 @@ use std::panic::Location;
 
 pub mod cutoff;
 pub mod either;
+pub mod dirty_observer;
 pub mod map;
 pub mod map_mut;
 pub mod refmap;
@@ -54,6 +55,15 @@ pub trait MultiAnchor<E: Engine>: Sized {
         Out: 'static,
         F: 'static,
         refmap::RefMap<Self::Target, F>: AnchorInner<E, Output = Out>;
+
+    /// 创建一个 DirtyObserverAnchor，用于观察输入 Anchor 的“脏传播”。
+    ///
+    /// 返回值为单调递增版本号 Anchor：只要任一输入被标脏（dirty），版本号 +1。
+    /// 该信号允许假阳性（例如输入最终计算为 Unchanged 也会推进版本），用于做重活 gating。
+    fn dirty_observer(self) -> Anchor<u64, E>
+    where
+        dirty_observer::DirtyObserverAnchor<Self::Target>:
+            AnchorInner<E, Output = u64>;
 
     /// 创建一个 UpdateObserverAnchor，用于观察输入 Anchor 是否发生更新。
     ///
@@ -355,6 +365,20 @@ where
             location: Location::caller(),
         })
     }
+
+    /// 单 Anchor 版本的脏传播观察器。
+    ///
+    /// 语义：只要该 Anchor 在依赖图里被标脏（dirty），版本号就会推进；
+    /// 不保证该 Anchor 的输出值真的变化。
+    #[track_caller]
+    pub fn dirty_observer(&self) -> Anchor<u64, E> {
+        E::mount(dirty_observer::DirtyObserverAnchor {
+            anchors: (self.clone(),),
+            version: 0,
+            output_stale: true,
+            location: Location::caller(),
+        })
+    }
     #[track_caller]
     pub fn debounce(&self) -> Anchor<O1, E>
     where
@@ -503,6 +527,20 @@ macro_rules! impl_tuple_ext {
                 E::mount(cutoff::Cutoff {
                     anchors: ($(self.$num.clone(),)+),
                     f,
+                    location: Location::caller(),
+                })
+            }
+
+            #[track_caller]
+            fn dirty_observer(self) -> Anchor<u64, E>
+            where
+                dirty_observer::DirtyObserverAnchor<Self::Target>:
+                    AnchorInner<E, Output = u64>,
+            {
+                E::mount(dirty_observer::DirtyObserverAnchor {
+                    anchors: ($(self.$num.clone(),)+),
+                    version: 0,
+                    output_stale: true,
                     location: Location::caller(),
                 })
             }
