@@ -199,11 +199,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MAP_CALLS_0: AtomicUsize = AtomicUsize::new(0);
 
     /// DirtyObserver 的典型用法：观察“上游便宜的输入 Anchor”，
     /// 用版本号 gate 下游很重的 map/布局/快照逻辑。
     #[test]
     fn dirty_observer_can_gate_heavy_map() {
+        MAP_CALLS_0.store(0, Ordering::Relaxed);
         MAP_CALLS.store(0, Ordering::Relaxed);
         let mut engine = Engine::new();
 
@@ -212,8 +214,16 @@ mod tests {
 
         let deps = (&a.watch(), &b.watch());
 
+        let mapped_0 = deps.map(|a, b| {
+            println!("map 0, called");
+            MAP_CALLS_0.fetch_add(1, Ordering::Relaxed);
+            (*a + 1, *b + 1)
+        });
+
         // 很重的计算（模拟）：我们不希望仅仅为了“判断是否变化”就执行它。
-        let mapped = deps.map(|a, b| {
+        let mapped = mapped_0.map(|(a, b)| {
+            println!("map 1, called");
+
             MAP_CALLS.fetch_add(1, Ordering::Relaxed);
             (*a + 1, *b + 1)
         });
@@ -221,28 +231,44 @@ mod tests {
         // 观察上游输入的脏传播：只要 a/b 任意发生过 dirty，就版本号 +1。
         let obs = deps.dirty_observer();
 
+        println!("--------------------------------------");
+
         let v1 = engine.get(&obs);
         assert_eq!(v1, 1);
         assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(MAP_CALLS_0.load(Ordering::Relaxed), 0);
+        println!("v:{}", v1);
+        println!("--------------------------------------");
 
         // 无输入更新时，版本号不变，也不触发 map。
         let v2 = engine.get(&obs);
         assert_eq!(v2, v1);
         assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(MAP_CALLS_0.load(Ordering::Relaxed), 0);
+        println!("v:{}", v2);
+        println!("--------------------------------------");
 
         a.set(10);
         let v3 = engine.get(&obs);
         assert_eq!(v3, v1 + 1);
         assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(MAP_CALLS_0.load(Ordering::Relaxed), 0);
+        println!("v:{}", v3);
+        println!("--------------------------------------");
 
         b.set(20);
         let v4 = engine.get(&obs);
         assert_eq!(v4, v3 + 1);
         assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(MAP_CALLS_0.load(Ordering::Relaxed), 0);
+        println!("v:{}", v4);
+        println!("--------------------------------------");
 
         // 当你真正需要结果时再 get(mapped)，才会执行重计算。
         let _val = engine.get(&mapped);
         assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(MAP_CALLS_0.load(Ordering::Relaxed), 1);
+        println!("val:{:?}", _val);
+        println!("--------------------------------------");
     }
 }
-
