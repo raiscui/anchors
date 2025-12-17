@@ -2,8 +2,8 @@ use super::{Anchor, AnchorInner, Engine};
 use std::panic::Location;
 
 pub mod cutoff;
-pub mod either;
 pub mod dirty_observer;
+pub mod either;
 pub mod map;
 pub mod map_mut;
 pub mod refmap;
@@ -62,8 +62,7 @@ pub trait MultiAnchor<E: Engine>: Sized {
     /// 该信号允许假阳性（例如输入最终计算为 Unchanged 也会推进版本），用于做重活 gating。
     fn dirty_observer(self) -> Anchor<u64, E>
     where
-        dirty_observer::DirtyObserverAnchor<Self::Target>:
-            AnchorInner<E, Output = u64>;
+        dirty_observer::DirtyObserverAnchor<Self::Target>: AnchorInner<E, Output = u64>;
 
     /// 创建一个 UpdateObserverAnchor，用于观察输入 Anchor 是否发生更新。
     ///
@@ -71,8 +70,7 @@ pub trait MultiAnchor<E: Engine>: Sized {
     /// 业务侧可以通过比较版本号是否变化来做“重活 gating”。
     fn update_observer(self) -> Anchor<u64, E>
     where
-        update_observer::UpdateObserverAnchor<Self::Target>:
-            AnchorInner<E, Output = u64>;
+        update_observer::UpdateObserverAnchor<Self::Target>: AnchorInner<E, Output = u64>;
 }
 
 impl<O1, E> Anchor<O1, E>
