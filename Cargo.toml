@@ -23,28 +23,27 @@ lock_strict = []
 
 
 [dependencies]
-cfg-if = "1.0.0"
 
 # imbl = "2.0.0"
 
 # typed-arena = { version = "2.0.1" }
 arena-graph = { version = "0.1.0", path = "../arena-graph" }
-slotmap = "1.0"
+cfg-if = "1.0.0"
+emg_common = { workspace = true, optional = true, features = ["debug"] } #unified
+emg_hasher = { workspace = true } #unified
+indexmap = { workspace = true } #unified
+libc = { workspace = true, optional = true } #unified
+slotmap = { workspace = true } #unified
+smallvec = { workspace = true } #unified
 
 tracing = { version = "^0.1" }
-smallvec = { version = "1.10.0", features = ["const_generics"] }
-emg_hasher = { path = "../emg_hasher" }
-
-emg_common = { path = "../emg_common", optional = true }
-libc = { version = "0.2", optional = true }
-indexmap = "2.2"
 
 [dev-dependencies]
-criterion = { version = "0.8.1", features = ["html_reports", "plotters"] }
+criterion = { workspace = true, features = ["plotters", "real_blackbox"] } #unified
 flamegraph = "0.6.10"
 insta = { version = "1", features = ["glob"] }
-tracing-subscriber = "0.3"
 png = "0.17"
+tracing-subscriber = "0.3"
 
 [[bench]]
 name = "benchmarks"
