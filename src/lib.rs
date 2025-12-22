@@ -1,6 +1,7 @@
 #![feature(negative_impls)]
 #![feature(exact_size_is_empty)]
 #![feature(specialization)]
+#![allow(incomplete_features)]
 // #![feature(option_result_contains)] //for with_anchor func
 #![feature(iter_collect_into)]
 #![feature(auto_traits)]
