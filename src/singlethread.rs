@@ -1996,16 +1996,39 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
     }
 
     fn request<'out, O: 'static>(&mut self, anchor: &Anchor<O>, necessary: bool) -> Poll {
-        let child =
-            self.engine
-                .expect_node(&self.graph, anchor.token(), "EngineContextMut::request");
+        let token = anchor.token();
+        let Some(child) = self.graph.get(token) else {
+            // ──────────────────────────────────────────────────────────────
+            // 兜底处理：
+            // - 当 token 已失效/节点被回收时，不再 panic，避免 UI 直接崩溃。
+            // - 该场景仍应视为异常，使用 warn 记录上下文，便于后续定位。
+            // ──────────────────────────────────────────────────────────────
+            self.pending_on_anchor_get = true;
+            let audit = self.engine.token_audit_snapshot();
+            tracing::warn!(
+                target: "anchors",
+                parent = %self.node.debug_info.get()._to_string(),
+                child_token = token.raw_token(),
+                audit_next_token = audit.next_token,
+                audit_last_deleted = ?audit.last_deleted_token,
+                "EngineContextMut::request 发现失效 token，已降级为 PendingDefer"
+            );
+            return Poll::PendingDefer;
+        };
         self.request_node(child, necessary)
     }
 
     fn unrequest<'out, O: 'static>(&mut self, anchor: &Anchor<O>) {
-        let child =
-            self.engine
-                .expect_node(&self.graph, anchor.token(), "EngineContextMut::unrequest");
+        let token = anchor.token();
+        let Some(child) = self.graph.get(token) else {
+            tracing::warn!(
+                target: "anchors",
+                parent = %self.node.debug_info.get()._to_string(),
+                child_token = token.raw_token(),
+                "EngineContextMut::unrequest 发现失效 token，已跳过"
+            );
+            return;
+        };
         self.node.remove_necessary_child(child);
         Engine::update_necessary_children(child);
     }
