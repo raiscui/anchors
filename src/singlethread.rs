@@ -33,6 +33,26 @@ struct PendingStatsInner {
     last_drain_drained: Cell<usize>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 失效 token 观测：用于在不崩溃的前提下，避免 warn 日志刷屏，同时保留“首个触发点”。
+// - 只在 anchors_slotmap 下启用（token 单调 + free list 复用更常见）。
+// - 以 child raw_token 作为 key 做去重与计数；同一个 token 一旦开始刷屏，通常就是同一根因。
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Default)]
+struct InvalidTokenLogInner {
+    counts: HashMap<u64, u32>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl InvalidTokenLogInner {
+    fn bump(&mut self, raw_token: u64) -> u32 {
+        let entry = self.counts.entry(raw_token).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+}
+
 /// Pending 队列统计快照，用于在 demo/测试后导出指标。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnchorsPendingStats {
@@ -470,6 +490,8 @@ pub struct Engine {
     #[cfg(feature = "anchors_slotmap")]
     pending_stats: Rc<PendingStatsInner>,
     #[cfg(feature = "anchors_slotmap")]
+    invalid_token_log: Rc<RefCell<InvalidTokenLogInner>>,
+    #[cfg(feature = "anchors_slotmap")]
     last_subset_remaining: Rc<RefCell<Vec<NodeKey>>>,
     #[cfg(feature = "anchors_slotmap")]
     last_subset_remaining_debug: Rc<RefCell<Vec<String>>>,
@@ -566,6 +588,8 @@ impl Engine {
             #[cfg(feature = "anchors_slotmap")]
             pending_stats: Rc::new(PendingStatsInner::default()),
             #[cfg(feature = "anchors_slotmap")]
+            invalid_token_log: Rc::new(RefCell::new(InvalidTokenLogInner::default())),
+            #[cfg(feature = "anchors_slotmap")]
             last_subset_remaining: Rc::new(RefCell::new(Vec::new())),
             #[cfg(feature = "anchors_slotmap")]
             last_subset_remaining_debug: Rc::new(RefCell::new(Vec::new())),
@@ -639,6 +663,42 @@ impl Engine {
         {
             TokenAudit::default()
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 失效 token 观测与去重
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn invalid_token_backtrace_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ANCHORS_INVALID_TOKEN_BACKTRACE")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    #[inline]
+    fn invalid_token_backtrace_enabled() -> bool {
+        false
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn bump_invalid_token_count(&self, raw_token: u64) -> u32 {
+        let mut slot = self.invalid_token_log.borrow_mut();
+        slot.bump(raw_token)
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    #[inline]
+    fn bump_invalid_token_count(&self, _raw_token: u64) -> u32 {
+        1
+    }
+
+    #[inline]
+    fn should_log_invalid_token(count: u32) -> bool {
+        matches!(count, 1 | 10 | 100) || count % 1000 == 0
     }
 
     #[cfg(feature = "anchors_slotmap")]
@@ -1167,6 +1227,7 @@ impl Engine {
                     graph,
                     node: parent,
                     pending_on_anchor_get: false,
+                    invalid_token_requested: false,
                 };
                 let poll = ctx.request_node(child, req.necessary);
                 if matches!(poll, Poll::PendingDefer) {
@@ -1277,6 +1338,7 @@ impl Engine {
             node,
             graph,
             pending_on_anchor_get: false,
+            invalid_token_requested: false,
         };
         /// ══════════════════════════════════════════════════════════════════════
         /// 锁严格模式开关：
@@ -1499,6 +1561,7 @@ impl Engine {
         let poll_result = anchor_ref.poll_updated(&mut ecx);
         node.recalc_retry.set(0);
         let pending_on_anchor_get = ecx.pending_on_anchor_get;
+        let invalid_token_requested = ecx.invalid_token_requested;
         match poll_result {
             Poll::Pending | Poll::PendingDefer => {
                 if std::env::var("ANCHORS_DEBUG_PENDING")
@@ -1509,6 +1572,25 @@ impl Engine {
                         "PENDING node={:?} pending_on_anchor_get={}",
                         node.debug_info.get()._to_string(),
                         pending_on_anchor_get
+                    );
+                }
+
+                // ──────────────────────────────────────────────────────────────
+                // 失效 token 兜底：
+                // - invalid token 并非“子节点尚未计算完成”，而是“子节点已被回收”。
+                // - 若继续按 Pending 逻辑重排队，会导致 stabilize 打转 + 日志刷屏。
+                // - 因此：
+                //   - 若该节点曾经 Ready 过（有旧输出），则保持旧输出并标记为 Ready，避免死循环；
+                //   - 若该节点从未 Ready（无旧输出），无法降级，直接 panic 以便定位根因。
+                // ──────────────────────────────────────────────────────────────
+                if invalid_token_requested {
+                    if node.last_ready.get().is_some() {
+                        node.last_ready.set(Some(self.generation));
+                        return true;
+                    }
+                    panic!(
+                        "slotmap: 检测到失效 token request，且节点尚无历史输出无法降级；请开启 ANCHORS_INVALID_TOKEN_BACKTRACE=1 定位根因，node={}",
+                        node.debug_info.get()._to_string()
                     );
                 }
                 if pending_on_anchor_get {
@@ -1941,6 +2023,7 @@ pub struct EngineContextMut<'eng, 'gg> {
     graph: Graph2Guard<'gg>,
     node: NodeGuard<'gg>,
     pending_on_anchor_get: bool,
+    invalid_token_requested: bool,
 }
 
 impl<'eng> OutputContext<'eng> for EngineContext<'eng> {
@@ -1995,6 +2078,7 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
         })
     }
 
+    #[track_caller]
     fn request<'out, O: 'static>(&mut self, anchor: &Anchor<O>, necessary: bool) -> Poll {
         let token = anchor.token();
         let Some(child) = self.graph.get(token) else {
@@ -2004,29 +2088,81 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
             // - 该场景仍应视为异常，使用 warn 记录上下文，便于后续定位。
             // ──────────────────────────────────────────────────────────────
             self.pending_on_anchor_get = true;
-            let audit = self.engine.token_audit_snapshot();
-            tracing::warn!(
-                target: "anchors",
-                parent = %self.node.debug_info.get()._to_string(),
-                child_token = token.raw_token(),
-                audit_next_token = audit.next_token,
-                audit_last_deleted = ?audit.last_deleted_token,
-                "EngineContextMut::request 发现失效 token，已降级为 PendingDefer"
-            );
-            return Poll::PendingDefer;
+            self.invalid_token_requested = true;
+
+            let raw_token = token.raw_token();
+            let count = self.engine.bump_invalid_token_count(raw_token);
+            if Engine::should_log_invalid_token(count) {
+                let audit = self.engine.token_audit_snapshot();
+                let caller = Location::caller();
+                let output_type = std::any::type_name::<O>();
+                if count == 1 && Engine::invalid_token_backtrace_enabled() {
+                    let bt = Backtrace::force_capture();
+                    tracing::warn!(
+                        target: "anchors",
+                        op = "request",
+                        parent = %self.node.debug_info.get()._to_string(),
+                        parent_token = self.node.key().raw_token(),
+                        child_token = raw_token,
+                        output_type,
+                        necessary,
+                        seen = count,
+                        caller_file = caller.file(),
+                        caller_line = caller.line(),
+                        caller_column = caller.column(),
+                        audit_next_token = audit.next_token,
+                        audit_last_deleted = ?audit.last_deleted_token,
+                        backtrace = %bt,
+                        "EngineContextMut::request 发现失效 token（节点可能已被 GC/free），将保持旧输出并抑制重复日志"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "anchors",
+                        op = "request",
+                        parent = %self.node.debug_info.get()._to_string(),
+                        parent_token = self.node.key().raw_token(),
+                        child_token = raw_token,
+                        output_type,
+                        necessary,
+                        seen = count,
+                        caller_file = caller.file(),
+                        caller_line = caller.line(),
+                        caller_column = caller.column(),
+                        audit_next_token = audit.next_token,
+                        audit_last_deleted = ?audit.last_deleted_token,
+                        "EngineContextMut::request 发现失效 token（节点可能已被 GC/free），将保持旧输出并抑制重复日志"
+                    );
+                }
+            }
+
+            return Poll::Pending;
         };
         self.request_node(child, necessary)
     }
 
+    #[track_caller]
     fn unrequest<'out, O: 'static>(&mut self, anchor: &Anchor<O>) {
         let token = anchor.token();
         let Some(child) = self.graph.get(token) else {
-            tracing::warn!(
-                target: "anchors",
-                parent = %self.node.debug_info.get()._to_string(),
-                child_token = token.raw_token(),
-                "EngineContextMut::unrequest 发现失效 token，已跳过"
-            );
+            let raw_token = token.raw_token();
+            let count = self.engine.bump_invalid_token_count(raw_token);
+            if Engine::should_log_invalid_token(count) {
+                let caller = Location::caller();
+                let output_type = std::any::type_name::<O>();
+                tracing::warn!(
+                    target: "anchors",
+                    op = "unrequest",
+                    parent = %self.node.debug_info.get()._to_string(),
+                    parent_token = self.node.key().raw_token(),
+                    child_token = raw_token,
+                    output_type,
+                    seen = count,
+                    caller_file = caller.file(),
+                    caller_line = caller.line(),
+                    caller_column = caller.column(),
+                    "EngineContextMut::unrequest 发现失效 token，已跳过（日志已去重）"
+                );
+            }
             return;
         };
         self.node.remove_necessary_child(child);

@@ -25,6 +25,7 @@ where
     E: Engine,
     // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from(value: Dict<I, ValOrAnchor<V, E>>) -> Self {
         VectorVOACollect::new_to_anchor(value.values().cloned().collect())
     }
@@ -37,6 +38,7 @@ where
     E: Engine,
     // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from(value: Anchor<Dict<I, ValOrAnchor<V, E>>, E>) -> Self {
         value.then(|v| VectorVOACollect::new_to_anchor(v.values().cloned().collect()))
     }
@@ -49,6 +51,7 @@ where
     E: Engine,
     // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from(value: Vector<ValOrAnchor<V, E>>) -> Self {
         VectorVOACollect::new_to_anchor(value)
     }
@@ -60,6 +63,7 @@ where
     E: Engine,
     // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from(value: &Anchor<Vector<ValOrAnchor<V, E>>, E>) -> Self {
         value.then(|v| VectorVOACollect::new_to_anchor(v.clone()))
     }
@@ -71,6 +75,7 @@ where
     E: Engine,
     // OrdMap<I, V>: std::cmp::Eq,
 {
+    #[track_caller]
     fn from(value: Anchor<Vector<ValOrAnchor<V, E>>, E>) -> Self {
         value.then(|v| VectorVOACollect::new_to_anchor(v.clone()))
     }
@@ -79,6 +84,7 @@ where
 impl<I: 'static + Clone, E: Engine> std::iter::FromIterator<ValOrAnchor<I, E>>
     for Anchor<Vector<I>, E>
 {
+    #[track_caller]
     fn from_iter<T>(iter: T) -> Self
     where
         T: IntoIterator<Item = ValOrAnchor<I, E>>,
@@ -90,6 +96,7 @@ impl<I: 'static + Clone, E: Engine> std::iter::FromIterator<ValOrAnchor<I, E>>
 impl<'a, I: 'static + Clone, E: Engine> std::iter::FromIterator<&'a ValOrAnchor<I, E>>
     for Anchor<Vector<I>, E>
 {
+    #[track_caller]
     fn from_iter<T>(iter: T) -> Self
     where
         T: IntoIterator<Item = &'a ValOrAnchor<I, E>>,

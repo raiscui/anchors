@@ -74,12 +74,17 @@ macro_rules! impl_tuple_then {
                     if found_pending {
                         #[cfg(debug_assertions)]
                         {
-                            tracing::warn!(
-                                target: "anchors",
-                                "then pending: loc={:?} anchors={}",
-                                self.location,
-                                stringify!($($output_type),+)
-                            );
+                            if std::env::var("ANCHORS_DEBUG_THEN")
+                                .map(|v| v != "0")
+                                .unwrap_or(false)
+                            {
+                                tracing::warn!(
+                                    target: "anchors",
+                                    "then pending: loc={:?} anchors={}",
+                                    self.location,
+                                    stringify!($($output_type),+)
+                                );
+                            }
                         }
                         return Poll::Pending;
                     }
@@ -89,13 +94,18 @@ macro_rules! impl_tuple_then {
                     match self.f_anchor.as_ref() {
                         Some(outdated_anchor) if outdated_anchor != &new_anchor => {
                             #[cfg(debug_assertions)]
-                            tracing::warn!(
-                                target: "anchors",
-                                "then switching output anchor old={:?} new={:?} loc={:?}",
-                                outdated_anchor.token(),
-                                new_anchor.token(),
-                                self.location
-                            );
+                            if std::env::var("ANCHORS_DEBUG_THEN")
+                                .map(|v| v != "0")
+                                .unwrap_or(false)
+                            {
+                                tracing::warn!(
+                                    target: "anchors",
+                                    "then switching output anchor old={:?} new={:?} loc={:?}",
+                                    outdated_anchor.token(),
+                                    new_anchor.token(),
+                                    self.location
+                                );
+                            }
                             if std::env::var("ANCHORS_DEBUG_THEN").map(|v| v != "0").unwrap_or(false) {
                                 println!(
                                     "THEN 切换输出 Anchor old={:?} new={:?} loc={:?}",
