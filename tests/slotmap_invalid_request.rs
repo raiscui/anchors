@@ -1,6 +1,7 @@
 #![cfg(feature = "anchors_slotmap")]
 
 use std::cell::Cell;
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use anchors::expert::{AnchorInner, Engine as EngineTrait, OutputContext, Poll, UpdateContext};
@@ -13,7 +14,7 @@ use anchors::singlethread::{Anchor, AnchorToken, Engine};
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct StaleInputProbe {
-    input: Anchor<u32>,
+    input: ManuallyDrop<Anchor<u32>>,
     output: u32,
     saw_pending: Rc<Cell<bool>>,
 }
@@ -24,14 +25,17 @@ impl AnchorInner<Engine> for StaleInputProbe {
     fn dirty(&mut self, _edge: &AnchorToken) {}
 
     fn poll_updated<G: UpdateContext<Engine = Engine>>(&mut self, ctx: &mut G) -> Poll {
-        match ctx.request(&self.input, true) {
+        // SAFETY: `ManuallyDrop<T>` 是 `repr(transparent)` 包装；这里仅获取只读引用，避免触发 drop。
+        let input: &Anchor<u32> = unsafe { &*(&self.input as *const _ as *const Anchor<u32>) };
+
+        match ctx.request(input, true) {
             Poll::Pending | Poll::PendingDefer => {
                 self.saw_pending.set(true);
                 self.output = 0;
                 Poll::Updated
             }
             Poll::Updated | Poll::Unchanged => {
-                self.output = *ctx.get(&self.input);
+                self.output = *ctx.get(input);
                 Poll::Updated
             }
         }
@@ -61,7 +65,7 @@ fn request_missing_anchor_token_is_deferred() {
     // unsafe: 使用 ptr::read 跳过 Clone 计数，制造“失效 token”。
     // 注意：仅用于测试异常路径，不可在业务代码中使用。
     // ──────────────────────────────────────────────────────────────
-    let stale_anchor = unsafe { std::ptr::read(&anchor) };
+    let stale_anchor = ManuallyDrop::new(unsafe { std::ptr::read(&anchor) });
     drop(anchor);
 
     // 触发一次 stabilize，确保 pending_free 被处理。
