@@ -22,7 +22,7 @@ fn main() {
         println!("*** recalculate v2 ***");
         x + 1
     });
-    let v2b = v1b.watch().map(|x| x + 1);
+    let _v2b = v1b.watch().map(|x| x + 1);
     println!("=---------------------------------- 1次");
     println!("v2 {:?}", engine.get(&v2));
     println!("=---------------------------------- 2次");

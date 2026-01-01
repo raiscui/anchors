@@ -24,7 +24,7 @@ fn main() {
     };
     let v = Var::new((0, 1));
     let mm = v.watch().clone();
-    let xx = v.watch().then(move |x| {
+    let xx = v.watch().then(move |_x| {
         println!("v change");
         mm.map(|y| {
             println!("mm change");
@@ -36,11 +36,16 @@ fn main() {
     v.set((3, 3));
     // println!("xx{:?}", engine.get(&xx));
     // println!("xx2{:?}", engine.get(&xx));
-    let n = xx.refmap(|v| {
+    ////////////////////////////////////////////////////////////////////////////////
+    // NOTE:
+    // - slotmap 模式下禁用 refmap：refmap 输出依赖 input token 的有效性，容易在 GC/动态子树下触发 panic；
+    // - 这里改用 map 抽取字段并返回 owned 值（i32 为 Copy），下游再做计算即可。
+    ////////////////////////////////////////////////////////////////////////////////
+    let n = xx.map(|v| {
         println!("get n");
-        &v.1
+        v.1
     });
-    let xn = n.map(|x| x + 10);
+    let xn = n.map(|x| *x + 10);
     // println!("n {}", engine.get(&n));
     // println!("n2 {}", engine.get(&n));
     println!("xn {}", engine.get(&xn));

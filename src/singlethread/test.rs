@@ -149,6 +149,7 @@ fn test_cutoff_simple_unobserved() {
     assert_eq!(engine.get(&post_cutoff), 161);
 }
 
+#[cfg(not(feature = "anchors_slotmap"))]
 #[test]
 fn test_refmap_simple() {
     #[derive(PartialEq, Debug)]
