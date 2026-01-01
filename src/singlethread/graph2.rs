@@ -1,6 +1,78 @@
 use super::{AnchorDebugInfo, Engine, EngineContext, Generation, GenericAnchor};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
+#[cfg(feature = "anchors_slotmap")]
+use std::{backtrace::Backtrace, sync::OnceLock};
+
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Debug)]
+struct FreeTraceConfig {
+    enabled: bool,
+    token_filter: Option<u64>,
+    match_substr: Option<String>,
+    backtrace: bool,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl FreeTraceConfig {
+    fn from_env() -> Self {
+        ////////////////////////////////////////////////////////////////////////////////
+        // NOTE:
+        // - 这是纯调试能力：用于定位“某个 token 在谁/何时被 free”。
+        // - 默认关闭，避免在正常运行时产生额外分支与日志。
+        //
+        // 用法（示例）：
+        // - ANCHORS_TRACE_FREE=1 ANCHORS_TRACE_FREE_TOKEN=4799 ANCHORS_TRACE_FREE_BACKTRACE=1
+        // - ANCHORS_TRACE_FREE=1 ANCHORS_TRACE_FREE_MATCH=node_builder.rs:169
+        ////////////////////////////////////////////////////////////////////////////////
+        let enabled = std::env::var("ANCHORS_TRACE_FREE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false);
+
+        let token_filter = std::env::var("ANCHORS_TRACE_FREE_TOKEN")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let match_substr = std::env::var("ANCHORS_TRACE_FREE_MATCH")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let backtrace = std::env::var("ANCHORS_TRACE_FREE_BACKTRACE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false);
+
+        Self {
+            enabled,
+            token_filter,
+            match_substr,
+            backtrace,
+        }
+    }
+
+    #[inline]
+    fn should_log(&self, token: u64, debug_info: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if let Some(filter) = self.token_filter {
+            if token != filter {
+                return false;
+            }
+        }
+        if let Some(substr) = &self.match_substr {
+            if !debug_info.contains(substr.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(feature = "anchors_slotmap")]
+fn free_trace_cfg() -> &'static FreeTraceConfig {
+    static CFG: OnceLock<FreeTraceConfig> = OnceLock::new();
+    CFG.get_or_init(FreeTraceConfig::from_env)
+}
 
 #[cfg(feature = "anchors_slotmap")]
 mod node_store {
@@ -1238,6 +1310,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
 }
 
 /// 辅助：当节点已经 Pending 但需要“重新排队”时，先摘下旧位置再重新入队，避免 recalc_min_height 已越过导致饥饿。
+#[allow(dead_code)]
 pub fn requeue_pending<'gg>(graph: Graph2Guard<'gg>, node: NodeGuard<'gg>) {
     // 仅处理 Pending 节点，其余保持原逻辑。
     if node.ptrs.recalc_state.get() != RecalcState::Pending {
@@ -1251,6 +1324,7 @@ pub fn requeue_pending<'gg>(graph: Graph2Guard<'gg>, node: NodeGuard<'gg>) {
 }
 
 /// 将节点状态强制置为 Ready（不改动队列指针），用于锁释放后无条件重新入队。
+#[allow(dead_code)]
 pub fn set_recalc_ready(node: NodeGuard<'_>) {
     node.ptrs.recalc_state.set(RecalcState::Ready);
 }
@@ -1318,11 +1392,26 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
 
 #[cfg(feature = "anchors_slotmap")]
 unsafe fn free(ptr: NodePtr) {
-    let graph: &Graph2 = {
-        let guard = unsafe { ptr.lookup_unchecked() };
-        // unsafe: graph 指针来源于当前 slotmap 节点，生命周期受 NodeStore 约束。
-        unsafe { &*guard.ptrs.graph }
-    };
+    let guard = unsafe { ptr.lookup_unchecked() };
+    let graph: &Graph2 = unsafe { &*guard.ptrs.graph };
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // NOTE:
+    // - 这里是在 “handle_count 刚刚归零 -> 触发 free()” 的时刻。
+    // - 即使后续因为借用冲突走了 enqueue_free_retry，这里仍然能看到“是谁触发了 free”。
+    ////////////////////////////////////////////////////////////////////////////////
+    let cfg = free_trace_cfg();
+    if cfg.enabled {
+        let token = guard.slot_token.get();
+        let debug_info = guard.debug_info.get()._to_string();
+        if cfg.should_log(token, debug_info.as_str()) {
+            eprintln!("[anchors][free] token={} debug={}", token, debug_info);
+            if cfg.backtrace {
+                let bt = Backtrace::force_capture();
+                eprintln!("[anchors][free] backtrace:\n{bt}");
+            }
+        }
+    }
 
     if unsafe { !graph.nodes.remove(ptr) } {
         graph.enqueue_free_retry(ptr);

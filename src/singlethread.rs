@@ -208,6 +208,7 @@ impl PendingSubsetFilter {
         self.tokens.is_empty()
     }
 
+    #[allow(dead_code)]
     fn contains(&self, token: &NodeKey) -> bool {
         self.tokens.contains(token)
     }
@@ -216,6 +217,7 @@ impl PendingSubsetFilter {
         self.tokens.len()
     }
 
+    #[allow(dead_code)]
     fn sample_raw_tokens(&self, limit: usize) -> Vec<u64> {
         self.tokens
             .iter()
