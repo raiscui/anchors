@@ -115,6 +115,7 @@ use std::cell::{Cell, RefCell};
 #[cfg(feature = "anchors_slotmap")]
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -1077,28 +1078,46 @@ impl Engine {
     fn stabilize_with_pending_subset(&self, pending_subset: PendingSubsetArg<'_>) {
         trace!("stabilize0");
         self.graph.with(|graph| {
-            // 可选调试：检测重算队列是否异常“打转”。设置 `ANCHORS_DEBUG_SPIN=1` 时启用。
-            let mut spin_counter: usize = 0;
+            // ─────────────────────────────────────────────────────────────
+            // 可选调试：检测 stabilize 是否异常“打转”
+            //
+            // 背景：
+            // - 在某些依赖环/不收敛场景中，recalc 队列会反复 requeue，导致 stabilize 长时间不返回；
+            // - GUI 表现：CPU 满载、事件循环无法退出，必须 kill。
+            //
+            // 用法：
+            // - `ANCHORS_DEBUG_SPIN=1` 开启检测（默认关闭，避免影响性能）。
+            // - `ANCHORS_DEBUG_SPIN_LIMIT=<N>` 可自定义阈值（默认按 active_nodes * 64 放宽，避免启动阶段误报）。
+            //
+            // 输出策略：
+            // - 不再逐步 println（会产生海量日志并影响时序），只在超过阈值时 panic；
+            // - panic 消息包含“最近 N 次出队”的 token + debug_info，便于快速定位闭环。
+            // ─────────────────────────────────────────────────────────────
             let spin_debug = std::env::var("ANCHORS_DEBUG_SPIN")
                 .map(|v| v != "0")
                 .unwrap_or(false);
-            // 自适应上限：根据当前激活节点数放宽容忍度，避免正常的高度调整/依赖扩展触发误报。
-            // 理念：有 N 个节点时，合法的“高度回填+新依赖建图”往往需要 O(N) 次出队；乘以 4 作为缓冲。
-            let spin_limit = if spin_debug {
-                #[cfg(feature = "anchors_slotmap")]
-                {
-                    let active_nodes = graph.active_nodes();
-                    std::cmp::max(64, active_nodes.saturating_mul(4))
-                }
-                #[cfg(not(feature = "anchors_slotmap"))]
-                {
-                    // 非 slotmap 后端暂无 active_nodes 统计，使用固定阈值以维持基本保护。
-                    64
+            let mut spin_counter: usize = 0;
+            let spin_limit: usize = if spin_debug {
+                if let Ok(v) = std::env::var("ANCHORS_DEBUG_SPIN_LIMIT") {
+                    v.parse::<usize>().unwrap_or(0)
+                } else {
+                    #[cfg(feature = "anchors_slotmap")]
+                    {
+                        // 启动阶段/依赖扩展时，合法的高度调整次数可能远超 active_nodes；
+                        // 这里使用更保守的倍数，减少误报。
+                        let active_nodes = graph.active_nodes();
+                        std::cmp::max(5_000, active_nodes.saturating_mul(64))
+                    }
+                    #[cfg(not(feature = "anchors_slotmap"))]
+                    {
+                        5_000
+                    }
                 }
             } else {
                 0
             };
-            // let spin_limit = 13;//for test
+
+            let mut spin_last: VecDeque<(usize, u64, String)> = VecDeque::with_capacity(32);
             #[cfg(feature = "anchors_slotmap")]
             {
                 graph.retry_pending_free();
@@ -1106,15 +1125,34 @@ impl Engine {
             while let Some((height, node)) = graph.recalc_pop_next() {
                 if spin_debug {
                     spin_counter = spin_counter.saturating_add(1);
-                    println!(
-                        "STABILIZE_SPIN #{spin_counter} height={height} node={}",
-                        node.debug_info.get()._to_string()
-                    );
-                    if spin_counter > spin_limit {
-                        panic!(
-                            "stabilize0 spin detected: 重算次数超过上限 {spin_limit}，最后节点={}",
-                            node.debug_info.get()._to_string(),
+                    if spin_last.len() == 32 {
+                        spin_last.pop_front();
+                    }
+                    spin_last.push_back((
+                        height,
+                        node.key().raw_token(),
+                        node.debug_info.get()._to_string(),
+                    ));
+
+                    if spin_limit > 0 && spin_counter > spin_limit {
+                        let mut msg = String::new();
+                        let _ = writeln!(
+                            &mut msg,
+                            "stabilize0 spin detected: 重算次数超过上限 {spin_limit} (count={spin_counter})"
                         );
+                        #[cfg(feature = "anchors_slotmap")]
+                        {
+                            let active_nodes = graph.active_nodes();
+                            let _ = writeln!(&mut msg, "active_nodes={active_nodes}");
+                        }
+                        let _ = writeln!(&mut msg, "recent_recalc (oldest -> newest):");
+                        for (i, (h, tok, info)) in spin_last.iter().enumerate() {
+                            let _ = writeln!(
+                                &mut msg,
+                                "  #{i} height={h} token={tok} node={info}"
+                            );
+                        }
+                        panic!("{msg}");
                     }
                 }
                 let calculation_complete = if graph2::height(node) == height {
@@ -1250,6 +1288,65 @@ impl Engine {
 
         let remaining = self.pending_requests.borrow().len();
         self.pending_stats.last_drain_remaining.set(remaining);
+
+        // ─────────────────────────────────────────────────────────────
+        // 可选调试：打印 pending 队列样本
+        //
+        // 背景：
+        // - 当某些依赖长期处于 PendingDefer（例如依赖环、或依赖链无法收敛）时，
+        //   `pending_requests` 会持续 drain -> retry -> reinsert，导致 CPU 满载。
+        // - 通过打印 queue 的少量样本（parent/child token + debug_info），能快速定位“打转”的 SCC。
+        //
+        // 用法：
+        // - 设置 `ANCHORS_PENDING_DEBUG_SAMPLE=1` 开启（默认关闭，避免影响正常性能）。
+        // ─────────────────────────────────────────────────────────────
+        if remaining > 0 && total_to_retry > 0 && Self::debug_pending_queue_sample_enabled() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let tick = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+            // 轻量限流：每 50 次 drain 打一次样本，避免刷屏。
+            // 另外：首次命中也会打印一次，保证“第一次打转”就能拿到线索。
+            if tick == 0 || tick % 50 == 0 {
+                let sample: Vec<PendingRequest> = {
+                    let queue = self.pending_requests.borrow();
+                    queue
+                        .buckets
+                        .values()
+                        .flat_map(|bucket| bucket.values())
+                        .take(8)
+                        .copied()
+                        .collect()
+                };
+
+                let parents: Vec<NodeKey> = sample.iter().map(|req| req.parent).collect();
+                let children: Vec<NodeKey> = sample.iter().map(|req| req.child).collect();
+                let parents_debug = self.describe_tokens(&parents);
+                let children_debug = self.describe_tokens(&children);
+
+                eprintln!(
+                    "[anchors] pending_queue remain={remaining} drained={total_to_retry} sample_n={}",
+                    sample.len()
+                );
+                for (i, req) in sample.iter().enumerate() {
+                    let parent_dbg = parents_debug
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or("<unknown>");
+                    let child_dbg = children_debug
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or("<unknown>");
+                    eprintln!(
+                        "[anchors] pending_sample[{i}] priority={} parent_token={} parent={parent_dbg} child_token={} child={child_dbg}",
+                        req.priority.as_u8(),
+                        req.parent.raw_token(),
+                        req.child.raw_token()
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(feature = "anchors_slotmap")]
@@ -2096,8 +2193,45 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                 let audit = self.engine.token_audit_snapshot();
                 let caller = Location::caller();
                 let output_type = std::any::type_name::<O>();
+                // ──────────────────────────────────────────────────────────────
+                // 重要：在大多数示例里没有初始化 tracing subscriber，
+                // 仅靠 tracing::warn! 会导致关键诊断信息“静默丢失”。
+                //
+                // 因此：当用户显式开启 `ANCHORS_INVALID_TOKEN_BACKTRACE=1` 时，
+                // 这里额外用 stderr 打印一次，保证能看到“是谁请求了哪个失效 token”。
+                // ──────────────────────────────────────────────────────────────
+                if Engine::invalid_token_backtrace_enabled() {
+                    // 尝试补充更多上下文：当前 ptr 所指向槽位的 token/debug/状态，
+                    // 用来区分“token 代际不匹配（槽位已被复用）” vs “anchor 已被置空”。
+                    let slot_debug = unsafe { token.ptr.lookup_unchecked() };
+                    let slot_token = slot_debug.slot_token.get();
+                    let slot_anchor_none = unsafe { (&*slot_debug.anchor.get()).is_none() };
+                    let slot_anchor_locked = slot_debug.anchor_locked.get();
+                    let slot_dbg_info = slot_debug.debug_info.get()._to_string();
+
+                    eprintln!(
+                        "[anchors][invalid_token][request] parent_token={} parent={} child_token={} output_type={} necessary={} caller={}:{}:{} audit_next_token={} audit_last_deleted={:?} seen={} slot_token={} slot_anchor_none={} slot_anchor_locked={} slot_debug={}",
+                        self.node.key().raw_token(),
+                        self.node.debug_info.get()._to_string(),
+                        raw_token,
+                        output_type,
+                        necessary,
+                        caller.file(),
+                        caller.line(),
+                        caller.column(),
+                        audit.next_token,
+                        audit.last_deleted_token,
+                        count,
+                        slot_token,
+                        slot_anchor_none,
+                        slot_anchor_locked,
+                        slot_dbg_info
+                    );
+                }
                 if count == 1 && Engine::invalid_token_backtrace_enabled() {
                     let bt = Backtrace::force_capture();
+                    // stderr 再补一份 backtrace，避免 tracing subscriber 未初始化时丢信息。
+                    eprintln!("[anchors][invalid_token][request] backtrace:\n{bt}");
                     tracing::warn!(
                         target: "anchors",
                         op = "request",
@@ -2197,8 +2331,10 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             .unwrap_or(false)
         {
             println!(
-                "REQUEST parent={:?} child={:?} ready={:?} height_ok={}",
+                "REQUEST parent_token={} parent={:?} child_token={} child={:?} ready={:?} height_ok={}",
+                self.node.key().raw_token(),
                 self.node.debug_info.get()._to_string(),
+                child.key().raw_token(),
                 child.debug_info.get()._to_string(),
                 graph2::recalc_state(child),
                 height_already_increased
@@ -2216,10 +2352,12 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
                 .unwrap_or(false)
             {
                 println!(
-                    "REQUEST pending child={:?} state={:?} parent={:?}",
+                    "REQUEST pending parent_token={} parent={:?} child_token={} child={:?} state={:?}",
+                    self.node.key().raw_token(),
+                    self.node.debug_info.get()._to_string(),
+                    child.key().raw_token(),
                     child.debug_info.get()._to_string(),
                     graph2::recalc_state(child),
-                    self.node.debug_info.get()._to_string()
                 );
             }
             if necessary && self_is_necessary {

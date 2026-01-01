@@ -807,19 +807,50 @@ impl<'gg> Graph2Guard<'gg> {
     }
 
     pub fn queue_recalc(&self, node: NodeGuard<'gg>) {
+        // ─────────────────────────────────────────────────────────────
+        // 防御性修复：Pending 但可能已“丢队列”
+        //
+        // 现象：
+        // - 某些场景下（例如 Dyn/ForEach 高频增删导致依赖链频繁重排），节点可能处于 `Pending`，
+        //   但实际已不在 recalc 队列中（prev/next/queue head 不一致）。
+        // - 此时若继续按 “already pending -> skip” 处理，会导致该节点永远不会被 pop，
+        //   上游节点不断 request 它并自旋，最终表现为 CPU 满载卡死。
+        //
+        // 处理：
+        // - 当检测到 `recalc_min_height` 已经越过该节点高度时，说明它极可能在队列中“饥饿/丢失”；此时强制重排队。
+        // - 这条路径应当非常少见；正常情况下 `Pending` 节点会被 pop，不会进入该分支。
+        // ─────────────────────────────────────────────────────────────
         if node.ptrs.recalc_state.get() == RecalcState::Pending {
-            if std::env::var("ANCHORS_DEBUG_QUEUE")
-                .map(|v| v != "0")
-                .unwrap_or(false)
-            {
-                println!(
-                    "queue_recalc skip (already pending) token={:?} debug={}",
-                    node.key().raw_token(),
-                    node.debug_info.get()._to_string()
-                );
+            let node_height = height(node);
+            if self.graph.recalc_min_height.get() > node_height {
+                if std::env::var("ANCHORS_DEBUG_QUEUE")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "queue_recalc requeue pending (min_height={} > node_height={}) token={:?} debug={}",
+                        self.graph.recalc_min_height.get(),
+                        node_height,
+                        node.key().raw_token(),
+                        node.debug_info.get()._to_string()
+                    );
+                }
+                // 若节点确实已丢队列，dequeue_calc 会把它恢复到 Ready；随后走常规入队逻辑。
+                dequeue_calc(self.graph, node);
+            } else {
+                if std::env::var("ANCHORS_DEBUG_QUEUE")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "queue_recalc skip (already pending) token={:?} debug={}",
+                        node.key().raw_token(),
+                        node.debug_info.get()._to_string()
+                    );
+                }
+                // already in recalc queue
+                return;
             }
-            // already in recalc queue
-            return;
         }
         // 如果节点正在重算（anchor_locked=true），跳过此次入队，改为标记“需补偿”，由 AnchorLockGuard 在解锁时入队，避免 strict 下的重入同时不丢更新。
         if node.anchor_locked.get() {
