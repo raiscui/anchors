@@ -26,12 +26,23 @@ pub enum Poll {
     /// Indicates该节点尚未完成计算，并且被延迟到下一轮 `stabilize`/drain
     /// 再次尝试，通常用于打断同帧内的循环请求。
     PendingDefer,
+
+    /// 表示 request 的 token 已失效（节点可能已被 GC/free）。
+    ///
+    /// 说明：
+    /// - 这不是“依赖尚未 ready”，而是“依赖已不存在”；
+    /// - 引擎会记录 invalid_token_requested，用于诊断；
+    /// - 对于带缓存的节点（例如 map_mut），可以选择保留旧输出降级，而不是继续向上传播 Pending。
+    PendingInvalidToken,
 }
 
 impl Poll {
     #[inline]
     pub fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending | Self::PendingDefer)
+        matches!(
+            self,
+            Self::Pending | Self::PendingDefer | Self::PendingInvalidToken
+        )
     }
 }
 

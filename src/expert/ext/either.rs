@@ -59,7 +59,7 @@ macro_rules! impl_tuple_either {
 
                     $(
                         match ctx.request(&self.anchors.$num, true) {
-                            Poll::Pending | Poll::PendingDefer => {
+                            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
                                 found_pending = true;
                             }
                             Poll::Updated => {
@@ -125,7 +125,7 @@ macro_rules! impl_tuple_either {
                     ValOrAnchor::Anchor(an) => match ctx.request(an, true) {
                         Poll::Updated => Poll::Updated,
                         Poll::Unchanged => poll,
-                        Poll::Pending | Poll::PendingDefer => Poll::Pending,
+                        Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => Poll::Pending,
                     },
                 }
             }

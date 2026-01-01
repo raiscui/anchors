@@ -75,7 +75,7 @@ macro_rules! impl_tuple_update_observer {
 
                 $(
                     match ctx.request(&self.anchors.$num, true) {
-                        Poll::Pending | Poll::PendingDefer => {
+                        Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
                             found_pending = true;
                         }
                         Poll::Updated => {

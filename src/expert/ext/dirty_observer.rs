@@ -81,7 +81,7 @@ macro_rules! impl_tuple_dirty_observer {
                 let mut found_pending = false;
                 $(
                     match ctx.request(&self.anchors.$num, false) {
-                        Poll::Pending | Poll::PendingDefer => {
+                        Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
                             found_pending = true;
                         }
                         Poll::Updated | Poll::Unchanged => {

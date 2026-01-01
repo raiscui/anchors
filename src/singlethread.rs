@@ -1660,7 +1660,7 @@ impl Engine {
         let pending_on_anchor_get = ecx.pending_on_anchor_get;
         let invalid_token_requested = ecx.invalid_token_requested;
         match poll_result {
-            Poll::Pending | Poll::PendingDefer => {
+            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
                 if std::env::var("ANCHORS_DEBUG_PENDING")
                     .map(|v| v != "0")
                     .unwrap_or(false)
@@ -2269,7 +2269,12 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                 }
             }
 
-            return Poll::Pending;
+            // NOTE:
+            // - 这里返回 PendingInvalidToken，用于区分：
+            //   - “依赖尚未 ready”（Pending/PendingDefer）
+            //   - “依赖已被 GC/free（token 失效）”（PendingInvalidToken）
+            // - 上层 AnchorInner（例如 map_mut）可以据此选择保留旧输出降级，避免 stabilize 自旋或 panic。
+            return Poll::PendingInvalidToken;
         };
         self.request_node(child, necessary)
     }

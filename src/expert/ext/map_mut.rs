@@ -44,12 +44,16 @@ macro_rules! impl_tuple_map_mut {
                 }
 
                 let mut found_pending = false;
+                let mut found_invalid = false;
                 let mut found_updated = false;
 
                 $(
                     match ctx.request(&self.anchors.$num, true) {
                         Poll::Pending | Poll::PendingDefer => {
                             found_pending = true;
+                        }
+                        Poll::PendingInvalidToken => {
+                            found_invalid = true;
                         }
                         Poll::Updated => {
                             found_updated = true;
@@ -59,6 +63,18 @@ macro_rules! impl_tuple_map_mut {
                         }
                     }
                 )+
+
+                ////////////////////////////////////////////////////////////////////////////////
+                // NOTE:
+                // - PendingInvalidToken 在这里被视为“可降级”的 Pending：
+                //   表示依赖 token 已失效（节点已被 GC/free）。
+                // - 对于 map_mut：我们始终持有一个可用的旧输出，因此直接保持旧输出即可，
+                //   避免把 Pending 继续向上传播导致 stabilize 自旋或 panic。
+                ////////////////////////////////////////////////////////////////////////////////
+                if found_invalid {
+                    self.output_stale = false;
+                    return Poll::Unchanged;
+                }
 
                 if found_pending {
                     return Poll::Pending;
@@ -161,4 +177,74 @@ impl_tuple_map_mut! {
     [O6, 6]
     [O7, 7]
     [O8, 8]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 单测：当依赖返回 PendingInvalidToken 时，map_mut 应保持旧输出并返回 Unchanged。
+    ///
+    /// 背景：
+    /// - 拆树期可能出现“失效 token request”，在 EngineContextMut::request 中会转成 PendingDefer；
+    /// - map_mut 作为缓存型节点，应优先保持旧输出，避免把 Pending 继续向上传播导致 panic/自旋。
+    /// ////////////////////////////////////////////////////////////////////////////
+    #[test]
+    fn map_mut_should_degrade_on_pending_invalid_token() {
+        use crate::expert::UpdateContext as _;
+        use crate::singlethread::Engine;
+
+        // 初始化默认 mounter（Anchor::constant 依赖 Engine::new）
+        let _engine = Engine::new();
+
+        let a: Anchor<u32, Engine> = Anchor::constant(1);
+        let b: Anchor<u32, Engine> = Anchor::constant(2);
+
+        struct PendingDeferOnlyCtx;
+
+        impl crate::expert::UpdateContext for PendingDeferOnlyCtx {
+            type Engine = crate::singlethread::Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("map_mut 在 PendingInvalidToken 分支不应调用 get()");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                _anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                Poll::PendingInvalidToken
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("map_mut 在 PendingInvalidToken 分支不应申请 dirty_handle()");
+            }
+        }
+
+        let mut mapped: MapMut<(Anchor<u32, Engine>, Anchor<u32, Engine>), _, u32> = MapMut {
+            anchors: (a, b),
+            output: 123,
+            output_stale: true,
+            location: std::panic::Location::caller(),
+            f: |_out: &mut u32, _x: &u32, _y: &u32| -> bool {
+                panic!("PendingInvalidToken 时不应执行 f（因为依赖不可用）");
+            },
+        };
+
+        let mut ctx = PendingDeferOnlyCtx;
+        let poll = mapped.poll_updated(&mut ctx);
+        assert_eq!(Poll::Unchanged, poll);
+        assert!(
+            !mapped.output_stale,
+            "应当清除 output_stale，避免无意义重复尝试"
+        );
+        assert_eq!(123, mapped.output);
+    }
 }

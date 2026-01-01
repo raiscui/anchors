@@ -58,7 +58,7 @@ macro_rules! impl_tuple_then {
 
                     $(
                         match ctx.request(&self.anchors.$num, true) {
-                            Poll::Pending | Poll::PendingDefer => {
+                            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
                                 found_pending = true;
                                 self.output_stale = true;
                             }
@@ -186,7 +186,7 @@ where
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         if self.f_anchor.is_none() || self.output_stale {
             match ctx.request(&self.anchor, true) {
-                Poll::Pending | Poll::PendingDefer => {
+                Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
                     self.output_stale = true;
                     return Poll::Pending;
                 }
@@ -263,7 +263,7 @@ macro_rules! impl_tuple_then_dedupe {
                     let mut found_pending = false;
                     $(
                         match ctx.request(&self.anchors.$num, true) {
-                            Poll::Pending | Poll::PendingDefer => {
+                            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
                                 found_pending = true;
                                 self.output_stale = true;
                             }
