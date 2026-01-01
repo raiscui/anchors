@@ -181,6 +181,38 @@ fn test_split_simple() {
 }
 
 #[test]
+fn split_should_use_map_not_refmap() {
+    ////////////////////////////////////////////////////////////////////////////////
+    // NOTE:
+    // - split 过去基于 refmap 做字段投影：输出借用自输入；
+    // - 在 token 失效/GC 场景里，refmap 的 output() 需要 ctx.get()，容易触发 panic；
+    // - 该测试用于锁定行为：split 必须走 map + clone（owned 缓存），以便安全降级。
+    ////////////////////////////////////////////////////////////////////////////////
+    let mut engine = Engine::new();
+    let (v, _) = {
+        let var = crate::expert::Var::new((1usize, 2usize));
+        (var.watch(), var)
+    };
+    let (a, b) = v.split();
+
+    // 先驱动一次计算，确保节点都已挂载并可导出依赖图。
+    assert_eq!(engine.get(&a), 1);
+    assert_eq!(engine.get(&b), 2);
+
+    // 导出的 DOT 标签里会包含 AnchorInner 的 debug name。
+    // 这里我们只关心“不能出现 refmap”，避免未来回归到不安全实现。
+    let dot = engine.export_dot_from_tokens(&[a.token()]);
+    assert!(
+        dot.contains("map"),
+        "split 派生节点应当包含 map 调试名，dot={dot}"
+    );
+    assert!(
+        !dot.contains("refmap"),
+        "split 派生节点不应再包含 refmap，dot={dot}"
+    );
+}
+
+#[test]
 fn test_map_simple() {
     let mut engine = Engine::new();
     let (v1, _v1_setter) = {

@@ -420,9 +420,17 @@ macro_rules! impl_tuple_ext {
             )+
             E: Engine,
         {
+            #[track_caller]
             pub fn split(&self) -> ($(Anchor<$output_type, E>,)+) {
+                ////////////////////////////////////////////////////////////////////////////////
+                // NOTE:
+                // - split 原实现用 refmap 做字段投影（输出借用自输入），减少一次 owned 缓存；
+                // - 但在动态子树/GC 场景里，输入 token 可能短暂失效：
+                //   refmap 会在 output() 内部调用 ctx.get()，从而触发 EngineContext::get 的 panic；
+                // - 这里改为 map + clone，把字段值缓存为 owned 输出，使 PendingInvalidToken 可安全降级。
+                ////////////////////////////////////////////////////////////////////////////////
                 ($(
-                    self.refmap(|v| &v.$num),
+                    self.map(|v| v.$num.clone()),
                 )+)
             }
         }
