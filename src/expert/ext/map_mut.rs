@@ -6,6 +6,10 @@ pub struct MapMut<A, F, Out> {
     pub(super) f: F,
     pub(super) output: Out,
     pub(super) output_stale: bool,
+    /// 一旦检测到依赖 token 已失效（PendingInvalidToken），就进入“冻结降级”模式：
+    /// - 保持旧输出不变
+    /// - 不再响应后续 dirty（避免其他依赖变化导致反复 request 失效 token，刷屏/自旋）
+    pub(super) degraded_on_invalid: bool,
     pub(super) anchors: A,
     pub(super) location: &'static Location<'static>,
 }
@@ -24,6 +28,10 @@ macro_rules! impl_tuple_map_mut {
         {
             type Output = Out;
             fn dirty(&mut self, edge:  &<E::AnchorHandle as crate::expert::AnchorHandle>::Token) {
+                // 已进入降级冻结：不再响应任何 dirty，等待上层 drop/拆树。
+                if self.degraded_on_invalid {
+                    return;
+                }
                 // self.output_stale = true;
                 if self.output_stale {
                     return;
@@ -39,6 +47,11 @@ macro_rules! impl_tuple_map_mut {
                 &mut self,
                 ctx: &mut G,
             ) -> Poll {
+                // 已进入降级冻结：保持旧输出，避免重复 request 失效 token。
+                if self.degraded_on_invalid {
+                    self.output_stale = false;
+                    return Poll::Unchanged;
+                }
                 if !self.output_stale {
                     return Poll::Unchanged;
                 }
@@ -73,6 +86,7 @@ macro_rules! impl_tuple_map_mut {
                 ////////////////////////////////////////////////////////////////////////////////
                 if found_invalid {
                     self.output_stale = false;
+                    self.degraded_on_invalid = true;
                     return Poll::Unchanged;
                 }
 
@@ -192,7 +206,6 @@ mod tests {
     /// ////////////////////////////////////////////////////////////////////////////
     #[test]
     fn map_mut_should_degrade_on_pending_invalid_token() {
-        use crate::expert::UpdateContext as _;
         use crate::singlethread::Engine;
 
         // 初始化默认 mounter（Anchor::constant 依赖 Engine::new）
@@ -232,6 +245,7 @@ mod tests {
             anchors: (a, b),
             output: 123,
             output_stale: true,
+            degraded_on_invalid: false,
             location: std::panic::Location::caller(),
             f: |_out: &mut u32, _x: &u32, _y: &u32| -> bool {
                 panic!("PendingInvalidToken 时不应执行 f（因为依赖不可用）");

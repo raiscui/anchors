@@ -127,6 +127,7 @@ where
             f,
             output: initial,
             output_stale: true,
+            degraded_on_invalid: false,
             location: Location::caller(),
         })
     }
@@ -475,6 +476,7 @@ macro_rules! impl_tuple_ext {
                     f,
                     output: initial,
                     output_stale: true,
+                    degraded_on_invalid: false,
                     location: Location::caller(),
                 })
             }

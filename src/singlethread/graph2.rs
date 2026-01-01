@@ -14,6 +14,15 @@ struct FreeTraceConfig {
 }
 
 #[cfg(feature = "anchors_slotmap")]
+#[derive(Debug)]
+struct TokenTraceConfig {
+    enabled: bool,
+    token_filter: Option<u64>,
+    match_substr: Option<String>,
+    backtrace: bool,
+}
+
+#[cfg(feature = "anchors_slotmap")]
 impl FreeTraceConfig {
     fn from_env() -> Self {
         ////////////////////////////////////////////////////////////////////////////////
@@ -72,6 +81,64 @@ impl FreeTraceConfig {
 fn free_trace_cfg() -> &'static FreeTraceConfig {
     static CFG: OnceLock<FreeTraceConfig> = OnceLock::new();
     CFG.get_or_init(FreeTraceConfig::from_env)
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl TokenTraceConfig {
+    fn from_env(prefix: &str) -> Self {
+        let enabled = std::env::var(prefix)
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false);
+
+        let token_filter = std::env::var(format!("{prefix}_TOKEN"))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let match_substr = std::env::var(format!("{prefix}_MATCH"))
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let backtrace = std::env::var(format!("{prefix}_BACKTRACE"))
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false);
+
+        Self {
+            enabled,
+            token_filter,
+            match_substr,
+            backtrace,
+        }
+    }
+
+    #[inline]
+    fn should_log(&self, token: u64, debug_info: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if let Some(filter) = self.token_filter {
+            if token != filter {
+                return false;
+            }
+        }
+        if let Some(substr) = &self.match_substr {
+            if !debug_info.contains(substr.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(feature = "anchors_slotmap")]
+fn remove_trace_cfg() -> &'static TokenTraceConfig {
+    static CFG: OnceLock<TokenTraceConfig> = OnceLock::new();
+    CFG.get_or_init(|| TokenTraceConfig::from_env("ANCHORS_TRACE_REMOVE"))
+}
+
+#[cfg(feature = "anchors_slotmap")]
+fn reuse_trace_cfg() -> &'static TokenTraceConfig {
+    static CFG: OnceLock<TokenTraceConfig> = OnceLock::new();
+    CFG.get_or_init(|| TokenTraceConfig::from_env("ANCHORS_TRACE_REUSE"))
 }
 
 #[cfg(feature = "anchors_slotmap")]
@@ -278,6 +345,31 @@ mod node_store {
             let guard = super::NodeGuard(raw_guard);
             // unsafe: graph 指针由 slotmap 生成，与当前节点同生灭。
             let graph: &super::Graph2 = unsafe { &*guard.ptrs.graph };
+
+            ////////////////////////////////////////////////////////////////////////////////
+            // NOTE:
+            // - 纯调试能力：定位“某个 token 在何处被 remove()（进入 free list）”。
+            // - 该日志发生在真正执行 remove 的位置，便于区分 free() 与 retry_pending_free。
+            //
+            // 用法（示例）：
+            // - ANCHORS_TRACE_REMOVE=1 ANCHORS_TRACE_REMOVE_TOKEN=1012 ANCHORS_TRACE_REMOVE_BACKTRACE=1
+            // - ANCHORS_TRACE_REMOVE=1 ANCHORS_TRACE_REMOVE_MATCH=node_builder.rs
+            ////////////////////////////////////////////////////////////////////////////////
+            {
+                let cfg = super::remove_trace_cfg();
+                if cfg.enabled {
+                    let token = guard.slot_token.get();
+                    let debug_info = guard.debug_info.get()._to_string();
+                    if cfg.should_log(token, debug_info.as_str()) {
+                        eprintln!("[anchors][remove] token={token} debug={debug_info}");
+                        if cfg.backtrace {
+                            let bt = super::Backtrace::force_capture();
+                            eprintln!("[anchors][remove] backtrace:\n{bt}");
+                        }
+                    }
+                }
+            }
+
             graph.inc_free_attempt();
             if guard.anchor_locked.get() {
                 graph.inc_gc_skipped();
@@ -1198,7 +1290,43 @@ impl Graph2 {
                 guard.observed.set(false);
                 guard.visited.set(false);
                 guard.necessary_count.set(0);
-                guard.slot_token.set(self.next_slot_token());
+                ////////////////////////////////////////////////////////////////////////////////
+                // NOTE:
+                // - 纯调试能力：定位“哪个旧 token 被复用成新 token”，用于追踪失效 token 的来源。
+                // - 触发点：Graph2::insert 复用 free list 槽位时。
+                //
+                // 用法（示例）：
+                // - ANCHORS_TRACE_REUSE=1 ANCHORS_TRACE_REUSE_TOKEN=1012 ANCHORS_TRACE_REUSE_BACKTRACE=1
+                // - ANCHORS_TRACE_REUSE=1 ANCHORS_TRACE_REUSE_MATCH=node_builder.rs
+                ////////////////////////////////////////////////////////////////////////////////
+                #[cfg(feature = "anchors_slotmap")]
+                {
+                    let cfg = reuse_trace_cfg();
+                    if cfg.enabled {
+                        let old_token = guard.slot_token.get();
+                        let old_debug = guard.debug_info.get()._to_string();
+                        if cfg.should_log(old_token, old_debug.as_str()) {
+                            let new_token = self.next_slot_token();
+                            let new_debug = debug_info._to_string();
+                            eprintln!(
+                                "[anchors][reuse] old_token={old_token} new_token={new_token} old_debug={old_debug} new_debug={new_debug}",
+                            );
+                            if cfg.backtrace {
+                                let bt = Backtrace::force_capture();
+                                eprintln!("[anchors][reuse] backtrace:\n{bt}");
+                            }
+                            guard.slot_token.set(new_token);
+                        } else {
+                            guard.slot_token.set(self.next_slot_token());
+                        }
+                    } else {
+                        guard.slot_token.set(self.next_slot_token());
+                    }
+                }
+                #[cfg(not(feature = "anchors_slotmap"))]
+                {
+                    guard.slot_token.set(self.next_slot_token());
+                }
                 guard.ptrs.clean_parent0.set(None);
                 guard.ptrs.clean_parents.replace(vec![]);
                 guard.ptrs.recalc_state.set(RecalcState::Needed);
@@ -1405,7 +1533,7 @@ unsafe fn free(ptr: NodePtr) {
         let token = guard.slot_token.get();
         let debug_info = guard.debug_info.get()._to_string();
         if cfg.should_log(token, debug_info.as_str()) {
-            eprintln!("[anchors][free] token={} debug={}", token, debug_info);
+            eprintln!("[anchors][free] token={token} debug={debug_info}");
             if cfg.backtrace {
                 let bt = Backtrace::force_capture();
                 eprintln!("[anchors][free] backtrace:\n{bt}");
