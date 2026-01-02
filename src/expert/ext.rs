@@ -178,6 +178,32 @@ where
         })
     }
 
+    /// `then` 的“owned 输出缓存”版本：要求 `Out: Clone`，把输出缓存到自身，避免 output 阶段再去 `ctx.get(f_anchor)`。
+    ///
+    /// 背景：slotmap 模式下拆树/GC 期可能出现 `PendingInvalidToken`，引擎会尝试“保留旧输出”降级。
+    /// 但普通 `then` 的 `output()` 通过借用输出 Anchor 实现，仍可能在 token 失效时触发 `EngineContext::get` 硬崩溃。
+    ///
+    /// 该版本通过缓存 `Out`（clone）实现：
+    /// - 正常情况下：当输出 Anchor Updated 时刷新缓存；
+    /// - 遇到 `PendingInvalidToken`：冻结并保留缓存，返回 `Unchanged`，避免崩溃与重复 request 刷屏。
+    #[track_caller]
+    pub fn then_clone<F, Out>(&self, initial: Out, f: F) -> Anchor<Out, E>
+    where
+        Out: 'static + Clone,
+        F: 'static,
+        then::ThenClone1<O1, Out, F, E>: AnchorInner<E, Output = Out>,
+    {
+        E::mount(then::ThenClone1 {
+            anchor: self.clone(),
+            f,
+            f_anchor: None,
+            cached_output: initial,
+            degraded_on_invalid: false,
+            output_stale: true,
+            location: Location::caller(),
+        })
+    }
+
     /// 与 `then` 类似，但要求输入实现 `Clone + PartialEq`，当本轮输入与上一轮等价时复用旧输出 Anchor，
     /// 避免频繁切换 token 导致的高度回填和重算。
     #[track_caller]
