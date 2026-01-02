@@ -471,6 +471,10 @@ pub struct GcStatsSnapshot {
     pub free_attempts: u64,
     pub free_succeeded: u64,
     pub pending_free: usize,
+    /// epoch 嵌套深度（>0 表示处于“读窗口”，禁止 token 回收/复用）。
+    pub epoch_depth: usize,
+    /// epoch 期间被 retire 的待回收节点数量（epoch end 统一尝试回收）。
+    pub retired_free: usize,
 }
 
 #[cfg(feature = "anchors_slotmap")]
@@ -524,6 +528,20 @@ pub struct Graph2 {
     active_nodes: Cell<usize>,
     #[cfg(feature = "anchors_slotmap")]
     pending_free: RefCell<Vec<NodePtr>>,
+    ////////////////////////////////////////////////////////////////////////////////
+    // Epoch（读窗口）：
+    // - epoch_depth > 0：禁止 token 物理回收/复用（nodes.remove -> free list）。
+    // - 仅允许把待回收节点“退休(retire)”到队列中，等 epoch end 再统一回收。
+    //
+    // 这样可以覆盖 “事件派发 + stabilize + render” 的读窗口，避免 TOCTOU：
+    // 派发前半段拿到的 token，在派发后半段继续 get 时被回收导致 hard panic。
+    ////////////////////////////////////////////////////////////////////////////////
+    #[cfg(feature = "anchors_slotmap")]
+    epoch_depth: Cell<usize>,
+    #[cfg(feature = "anchors_slotmap")]
+    retired_free: RefCell<Vec<NodePtr>>,
+    #[cfg(feature = "anchors_slotmap")]
+    epoch_flushes: Cell<u64>,
     #[cfg(feature = "anchors_slotmap")]
     gc_skipped: Cell<u64>,
     #[cfg(feature = "anchors_slotmap")]
@@ -548,6 +566,30 @@ pub struct Graph2 {
 
     /// pointer to head of linked list of free nodes
     free_head: Box<Cell<Option<NodePtr>>>,
+}
+
+/// epoch 的 RAII 守卫：
+/// - 创建时：epoch_depth += 1
+/// - Drop 时：epoch_depth -= 1；当归零时触发 flush_retired（真正回收/复用 token）
+#[cfg(feature = "anchors_slotmap")]
+pub struct EpochGuard {
+    graph: Rc<Graph2>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl EpochGuard {
+    #[must_use]
+    pub(crate) fn new(graph: Rc<Graph2>) -> Self {
+        graph.enter_epoch();
+        Self { graph }
+    }
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl Drop for EpochGuard {
+    fn drop(&mut self) {
+        self.graph.leave_epoch();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1184,6 +1226,8 @@ impl Graph2 {
             free_attempts: self.free_attempts.get(),
             free_succeeded: self.free_succeeded.get(),
             pending_free: self.pending_free.borrow().len(),
+            epoch_depth: self.epoch_depth.get(),
+            retired_free: self.retired_free.borrow().len(),
         }
     }
 
@@ -1197,6 +1241,14 @@ impl Graph2 {
 
     #[cfg(feature = "anchors_slotmap")]
     fn retry_pending_free(&self) {
+        ////////////////////////////////////////////////////////////////////////////////
+        // epoch 内禁止 token 物理回收/复用：
+        // - pending_free 里的节点同样属于“待回收”，必须等到 epoch end 才能真正 remove。
+        ////////////////////////////////////////////////////////////////////////////////
+        if self.epoch_depth.get() > 0 {
+            return;
+        }
+
         let mut pending = self.pending_free.borrow_mut();
         if pending.is_empty() {
             return;
@@ -1204,6 +1256,11 @@ impl Graph2 {
 
         let mut still_pending = Vec::new();
         for ptr in pending.drain(..) {
+            debug_assert_eq!(
+                self.epoch_depth.get(),
+                0,
+                "slotmap: retry_pending_free 不应在 epoch 内触发 remove"
+            );
             let freed = unsafe { self.nodes.remove(ptr) };
             if !freed {
                 if !still_pending.iter().any(|p| *p == ptr) {
@@ -1212,6 +1269,112 @@ impl Graph2 {
             }
         }
         *pending = still_pending;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Epoch（读窗口）实现
+    ////////////////////////////////////////////////////////////////////////////////
+    #[cfg(feature = "anchors_slotmap")]
+    fn epoch_trace_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("ANCHORS_EPOCH_TRACE").ok().as_deref() == Some("1"))
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn enter_epoch(&self) {
+        let prev = self.epoch_depth.get();
+        let next = prev.saturating_add(1);
+        self.epoch_depth.set(next);
+
+        // 只在 0->1 时打印 begin，避免嵌套时刷屏。
+        if prev == 0 && Self::epoch_trace_enabled() {
+            let retired_len = self.retired_free.borrow().len();
+            let pending_len = self.pending_free.borrow().len();
+            eprintln!(
+                "[anchors][epoch] begin depth={next} retired_free={retired_len} pending_free={pending_len}"
+            );
+        }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn leave_epoch(&self) {
+        let prev = self.epoch_depth.get();
+        debug_assert!(prev > 0, "slotmap: leave_epoch depth 不应为 0");
+        if prev == 0 {
+            return;
+        }
+
+        let next = prev - 1;
+        self.epoch_depth.set(next);
+
+        // 只在 1->0 时打印 end，并触发真正回收。
+        if next == 0 {
+            if Self::epoch_trace_enabled() {
+                let retired_len = self.retired_free.borrow().len();
+                let pending_len = self.pending_free.borrow().len();
+                eprintln!(
+                    "[anchors][epoch] end depth={next} retired_free={retired_len} pending_free={pending_len}"
+                );
+            }
+            self.flush_retired();
+        }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn retire_free(&self, ptr: NodePtr) {
+        let mut retired = self.retired_free.borrow_mut();
+        if retired.iter().any(|p| *p == ptr) {
+            return;
+        }
+        retired.push(ptr);
+
+        if Self::epoch_trace_enabled() {
+            // NOTE: 这里不打印 token/debug，避免和 free_trace_cfg 的定位能力重复。
+            //       epoch trace 更关注“队列是否积压”。
+            let depth = self.epoch_depth.get();
+            let retired_len = retired.len();
+            eprintln!("[anchors][epoch] retire depth={depth} retired_free={retired_len}");
+        }
+    }
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn flush_retired(&self) {
+        debug_assert_eq!(
+            self.epoch_depth.get(),
+            0,
+            "slotmap: flush_retired 只能在 epoch end 执行"
+        );
+
+        let mut retired = self.retired_free.borrow_mut();
+        if retired.is_empty() {
+            drop(retired);
+            // 仍然尝试清理 pending_free，避免残留。
+            self.retry_pending_free();
+            return;
+        }
+
+        self.epoch_flushes
+            .set(self.epoch_flushes.get().saturating_add(1));
+
+        // 将 retire 列表一次性取出，避免在 remove 时持有 RefCell 借用。
+        let to_free: Vec<NodePtr> = retired.drain(..).collect();
+        drop(retired);
+
+        for ptr in to_free {
+            debug_assert_eq!(
+                self.epoch_depth.get(),
+                0,
+                "slotmap: flush_retired 不应在 epoch 内触发 remove"
+            );
+
+            let freed = unsafe { self.nodes.remove(ptr) };
+            if !freed {
+                self.enqueue_free_retry(ptr);
+            }
+        }
+
+        // 统一在 epoch end 再尝试一次 pending_free，最大化回收成功率。
+        self.retry_pending_free();
     }
 
     #[cfg(not(feature = "anchors_slotmap"))]
@@ -1237,6 +1400,12 @@ impl Graph2 {
             active_nodes: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             pending_free: RefCell::new(vec![]),
+            #[cfg(feature = "anchors_slotmap")]
+            epoch_depth: Cell::new(0),
+            #[cfg(feature = "anchors_slotmap")]
+            retired_free: RefCell::new(vec![]),
+            #[cfg(feature = "anchors_slotmap")]
+            epoch_flushes: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
             gc_skipped: Cell::new(0),
             #[cfg(feature = "anchors_slotmap")]
@@ -1541,6 +1710,17 @@ unsafe fn free(ptr: NodePtr) {
         }
     }
 
+    // epoch 内禁止 token 物理回收/复用：只允许 retire，等待 epoch end 再统一 reclaim。
+    if graph.epoch_depth.get() > 0 {
+        graph.retire_free(ptr);
+        return;
+    }
+
+    debug_assert_eq!(
+        graph.epoch_depth.get(),
+        0,
+        "slotmap: free 不应在 epoch 内执行 remove"
+    );
     if unsafe { !graph.nodes.remove(ptr) } {
         graph.enqueue_free_retry(ptr);
     }

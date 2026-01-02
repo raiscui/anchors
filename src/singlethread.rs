@@ -17,6 +17,8 @@ use tracing::trace;
 
 pub use graph2::AnchorHandle;
 #[cfg(feature = "anchors_slotmap")]
+pub use graph2::EpochGuard;
+#[cfg(feature = "anchors_slotmap")]
 pub use graph2::GcStatsSnapshot;
 pub use graph2::NodeKey as AnchorToken;
 
@@ -647,6 +649,19 @@ impl Engine {
     #[must_use]
     pub fn slotmap_gc_stats(&self) -> GcStatsSnapshot {
         self.graph.gc_stats_snapshot()
+    }
+
+    /// 进入 anchors epoch（读窗口）。
+    ///
+    /// 在 epoch 期间：
+    /// - 禁止 token 的物理回收/复用（nodes.remove -> free list）；
+    /// - 只允许把待回收节点 retire 入队，等到 epoch end 再统一 reclaim。
+    ///
+    /// 典型用法：由事件循环在 “事件派发 + stabilize + render” 外层持有该 guard。
+    #[cfg(feature = "anchors_slotmap")]
+    #[must_use]
+    pub fn enter_epoch(&self) -> EpochGuard {
+        EpochGuard::new(self.graph.clone())
     }
 
     /// 读取 token 计数与最近删除记录，便于验证“单调且不复用”。
