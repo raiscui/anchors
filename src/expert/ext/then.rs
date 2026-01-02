@@ -757,7 +757,7 @@ mod tests {
             }
         }
 
-        let mut inner = ThenClone1::<u32, u32, _, Engine> {
+        let inner = ThenClone1::<u32, u32, _, Engine> {
             f: move |_v: &u32| output_for_f.clone(),
             f_anchor: Some(output),
             cached_output: 777,

@@ -609,6 +609,7 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
 #[cfg(test)]
 mod tests {
 
+    #[allow(dead_code)]
     fn tracing_init() {
         use tracing_subscriber::prelude::*;
         // A general-purpose logging layer.

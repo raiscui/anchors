@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anchors::singlethread::{Anchor, AnchorToken, Engine, Var};
 
 /// ════════════════════════════════════════════════════════════════════════

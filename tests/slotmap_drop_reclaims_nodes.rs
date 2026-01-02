@@ -7,6 +7,7 @@ mod slotmap;
 #[cfg(all(feature = "anchors_slotmap", target_os = "linux"))]
 use libc::_SC_PAGESIZE;
 #[cfg(all(feature = "anchors_slotmap", target_os = "macos"))]
+#[allow(deprecated)]
 use libc::{
     KERN_SUCCESS, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_msg_type_number_t,
     mach_task_basic_info_data_t, mach_task_self, task_info,
@@ -36,6 +37,7 @@ fn current_rss_bytes() -> u64 {
 }
 
 #[cfg(all(feature = "anchors_slotmap", target_os = "macos"))]
+#[allow(deprecated)]
 fn current_rss_bytes() -> u64 {
     // macOS: 使用 mach task_info 拿到实时 resident_size，避免 ru_maxrss 只记录「历史最大值」造成误判。
     let mut info: mach_task_basic_info_data_t = unsafe { std::mem::zeroed() };

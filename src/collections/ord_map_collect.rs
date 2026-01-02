@@ -279,8 +279,6 @@ where
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
-        let mut changed = false;
-
         if std::env::var("ANCHORS_DEBUG_COLLECT")
             .map(|v| v != "0")
             .unwrap_or(false)
@@ -291,80 +289,76 @@ where
             );
         }
 
-        // 只有一个输入：整张字典 Anchor。更新/脏时重建输出。
-        if self.dirty {
-            match ctx.request(&self.input, true) {
-                Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
-                    // 输入仍在计算，延后本节点重建，避免在持锁期间重复入队。
-                    return Poll::Pending;
-                }
-                Poll::Updated | Poll::Unchanged => {
-                    // Updated 直接继续重建即可（已确保依赖顺序），重入风险低于 Pending。
-                }
-            };
+        // ─────────────────────────────────────────────────────────────
+        // anchors 契约说明（非常重要）：
+        // - `poll_updated` 只有在“本轮 request 了某个未就绪子 Anchor”时才允许返回 Pending。
+        // - 过去这里存在一个分支：`input Updated => dirty=true; return Pending`。
+        //   该分支没有 request 未就绪子 Anchor，会触发引擎的 unexpected_pending/panic，
+        //   也可能导致“冻结旧输出”从而造成界面不更新。
+        // - 正确做法：当 input Updated 时，必须在同一轮直接进入重建逻辑。
+        // ─────────────────────────────────────────────────────────────
 
-            let dict_in = ctx.get(&self.input);
-            let entries: Vec<(I, Anchor<V, E>)> = dict_in
-                .iter()
-                .map(|(i, anchor)| (i.clone(), anchor.clone()))
-                .collect();
-            // 一次性请求全部子 Anchor，避免遇到第一个 Pending 就早退导致多轮调度。
-            let mut pending_child = false;
-            let mut ready_entries: Vec<(I, V)> = Vec::with_capacity(entries.len());
-
-            for (i, anchor) in entries {
-                match ctx.request(&anchor, true) {
-                    Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
-                        pending_child = true;
-                        continue;
-                    }
-                    _ => {}
-                }
-                ready_entries.push((i, ctx.get(&anchor).clone()));
-            }
-
-            if pending_child {
-                // 子节点尚未全部就绪，保持 dirty，等待下一轮统一重建。
+        // 1) 先 request 输入字典，确保依赖关系/必要性正确，同时判定是否需要重建。
+        match ctx.request(&self.input, true) {
+            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
+                // 输入仍在计算，延后本节点重建，避免在持锁期间重复入队。
                 return Poll::Pending;
             }
-
-            let pool = ordmap::OrdMapPool::new(ready_entries.len());
-            let mut dict = OrdMap::with_pool(&pool);
-            ready_entries.into_iter().collect_into(&mut dict);
-
-            if std::env::var("ANCHORS_DEBUG_COLLECT")
-                .map(|v| v != "0")
-                .unwrap_or(false)
-            {
-                println!(
-                    "OrdMapCollectStream 重建完成，条目={} loc={:?}",
-                    dict.len(),
-                    self.location
-                );
+            Poll::Updated => {
+                // 输入字典已更新：即使本节点未收到 dirty 通知，也必须重建。
+                self.dirty = true;
             }
+            Poll::Unchanged => {}
+        }
 
-            self.vals = Some(dict);
-            self.dirty = false;
-            changed = true;
-        } else {
-            // 保持依赖以便高度/必要关系正确
-            match ctx.request(&self.input, true) {
+        // 2) 若无需重建，则保持 Unchanged。
+        if !self.dirty {
+            return Poll::Unchanged;
+        }
+
+        // 3) 重建输出：一次性 request 全部子 Anchor，避免遇到第一个 Pending 就早退导致多轮调度。
+        let dict_in = ctx.get(&self.input);
+        let entries: Vec<(I, Anchor<V, E>)> = dict_in
+            .iter()
+            .map(|(i, anchor)| (i.clone(), anchor.clone()))
+            .collect();
+        let mut pending_child = false;
+        let mut ready_entries: Vec<(I, V)> = Vec::with_capacity(entries.len());
+
+        for (i, anchor) in entries {
+            match ctx.request(&anchor, true) {
                 Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
-                    return Poll::Pending;
+                    pending_child = true;
+                    continue;
                 }
-                Poll::Updated => {
-                    self.dirty = true;
-                    return Poll::Pending;
-                }
-                Poll::Unchanged => {}
+                _ => {}
             }
+            ready_entries.push((i, ctx.get(&anchor).clone()));
         }
 
-        if changed {
-            Poll::Updated
-        } else {
-            Poll::Unchanged
+        if pending_child {
+            // 子节点尚未全部就绪，保持 dirty，等待下一轮统一重建。
+            return Poll::Pending;
         }
+
+        let pool = ordmap::OrdMapPool::new(ready_entries.len());
+        let mut dict = OrdMap::with_pool(&pool);
+        ready_entries.into_iter().collect_into(&mut dict);
+
+        if std::env::var("ANCHORS_DEBUG_COLLECT")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            println!(
+                "OrdMapCollectStream 重建完成，条目={} loc={:?}",
+                dict.len(),
+                self.location
+            );
+        }
+
+        self.vals = Some(dict);
+        self.dirty = false;
+        Poll::Updated
     }
 
     fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
@@ -387,7 +381,94 @@ mod test {
 
     use crate::im_rc::OrdMap;
 
+    use super::OrdMapCollectStream;
+    use crate::expert::{
+        AnchorHandle, AnchorInner, Engine as AnchorEngine, OutputContext, Poll, UpdateContext,
+    };
     use crate::{dict, singlethread::*};
+    use std::panic::Location;
+
+    type Token = <<Engine as AnchorEngine>::AnchorHandle as AnchorHandle>::Token;
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 回归：防止 “input Updated => dirty=true; return Pending” 这种违规 Pending
+    ///
+    /// 说明：
+    /// - 我们用一个“屏蔽 dirty 转发”的包装器来模拟：输入变了，但收集器内部没收到 dirty 通知。
+    /// - 旧实现会在 `dirty=false` 时遇到 `input Updated` 直接返回 Pending，
+    ///   引擎会把它当成 unexpected_pending，可能冻结旧输出，导致界面不更新。
+    /// - 修复后：必须在同一轮进入重建逻辑，返回 Updated，输出随输入变化而更新。
+    /// ////////////////////////////////////////////////////////////////////////////
+    struct DirtyDroppedOrdMapCollectStream<I, V> {
+        inner: OrdMapCollectStream<I, V, Engine>,
+        location: &'static Location<'static>,
+    }
+
+    impl<I, V> AnchorInner<Engine> for DirtyDroppedOrdMapCollectStream<I, V>
+    where
+        V: Clone + 'static,
+        I: 'static + Clone + Ord,
+    {
+        type Output = OrdMap<I, V>;
+
+        fn dirty(&mut self, _edge: &Token) {
+            // 故意不转发给 inner.dirty，模拟“dirty 通知丢失”。
+        }
+
+        fn poll_updated<G: UpdateContext<Engine = Engine>>(&mut self, ctx: &mut G) -> Poll {
+            <OrdMapCollectStream<I, V, Engine> as AnchorInner<Engine>>::poll_updated(
+                &mut self.inner,
+                ctx,
+            )
+        }
+
+        fn output<'slf, 'out, G: OutputContext<'out, Engine = Engine>>(
+            &'slf self,
+            ctx: &mut G,
+        ) -> &'out Self::Output
+        where
+            'slf: 'out,
+        {
+            <OrdMapCollectStream<I, V, Engine> as AnchorInner<Engine>>::output(&self.inner, ctx)
+        }
+
+        fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
+            Some(("DirtyDroppedOrdMapCollectStream", self.location))
+        }
+    }
+
+    #[test]
+    fn collect_stream_should_rebuild_on_input_updated_even_without_dirty_forwarding() {
+        let mut engine = Engine::new();
+
+        let a = Var::new(1usize);
+        let b = Var::new(2usize);
+        let c = Var::new(10usize);
+
+        let dict_var = Var::new(dict!(1usize=>a.watch(), 2usize=>b.watch()));
+        let input = dict_var.watch();
+
+        // 先计算一次，确保有“历史输出”。
+        let collected: Anchor<OrdMap<usize, usize>> =
+            Engine::mount(DirtyDroppedOrdMapCollectStream {
+                inner: OrdMapCollectStream {
+                    input,
+                    vals: None,
+                    dirty: true,
+                    location: Location::caller(),
+                },
+                location: Location::caller(),
+            });
+
+        let sum: Anchor<usize> = collected.map(|m| m.values().sum());
+        assert_eq!(engine.get(&sum), 3);
+
+        // 更新输入字典（新增 key），但包装器不转发 dirty：
+        // - 旧实现会走 `dirty=false + input Updated => Pending`，导致冻结旧输出（仍返回 3）。
+        // - 新实现必须在同一轮重建并返回 Updated，得到正确的 13。
+        dict_var.set(dict!(1usize=>a.watch(), 2usize=>b.watch(), 3usize=>c.watch()));
+        assert_eq!(engine.get(&sum), 13);
+    }
 
     #[test]
     fn collect_k_change() {

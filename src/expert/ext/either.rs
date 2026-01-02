@@ -285,7 +285,7 @@ mod tests {
 
         let b = Var::new(9);
         let bw = b.watch();
-        let bw2 = bw.clone();
+        let _bw2 = bw.clone();
 
         let w = a.watch().either(move |&x| {
             debug!("in either  ,  x:{x}");
@@ -313,7 +313,7 @@ mod tests {
 
         debug!(".....................");
         a.set(c.watch());
-        // a.set(bw2);
+        // a.set(_bw2);
         debug!("a seted .....................");
 
         // debug!("a:{}", engine.get(a.get().as_anchor().unwrap()));
@@ -335,7 +335,7 @@ mod tests {
     fn aaaxx() {
         let mut engine = Engine::new();
         let a = VarVOA::new(1);
-        let c = Var::new(22);
+        let _c = Var::new(22);
         let d = Var::new(-1);
         let b = Var::new(9);
         let bw = b.watch();
