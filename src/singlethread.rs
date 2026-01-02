@@ -55,6 +55,31 @@ impl InvalidTokenLogInner {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// “意外 Pending”观测：
+//
+// Anchors 的契约是：
+// - 若 `poll_updated` 返回 Pending，则必须是因为它 request 了某个子 Anchor 且该子 Anchor 未 Ready；
+// - 否则 Engine 无法知道“它在等什么”，继续 requeue 会导致 stabilize 自旋（CPU 满载）。
+//
+// 但在真实项目里，我们宁愿“冻结旧输出并记录告警”，也不希望 GUI 直接崩溃。
+// 这里用 raw_token 做去重计数，避免同一节点反复刷屏。
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "anchors_slotmap")]
+#[derive(Default)]
+struct UnexpectedPendingLogInner {
+    counts: HashMap<u64, u32>,
+}
+
+#[cfg(feature = "anchors_slotmap")]
+impl UnexpectedPendingLogInner {
+    fn bump(&mut self, raw_token: u64) -> u32 {
+        let entry = self.counts.entry(raw_token).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+}
+
 /// Pending 队列统计快照，用于在 demo/测试后导出指标。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnchorsPendingStats {
@@ -497,6 +522,8 @@ pub struct Engine {
     #[cfg(feature = "anchors_slotmap")]
     invalid_token_log: Rc<RefCell<InvalidTokenLogInner>>,
     #[cfg(feature = "anchors_slotmap")]
+    unexpected_pending_log: Rc<RefCell<UnexpectedPendingLogInner>>,
+    #[cfg(feature = "anchors_slotmap")]
     last_subset_remaining: Rc<RefCell<Vec<NodeKey>>>,
     #[cfg(feature = "anchors_slotmap")]
     last_subset_remaining_debug: Rc<RefCell<Vec<String>>>,
@@ -594,6 +621,8 @@ impl Engine {
             pending_stats: Rc::new(PendingStatsInner::default()),
             #[cfg(feature = "anchors_slotmap")]
             invalid_token_log: Rc::new(RefCell::new(InvalidTokenLogInner::default())),
+            #[cfg(feature = "anchors_slotmap")]
+            unexpected_pending_log: Rc::new(RefCell::new(UnexpectedPendingLogInner::default())),
             #[cfg(feature = "anchors_slotmap")]
             last_subset_remaining: Rc::new(RefCell::new(Vec::new())),
             #[cfg(feature = "anchors_slotmap")]
@@ -717,6 +746,27 @@ impl Engine {
     #[inline]
     fn should_log_invalid_token(count: u32) -> bool {
         matches!(count, 1 | 10 | 100) || count % 1000 == 0
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // “意外 Pending”观测与去重
+
+    #[cfg(feature = "anchors_slotmap")]
+    fn bump_unexpected_pending_count(&self, raw_token: u64) -> u32 {
+        let mut slot = self.unexpected_pending_log.borrow_mut();
+        slot.bump(raw_token)
+    }
+
+    #[cfg(not(feature = "anchors_slotmap"))]
+    #[inline]
+    fn bump_unexpected_pending_count(&self, _raw_token: u64) -> u32 {
+        1
+    }
+
+    #[inline]
+    fn should_log_unexpected_pending(count: u32) -> bool {
+        // 复用同一套“稀疏采样”策略：1/10/100/每 1000 次
+        Self::should_log_invalid_token(count)
     }
 
     #[cfg(feature = "anchors_slotmap")]
@@ -1713,9 +1763,40 @@ impl Engine {
                     // requested anchor's already, or it was updated so it's higher now.
                     false
                 } else {
-                    // in the future, this means we polled on some non-anchors future. since
-                    // that isn't supported for now, this just means something went wrong
-                    panic!("poll_updated return pending without requesting another anchor");
+                    // ──────────────────────────────────────────────────────────────
+                    // 意外 Pending：
+                    // - `poll_updated` 返回 Pending，但本次 poll 没有 request 任何“未 Ready 的子 Anchor”。
+                    // - 这意味着它在等待“非 anchors 依赖”（比如外部 Future/通道/时钟），
+                    //   anchors 无法追踪依赖关系，继续 requeue 会导致 stabilize 自旋。
+                    //
+                    // 处理策略：
+                    // - 若该节点曾经 Ready 过（有旧输出）：冻结旧输出并记录告警，避免 GUI 崩溃；
+                    // - 若从未 Ready（无旧输出）：无法提供降级输出，仍然 panic，且附带 node 信息。
+                    // ──────────────────────────────────────────────────────────────
+                    let raw_token = node.key().raw_token();
+                    let count = self.bump_unexpected_pending_count(raw_token);
+                    if Self::should_log_unexpected_pending(count) {
+                        let debug = node.debug_info.get()._to_string();
+                        eprintln!(
+                            "[anchors][unexpected_pending] node={debug} token={raw_token} seen={count} poll={poll_result:?}"
+                        );
+                        // NOTE: 只在第一次采样时抓一次回溯，避免高频路径产生大量 backtrace 分配。
+                        if count == 1 {
+                            let bt = Backtrace::force_capture();
+                            eprintln!("[anchors][unexpected_pending] backtrace:\n{bt}");
+                        }
+                    }
+
+                    if node.last_ready.get().is_some() {
+                        // 冻结：把本轮视为“已 ready”，避免不断 requeue。
+                        node.last_ready.set(Some(self.generation));
+                        return true;
+                    }
+
+                    panic!(
+                        "poll_updated 返回 Pending，但未 request 任何未就绪子 Anchor，且节点无历史输出无法降级；node={} token={raw_token}",
+                        node.debug_info.get()._to_string(),
+                    );
                 }
             }
             Poll::Updated => {
