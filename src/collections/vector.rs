@@ -110,20 +110,47 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         let mut changed = false;
         if self.dirty {
-            let polls = self.anchors.iter().try_fold(vec![], |mut acc, anchor| {
-                let s = ctx.request(anchor, true);
-                if !s.is_pending() {
-                    acc.push((s, anchor));
-                    Some(acc)
-                } else {
-                    None
-                }
-            });
+            ////////////////////////////////////////////////////////////////////////////////
+            // `PendingInvalidToken` 不会变成 Ready。
+            // 若仍当作 Pending，会导致 VectorCollect 持续 request 失效 token，图无法收敛。
+            //
+            // 策略：将失效 token 对应的 Anchor 从 anchors 列表中剔除，再重建输出。
+            ////////////////////////////////////////////////////////////////////////////////
+            let mut invalid_found = false;
+            let mut polls: Vec<(Poll, &Anchor<T, E>)> = Vec::with_capacity(self.anchors.len());
+            let mut next_anchors_vec: Vec<Anchor<T, E>> = Vec::with_capacity(self.anchors.len());
 
-            if polls.is_none() {
-                return Poll::Pending;
+            for anchor in self.anchors.iter() {
+                let s = ctx.request(anchor, true);
+                match s {
+                    Poll::Pending | Poll::PendingDefer => return Poll::Pending,
+                    Poll::PendingInvalidToken => {
+                        invalid_found = true;
+                    }
+                    _ => {
+                        polls.push((s, anchor));
+                        next_anchors_vec.push(anchor.clone());
+                    }
+                }
             }
             self.dirty = false;
+
+            if invalid_found {
+                let pool = vector::RRBPool::<Anchor<T, E>>::new(next_anchors_vec.len());
+                let mut next_anchors = Vector::with_pool(&pool);
+                next_anchors_vec.into_iter().collect_into(&mut next_anchors);
+
+                let pool = vector::RRBPool::<T>::new(next_anchors.len());
+                let mut vals = Vector::with_pool(&pool);
+                next_anchors
+                    .iter()
+                    .map(|anchor| ctx.get(anchor).clone())
+                    .collect_into(&mut vals);
+
+                self.anchors = next_anchors;
+                self.vals = Some(vals);
+                return Poll::Updated;
+            }
 
             // ─────────────────────────────────────────────────────────────────────────────
             // self.anchors.iter().for_each(|a| {
@@ -133,7 +160,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
             // ─────────────────────────────────────────────────────
 
             if let Some(ref mut old_vals) = self.vals {
-                for (old_val, (poll, anchor)) in old_vals.iter_mut().zip(polls.unwrap().iter()) {
+                for (old_val, (poll, anchor)) in old_vals.iter_mut().zip(polls.iter()) {
                     if &Poll::Updated == poll {
                         *old_val = ctx.get(anchor).clone();
                         changed = true;

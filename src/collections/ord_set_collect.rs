@@ -74,12 +74,21 @@ where
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         if self.dirty {
-            let pending_exists = self
-                .anchors
-                .iter()
-                .any(|anchor| ctx.request(anchor, true).is_pending());
-            if pending_exists {
-                return Poll::Pending;
+            ////////////////////////////////////////////////////////////////////////////////
+            // `PendingInvalidToken` 不是可恢复的 Pending。
+            // 对于集合收集器：将失效 token 对应的 Anchor 视为“元素被移除”，从集合中剔除。
+            ////////////////////////////////////////////////////////////////////////////////
+            let mut invalid_anchors: Vec<Anchor<T, E>> = Vec::new();
+            for anchor in self.anchors.iter() {
+                match ctx.request(anchor, true) {
+                    Poll::Pending | Poll::PendingDefer => return Poll::Pending,
+                    Poll::PendingInvalidToken => invalid_anchors.push(anchor.clone()),
+                    _ => {}
+                }
+            }
+
+            for invalid in invalid_anchors {
+                let _ = self.anchors.remove(&invalid);
             }
 
             self.dirty = false;

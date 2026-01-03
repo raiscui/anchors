@@ -110,7 +110,10 @@ fn is_token_alive_reflects_drop_and_remove() {
     let token = watch.token();
 
     // 节点仍被 handle 持有时应为 alive。
-    assert!(engine.is_token_alive(token), "节点仍被 handle 持有时应为 alive");
+    assert!(
+        engine.is_token_alive(token),
+        "节点仍被 handle 持有时应为 alive"
+    );
 
     // drop 掉最后一个 handle（Var 自身 + watch 克隆）后，token 应当失效（anchor 置空/进入 free list）。
     drop(watch);

@@ -52,20 +52,42 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VecCollect<T, E> {
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         let mut changed = false;
         if self.dirty {
-            let polls = self.anchors.iter().try_fold(vec![], |mut acc, anchor| {
-                let s = ctx.request(anchor, true);
-                if !s.is_pending() {
-                    acc.push((s, anchor));
-                    Some(acc)
-                } else {
-                    None
-                }
-            });
+            ////////////////////////////////////////////////////////////////////////////////
+            // 与 `VectorVOACollect` 同理：`PendingInvalidToken` 不是可恢复的 Pending。
+            // 若继续把它当 Pending，会导致 VecCollect 每轮 stabilize 都重复 request 死 token。
+            //
+            // 策略：把失效 token 对应的 Anchor 视为“已移除”，从 anchors 列表里剔除，
+            // 并基于剩余 anchors 立即重建输出，让图能收敛。
+            ////////////////////////////////////////////////////////////////////////////////
+            let mut invalid_found = false;
+            let mut polls: Vec<(Poll, &Anchor<T, E>)> = Vec::with_capacity(self.anchors.len());
+            let mut next_anchors: Vec<Anchor<T, E>> = Vec::with_capacity(self.anchors.len());
 
-            if polls.is_none() {
-                return Poll::Pending;
+            for anchor in self.anchors.iter() {
+                let s = ctx.request(anchor, true);
+                match s {
+                    Poll::Pending | Poll::PendingDefer => return Poll::Pending,
+                    Poll::PendingInvalidToken => {
+                        invalid_found = true;
+                    }
+                    _ => {
+                        polls.push((s, anchor));
+                        next_anchors.push(anchor.clone());
+                    }
+                }
             }
             self.dirty = false;
+
+            if invalid_found {
+                self.anchors = next_anchors;
+                self.vals = Some(
+                    self.anchors
+                        .iter()
+                        .map(|anchor| ctx.get(anchor).clone())
+                        .collect(),
+                );
+                return Poll::Updated;
+            }
 
             // ─────────────────────────────────────────────────────────────────────────────
             // self.anchors.iter().for_each(|a| {
@@ -75,7 +97,7 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VecCollect<T, E> {
             // ─────────────────────────────────────────────────────
 
             if let Some(ref mut old_vals) = self.vals {
-                for (old_val, (poll, anchor)) in old_vals.iter_mut().zip(polls.unwrap().iter()) {
+                for (old_val, (poll, anchor)) in old_vals.iter_mut().zip(polls.iter()) {
                     if &Poll::Updated == poll {
                         *old_val = ctx.get(anchor).clone();
                         changed = true;
