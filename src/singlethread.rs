@@ -1037,6 +1037,19 @@ impl Engine {
         })
     }
 
+    /// 检查 `AnchorToken` 是否仍然指向一个“活节点”。
+    ///
+    /// 说明：
+    /// - 该函数只做 slot_token/anchor 是否存在的快速判断，不触发重算，也不会改写队列。
+    /// - 主要用途：上层存在一些 token 的索引/缓存（例如 path -> token 的反查索引、backfill/patch 队列）。
+    ///   这些结构会保留“弱引用 token”，它们不保活节点。节点被回收后 token 可能失效或被复用。
+    /// - 在把这些弱引用 token 再喂回 `stabilize_subset` 或写回依赖补丁前，先做 liveness 过滤，
+    ///   可以显著降低 invalid token request 的扩散概率。
+    #[inline]
+    pub fn is_token_alive(&self, token: AnchorToken) -> bool {
+        self.graph.with(|graph| graph.get(token).is_some())
+    }
+
     pub(crate) fn update_dirty_marks(&mut self) {
         trace!("update_dirty_marks");
         self.graph.with(|graph| {

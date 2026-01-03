@@ -94,6 +94,33 @@ fn peek_value_respects_ready() {
     assert_eq!(engine.peek_value(&derived), Some(6));
 }
 
+#[cfg(feature = "anchors_slotmap")]
+#[test]
+fn is_token_alive_reflects_drop_and_remove() {
+    ////////////////////////////////////////////////////////////////////////////////
+    // NOTE:
+    // - `AnchorToken(NodeKey)` 是弱引用：handle_count 归零后会触发 free/remove；
+    // - 上层（emg_element）会用 `engine.is_token_alive(token)` 过滤 backfill/patch 中的 stale token；
+    // - 该测试用于锁定 `is_token_alive` 的语义：drop 后应变为 false。
+    ////////////////////////////////////////////////////////////////////////////////
+    let mut engine = Engine::new();
+
+    let var = Var::new(1i32);
+    let watch = var.watch();
+    let token = watch.token();
+
+    // 节点仍被 handle 持有时应为 alive。
+    assert!(engine.is_token_alive(token), "节点仍被 handle 持有时应为 alive");
+
+    // drop 掉最后一个 handle（Var 自身 + watch 克隆）后，token 应当失效（anchor 置空/进入 free list）。
+    drop(watch);
+    drop(var);
+    assert!(
+        !engine.is_token_alive(token),
+        "handle_count 归零并 free/remove 后应为 not alive"
+    );
+}
+
 #[test]
 fn test_cutoff_simple_observed() {
     let mut engine = Engine::new();
