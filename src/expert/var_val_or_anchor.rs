@@ -537,8 +537,20 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
                 }
                 (ValOrAnchor::Val(_), ValOrAnchor::Anchor(new_a)) => {
                     debug!("a2");
-
-                    ctx.request(new_a, true)
+                    match ctx.request(new_a, true) {
+                        Poll::PendingInvalidToken => {
+                            ////////////////////////////////////////////////////////////////////////////////
+                            // `PendingInvalidToken` 不会变 Ready：
+                            // - 这代表“新赋值进来的 Anchor 已经失效/不属于当前引擎”。
+                            // - 若继续返回 Pending，会导致 stabilize 自旋或刷屏。
+                            // - 这里选择回退到旧值（self.val），并返回 Unchanged。
+                            ////////////////////////////////////////////////////////////////////////////////
+                            inner.val = Rc::clone(&self.val);
+                            force_unchanged_no_clone = true;
+                            Poll::Unchanged
+                        }
+                        other => other,
+                    }
                 }
                 (ValOrAnchor::Anchor(outdated_anchor), ValOrAnchor::Val(_v)) => {
                     debug!("a3");
@@ -551,8 +563,22 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
 
                     if outdated_anchor != new_a {
                         ctx.unrequest(outdated_anchor);
-
-                        ctx.request(new_a, true)
+                        match ctx.request(new_a, true) {
+                            Poll::PendingInvalidToken => {
+                                ////////////////////////////////////////////////////////////////////////////////
+                                // 新 Anchor 已失效：回退到旧 Anchor，并恢复依赖边。
+                                ////////////////////////////////////////////////////////////////////////////////
+                                inner.val = Rc::clone(&self.val);
+                                match ctx.request(outdated_anchor, true) {
+                                    Poll::Unchanged => {
+                                        force_unchanged_no_clone = true;
+                                        Poll::Unchanged
+                                    }
+                                    up_or_pending => up_or_pending,
+                                }
+                            }
+                            other => other,
+                        }
                     } else {
                         //same
                         match ctx.request(new_a, true) {
@@ -565,9 +591,16 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
                     }
                 }
             };
-            if poll.is_pending() {
-                debug!("a pending");
-                return Poll::Pending;
+            match poll {
+                Poll::Pending | Poll::PendingDefer => {
+                    debug!("a pending");
+                    return Poll::Pending;
+                }
+                Poll::PendingInvalidToken => {
+                    debug!("a invalid token pending");
+                    return Poll::PendingInvalidToken;
+                }
+                Poll::Updated | Poll::Unchanged => {}
             }
             inner.output_stale = false;
 
@@ -700,5 +733,254 @@ mod tests {
 
         debug!("{}", engine.get(&aw));
         debug!("{}", engine.get(&aw));
+    }
+
+    #[test]
+    fn var_either_should_fallback_on_pending_invalid_token_when_switching_to_new_anchor() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 回归测试：
+        // - 当 VarEitherAnchor “切换到一个新 Anchor”时，如果该 Anchor request 返回 PendingInvalidToken，
+        //   不能把它当作普通 Pending（否则可能 stabilize 自旋/刷屏）。
+        // - 期望行为：回退到旧值，并返回 Unchanged。
+        ////////////////////////////////////////////////////////////////////////////////
+
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        use crate::expert::{
+            Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine as EngineTrait, Poll,
+            UpdateContext,
+        };
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct DummyToken(u64);
+
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct DummyAnchorHandle {
+            token: DummyToken,
+        }
+
+        impl AnchorHandle for DummyAnchorHandle {
+            type Token = DummyToken;
+
+            fn token(&self) -> Self::Token {
+                self.token
+            }
+        }
+
+        #[derive(Clone)]
+        struct DummyDirtyHandle;
+
+        impl DirtyHandle for DummyDirtyHandle {
+            fn mark_dirty(&self) {}
+        }
+
+        struct DummyEngine;
+
+        impl EngineTrait for DummyEngine {
+            type AnchorHandle = DummyAnchorHandle;
+            type DirtyHandle = DummyDirtyHandle;
+
+            fn mount<I: AnchorInner<Self> + 'static>(_inner: I) -> Anchor<I::Output, Self> {
+                unreachable!("该测试直接构造 VarEitherAnchor，不需要 mount")
+            }
+        }
+
+        struct DummyCtx {
+            polls: HashMap<DummyToken, Poll>,
+        }
+
+        impl DummyCtx {
+            fn new() -> Self {
+                Self {
+                    polls: HashMap::new(),
+                }
+            }
+        }
+
+        impl UpdateContext for DummyCtx {
+            type Engine = DummyEngine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("该测试不应调用 get()")
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                match self.polls.get(&anchor.token()) {
+                    Some(Poll::Updated) => Poll::Updated,
+                    Some(Poll::Unchanged) => Poll::Unchanged,
+                    Some(Poll::Pending) => Poll::Pending,
+                    Some(Poll::PendingDefer) => Poll::PendingDefer,
+                    Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
+                    None => Poll::Unchanged,
+                }
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as EngineTrait>::DirtyHandle {
+                DummyDirtyHandle
+            }
+        }
+
+        let bad_anchor: Anchor<u32, DummyEngine> = Anchor::new_from_expert(DummyAnchorHandle {
+            token: DummyToken(1),
+        });
+        let old_rc: Rc<ValOrAnchor<u32, DummyEngine>> = Rc::new(ValOrAnchor::Val(10u32));
+
+        let shared = Rc::new(RefCell::new(super::VarEAShared::<u32, DummyEngine> {
+            dirty_handle: None,
+            val: Rc::new(ValOrAnchor::Anchor(bad_anchor)),
+            output_stale: true,
+        }));
+
+        let mut inner = super::VarEitherAnchor::<u32, DummyEngine> {
+            inner: shared.clone(),
+            val: old_rc,
+        };
+
+        let mut ctx = DummyCtx::new();
+        ctx.polls.insert(DummyToken(1), Poll::PendingInvalidToken);
+
+        let poll =
+            <super::VarEitherAnchor<u32, DummyEngine> as AnchorInner<DummyEngine>>::poll_updated(
+                &mut inner, &mut ctx,
+            );
+        assert_eq!(poll, Poll::Unchanged);
+
+        // 必须回退为旧值（Val），避免后续继续 request 死 token。
+        match &*shared.borrow().val {
+            ValOrAnchor::Val(v) => assert_eq!(*v, 10u32),
+            ValOrAnchor::Anchor(_) => panic!("预期回退为 Val，但仍然是 Anchor"),
+        }
+    }
+
+    #[test]
+    fn var_either_should_propagate_pending_invalid_token_when_current_anchor_is_invalid() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 回归测试：
+        // - 当当前生效的 Anchor 已经失效时（无可回退值），poll_updated 应直接返回 PendingInvalidToken，
+        //   交给引擎用 last_ready 冻结或 panic（无历史输出）处理，而不是错误地转成 Pending。
+        ////////////////////////////////////////////////////////////////////////////////
+
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        use crate::expert::{
+            Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine as EngineTrait, Poll,
+            UpdateContext,
+        };
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct DummyToken(u64);
+
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct DummyAnchorHandle {
+            token: DummyToken,
+        }
+
+        impl AnchorHandle for DummyAnchorHandle {
+            type Token = DummyToken;
+
+            fn token(&self) -> Self::Token {
+                self.token
+            }
+        }
+
+        #[derive(Clone)]
+        struct DummyDirtyHandle;
+
+        impl DirtyHandle for DummyDirtyHandle {
+            fn mark_dirty(&self) {}
+        }
+
+        struct DummyEngine;
+
+        impl EngineTrait for DummyEngine {
+            type AnchorHandle = DummyAnchorHandle;
+            type DirtyHandle = DummyDirtyHandle;
+
+            fn mount<I: AnchorInner<Self> + 'static>(_inner: I) -> Anchor<I::Output, Self> {
+                unreachable!("该测试直接构造 VarEitherAnchor，不需要 mount")
+            }
+        }
+
+        struct DummyCtx {
+            polls: HashMap<DummyToken, Poll>,
+        }
+
+        impl DummyCtx {
+            fn new() -> Self {
+                Self {
+                    polls: HashMap::new(),
+                }
+            }
+        }
+
+        impl UpdateContext for DummyCtx {
+            type Engine = DummyEngine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("该测试不应调用 get()")
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                match self.polls.get(&anchor.token()) {
+                    Some(Poll::Updated) => Poll::Updated,
+                    Some(Poll::Unchanged) => Poll::Unchanged,
+                    Some(Poll::Pending) => Poll::Pending,
+                    Some(Poll::PendingDefer) => Poll::PendingDefer,
+                    Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
+                    None => Poll::Unchanged,
+                }
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as EngineTrait>::DirtyHandle {
+                DummyDirtyHandle
+            }
+        }
+
+        let bad_anchor: Anchor<u32, DummyEngine> = Anchor::new_from_expert(DummyAnchorHandle {
+            token: DummyToken(1),
+        });
+        let bad_rc: Rc<ValOrAnchor<u32, DummyEngine>> = Rc::new(ValOrAnchor::Anchor(bad_anchor));
+
+        let shared = Rc::new(RefCell::new(super::VarEAShared::<u32, DummyEngine> {
+            dirty_handle: None,
+            val: bad_rc.clone(),
+            output_stale: false,
+        }));
+
+        let mut inner = super::VarEitherAnchor::<u32, DummyEngine> {
+            inner: shared,
+            val: bad_rc,
+        };
+
+        let mut ctx = DummyCtx::new();
+        ctx.polls.insert(DummyToken(1), Poll::PendingInvalidToken);
+
+        let poll =
+            <super::VarEitherAnchor<u32, DummyEngine> as AnchorInner<DummyEngine>>::poll_updated(
+                &mut inner, &mut ctx,
+            );
+        assert_eq!(poll, Poll::PendingInvalidToken);
     }
 }

@@ -16,6 +16,7 @@ use crate::{
     },
     im_rc::OrdMap,
 };
+use std::collections::BTreeSet;
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -152,6 +153,8 @@ pub struct OrdMapVOACollectStream<I, V, E: Engine> {
     input: Anchor<OrdMap<I, ValOrAnchor<V, E>>, E>,
     vals: Option<OrdMap<I, V>>,
     dirty: bool,
+    /// 记录曾经遇到过的失效 key，避免在输入未变化时反复 request 死 token 造成刷屏。
+    invalid_keys: BTreeSet<I>,
     location: &'static std::panic::Location<'static>,
 }
 
@@ -176,6 +179,7 @@ where
             input,
             vals: None,
             dirty: true,
+            invalid_keys: BTreeSet::new(),
             location: std::panic::Location::caller(),
         })
     }
@@ -205,12 +209,18 @@ where
         // ─────────────────────────────────────────────────────────────
         // 1) 先 request 输入字典，确保依赖关系/必要性正确，同时判定是否需要重建。
         match ctx.request(&self.input, true) {
-            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
+            Poll::Pending | Poll::PendingDefer => {
                 return Poll::Pending;
+            }
+            Poll::PendingInvalidToken => {
+                // 输入 token 失效属于“无法恢复的依赖丢失”，交给上层/引擎做冻结或 panic（无历史输出）。
+                return Poll::PendingInvalidToken;
             }
             Poll::Updated => {
                 // 输入字典已更新：即使本节点未收到 dirty 通知，也必须重建。
                 self.dirty = true;
+                // 输入已变化：之前记录的 invalid key 可能被替换为新的有效 Anchor，需要清空后重新判定。
+                self.invalid_keys.clear();
             }
             Poll::Unchanged => {}
         }
@@ -231,14 +241,28 @@ where
         let mut ready_entries: Vec<(I, V)> = Vec::with_capacity(entries.len());
 
         for (k, voa) in entries {
+            // 若 key 已经被判定为 invalid，则跳过，避免重复 request 死 token。
+            if self.invalid_keys.contains(&k) {
+                continue;
+            }
             match voa {
                 ValOrAnchor::Val(v) => {
                     ready_entries.push((k, v));
                 }
                 ValOrAnchor::Anchor(an) => {
                     match ctx.request(&an, true) {
-                        Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
+                        Poll::Pending | Poll::PendingDefer => {
                             pending_child = true;
+                            continue;
+                        }
+                        Poll::PendingInvalidToken => {
+                            ////////////////////////////////////////////////////////////////////////////////
+                            // `PendingInvalidToken` 不会变 Ready：
+                            // - 将该 key 视为“元素已被移除”，从输出中剔除；
+                            // - 同时缓存 key，避免后续重复 request 造成刷屏。
+                            ////////////////////////////////////////////////////////////////////////////////
+                            self.invalid_keys.insert(k.clone());
+                            ctx.unrequest(&an);
                             continue;
                         }
                         _ => {}
@@ -356,6 +380,7 @@ mod test {
                     input,
                     vals: None,
                     dirty: true,
+                    invalid_keys: std::collections::BTreeSet::new(),
                     location: Location::caller(),
                 },
                 location: Location::caller(),
@@ -506,5 +531,171 @@ mod test {
             8usize=>dv.into()
         ));
         assert_eq!(engine.get(&sum), 37 + 9);
+    }
+
+    #[test]
+    fn voa_collect_stream_should_drop_invalid_token_instead_of_pending_forever() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 该测试验证一个关键契约：
+        // - 当某个子 Anchor request 返回 `PendingInvalidToken` 时，OrdMapVOACollectStream 不能返回 Pending；
+        // - 否则会导致每轮 stabilize 都重复 request 死 token，刷屏并且图永远不收敛；
+        // - 正确行为是：把该 key 当作“已移除”，从输出中剔除，并缓存 key 以避免重复 request。
+        ////////////////////////////////////////////////////////////////////////////////
+
+        use std::any::Any;
+        use std::collections::HashMap;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct DummyToken(u64);
+
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct DummyAnchorHandle {
+            token: DummyToken,
+        }
+
+        impl AnchorHandle for DummyAnchorHandle {
+            type Token = DummyToken;
+
+            fn token(&self) -> Self::Token {
+                self.token
+            }
+        }
+
+        #[derive(Clone)]
+        struct DummyDirtyHandle;
+
+        impl crate::expert::DirtyHandle for DummyDirtyHandle {
+            fn mark_dirty(&self) {}
+        }
+
+        struct DummyEngine;
+
+        impl AnchorEngine for DummyEngine {
+            type AnchorHandle = DummyAnchorHandle;
+            type DirtyHandle = DummyDirtyHandle;
+
+            fn mount<I: crate::expert::AnchorInner<Self> + 'static>(
+                _inner: I,
+            ) -> crate::expert::Anchor<I::Output, Self> {
+                unreachable!("该测试直接构造 OrdMapVOACollectStream，不需要 mount")
+            }
+        }
+
+        struct DummyCtx {
+            polls: HashMap<DummyToken, Poll>,
+            vals: HashMap<DummyToken, Box<dyn Any>>,
+            requests: Vec<DummyToken>,
+        }
+
+        impl DummyCtx {
+            fn new() -> Self {
+                Self {
+                    polls: HashMap::new(),
+                    vals: HashMap::new(),
+                    requests: Vec::new(),
+                }
+            }
+        }
+
+        impl UpdateContext for DummyCtx {
+            type Engine = DummyEngine;
+
+            fn get<'out, 'slf, O: 'static>(
+                &'slf self,
+                anchor: &crate::expert::Anchor<O, Self::Engine>,
+            ) -> &'out O
+            where
+                'slf: 'out,
+            {
+                let token = anchor.token();
+                let val = self.vals.get(&token).expect("缺少测试值");
+                val.as_ref()
+                    .downcast_ref::<O>()
+                    .expect("DummyCtx get downcast 失败")
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                anchor: &crate::expert::Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                let token = anchor.token();
+                self.requests.push(token);
+                match self.polls.get(&token) {
+                    Some(Poll::Updated) => Poll::Updated,
+                    Some(Poll::Unchanged) => Poll::Unchanged,
+                    Some(Poll::Pending) => Poll::Pending,
+                    Some(Poll::PendingDefer) => Poll::PendingDefer,
+                    Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
+                    None => Poll::Unchanged,
+                }
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &crate::expert::Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as AnchorEngine>::DirtyHandle {
+                DummyDirtyHandle
+            }
+        }
+
+        let input = crate::expert::Anchor::<
+            OrdMap<usize, crate::expert::ValOrAnchor<u32, DummyEngine>>,
+            DummyEngine,
+        >::new_from_expert(DummyAnchorHandle {
+            token: DummyToken(100),
+        });
+        let a = crate::expert::Anchor::<u32, DummyEngine>::new_from_expert(DummyAnchorHandle {
+            token: DummyToken(1),
+        });
+        let b = crate::expert::Anchor::<u32, DummyEngine>::new_from_expert(DummyAnchorHandle {
+            token: DummyToken(2),
+        });
+
+        let pool = crate::im_rc::ordmap::OrdMapPool::new(3);
+        let mut dict_in: OrdMap<usize, crate::expert::ValOrAnchor<u32, DummyEngine>> =
+            OrdMap::with_pool(&pool);
+        dict_in.insert(1usize, crate::expert::ValOrAnchor::Val(10u32));
+        dict_in.insert(2usize, crate::expert::ValOrAnchor::Anchor(a.clone()));
+        dict_in.insert(3usize, crate::expert::ValOrAnchor::Anchor(b.clone()));
+
+        let mut inner = OrdMapVOACollectStream::<usize, u32, DummyEngine> {
+            input: input.clone(),
+            vals: None,
+            dirty: true,
+            invalid_keys: std::collections::BTreeSet::new(),
+            location: Location::caller(),
+        };
+
+        let mut ctx = DummyCtx::new();
+        ctx.polls.insert(DummyToken(100), Poll::Unchanged);
+        ctx.polls.insert(DummyToken(1), Poll::Unchanged);
+        ctx.polls.insert(DummyToken(2), Poll::PendingInvalidToken);
+
+        ctx.vals.insert(DummyToken(100), Box::new(dict_in));
+        ctx.vals.insert(DummyToken(1), Box::new(5u32));
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        let out = inner.vals.clone().expect("必须生成输出");
+
+        let pool = crate::im_rc::ordmap::OrdMapPool::new(2);
+        let mut expected: OrdMap<usize, u32> = OrdMap::with_pool(&pool);
+        expected.insert(1usize, 10u32);
+        expected.insert(2usize, 5u32);
+        assert_eq!(out, expected);
+
+        // 再次触发重建：不应再次 request 已确认失效的 token(2)。
+        ctx.requests.clear();
+        inner.dirty = true;
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        assert!(
+            !ctx.requests.contains(&DummyToken(2)),
+            "不应重复 request 死 token，避免 invalid_token 日志刷屏"
+        );
     }
 }
