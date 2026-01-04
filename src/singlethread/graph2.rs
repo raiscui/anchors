@@ -361,7 +361,18 @@ mod node_store {
                     let token = guard.slot_token.get();
                     let debug_info = guard.debug_info.get()._to_string();
                     if cfg.should_log(token, debug_info.as_str()) {
-                        eprintln!("[anchors][remove] token={token} debug={debug_info}");
+                        ////////////////////////////////////////////////////////////////////////////////
+                        // NOTE:
+                        // - remove() 发生时，理论上 handle_count 应该已经归零（否则会导致“活句柄变 stale”）。
+                        // - 这里把关键状态一起打印出来，便于定位 invalid_token 的根因。
+                        ////////////////////////////////////////////////////////////////////////////////
+                        let handle_count = guard.ptrs.handle_count.get();
+                        let necessary_count = guard.necessary_count.get();
+                        let anchor_locked = guard.anchor_locked.get();
+                        let anchor_is_none = unsafe { (&*guard.anchor.get()).is_none() };
+                        eprintln!(
+                            "[anchors][remove] token={token} handle_count={handle_count} necessary_count={necessary_count} anchor_locked={anchor_locked} anchor_is_none={anchor_is_none} debug={debug_info}"
+                        );
                         if cfg.backtrace {
                             let bt = super::Backtrace::force_capture();
                             eprintln!("[anchors][remove] backtrace:\n{bt}");
@@ -412,7 +423,16 @@ mod node_store {
                 return false;
             }
 
-            super::dequeue_calc(graph, guard);
+            ////////////////////////////////////////////////////////////////////////////////
+            // 关键：节点即将进入 free list，必须确保它已经彻底从 recalc 队列摘除。
+            //
+            // 否则：
+            // - recalc_pop_next 可能在之后把 free list 的 next 当成 queue next；
+            // - 进而污染 free list，导致活节点被误复用，产生 stale token 与 invalid_token request。
+            //
+            // 这里不信任 `recalc_state/height`，直接按 NodePtr 扫描所有 bucket 摘除一次。
+            ////////////////////////////////////////////////////////////////////////////////
+            super::dequeue_calc_by_ptr(graph, ptr);
 
             let anchor_slot = unsafe { &mut *guard.anchor.get() };
             if anchor_slot.is_none() {
@@ -434,10 +454,10 @@ mod node_store {
             let free_head = &graph.free_head;
             if let Some(old_free) = free_head.get() {
                 let old_guard = unsafe { old_free.lookup_unchecked() };
-                old_guard.ptrs.prev.set(Some(ptr));
+                old_guard.ptrs.free_prev.set(Some(ptr));
             }
-            guard.ptrs.next.set(free_head.get());
-            guard.ptrs.prev.set(None);
+            guard.ptrs.free_next.set(free_head.get());
+            guard.ptrs.free_prev.set(None);
             free_head.set(Some(ptr));
 
             graph
@@ -653,13 +673,22 @@ pub struct NodePtrs {
 
     graph: *const Graph2,
 
-    /// Next node in either recalc linked list for this height, or if node is in the free list, the free linked list.
+    /// Next node in recalc linked list for this height.
     /// If this is the last node, None.
     next: Cell<Option<NodePtr>>,
-    /// Prev node in either recalc linked list for this height, or if node is in the free list, the free linked list.
+    /// Prev node in recalc linked list for this height.
     /// If this is the head node, None.
     prev: Cell<Option<NodePtr>>,
     recalc_state: Cell<RecalcState>,
+
+    /// Next node in free list (仅用于 anchors_slotmap)。
+    ///
+    /// 重要：free list 与 recalc queue 必须使用**不同**的指针字段。
+    /// 否则当“已回收节点”意外残留在 recalc 队列里时，recalc_pop_next 会误把 free list 的 next 当成 queue next，
+    /// 直接污染 free_head 链表，最终导致“活节点被复用 -> stale token -> invalid_token request”。
+    free_next: Cell<Option<NodePtr>>,
+    /// Prev node in free list (仅用于 anchors_slotmap)。
+    free_prev: Cell<Option<NodePtr>>,
 
     /// sorted in pointer order
     necessary_children: RefCell<Vec<NodePtr>>,
@@ -1451,10 +1480,25 @@ impl Graph2 {
         self.nodes.with(|nodes| {
             let guard = if let Some(free_head) = self.free_head.get() {
                 let guard = NodeGuard(unsafe { free_head.lookup_unchecked() });
-                self.free_head.set(guard.ptrs.next.get());
-                if let Some(next_ptr) = guard.ptrs.next.get() {
-                    let next_node = unsafe { nodes.lookup_ptr(next_ptr) };
-                    next_node.ptrs.prev.set(None);
+                // 从 free list 取出一个空槽位。
+                //
+                // anchors_slotmap 下：free list 使用专用指针字段（free_next/free_prev），
+                // 避免和 recalc 队列（next/prev）互相污染导致“活节点被误复用”。
+                #[cfg(feature = "anchors_slotmap")]
+                {
+                    self.free_head.set(guard.ptrs.free_next.get());
+                    if let Some(next_ptr) = guard.ptrs.free_next.get() {
+                        let next_node = unsafe { nodes.lookup_ptr(next_ptr) };
+                        next_node.ptrs.free_prev.set(None);
+                    }
+                }
+                #[cfg(not(feature = "anchors_slotmap"))]
+                {
+                    self.free_head.set(guard.ptrs.next.get());
+                    if let Some(next_ptr) = guard.ptrs.next.get() {
+                        let next_node = unsafe { nodes.lookup_ptr(next_ptr) };
+                        next_node.ptrs.prev.set(None);
+                    }
                 }
                 guard.observed.set(false);
                 guard.visited.set(false);
@@ -1477,8 +1521,20 @@ impl Graph2 {
                         if cfg.should_log(old_token, old_debug.as_str()) {
                             let new_token = self.next_slot_token();
                             let new_debug = debug_info._to_string();
+                            ////////////////////////////////////////////////////////////////////////////////
+                            // NOTE:
+                            // - 复用时补充“旧槽位状态”用于定位 invalid_token：
+                            //   - old_handle_count：理论上应为 0（已进入 free list）。
+                            //   - old_necessary_count：理论上应为 0（已无必要父链）。
+                            //   - old_anchor_none：理论上应为 true（anchor 已被 remove）。
+                            //
+                            // 若这些值不满足预期，说明存在“仍被引用但被回收/复用”的生命周期错误。
+                            ////////////////////////////////////////////////////////////////////////////////
+                            let old_handle_count = guard.ptrs.handle_count.get();
+                            let old_necessary_count = guard.necessary_count.get();
+                            let old_anchor_none = unsafe { (&*guard.anchor.get()).is_none() };
                             eprintln!(
-                                "[anchors][reuse] old_token={old_token} new_token={new_token} old_debug={old_debug} new_debug={new_debug}",
+                                "[anchors][reuse] old_token={old_token} old_handle_count={old_handle_count} old_necessary_count={old_necessary_count} old_anchor_none={old_anchor_none} new_token={new_token} old_debug={old_debug} new_debug={new_debug}",
                             );
                             if cfg.backtrace {
                                 let bt = Backtrace::force_capture();
@@ -1499,6 +1555,8 @@ impl Graph2 {
                 guard.ptrs.clean_parent0.set(None);
                 guard.ptrs.clean_parents.replace(vec![]);
                 guard.ptrs.recalc_state.set(RecalcState::Needed);
+                guard.ptrs.free_next.set(None);
+                guard.ptrs.free_prev.set(None);
                 guard.ptrs.necessary_children.replace(vec![]);
                 guard.ptrs.height.set(0);
                 guard.ptrs.handle_count.set(1);
@@ -1528,6 +1586,8 @@ impl Graph2 {
                         next: Cell::new(None),
                         prev: Cell::new(None),
                         recalc_state: Cell::new(RecalcState::Needed),
+                        free_next: Cell::new(None),
+                        free_prev: Cell::new(None),
                         necessary_children: RefCell::new(vec![]),
                         height: Cell::new(0),
                         handle_count: Cell::new(1),
@@ -1630,61 +1690,72 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
     if node.ptrs.recalc_state.get() != RecalcState::Pending {
         return;
     }
-    // ─────────────────────────────────────────────────────────────
-    // 说明：高度可能在 Pending 队列期间被提升，prev/next 指针也可能失效。
-    // 这里通过遍历队列重新定位节点，防御性摘除，避免断言直接崩溃。
-    let height_idx = node.ptrs.height.get();
-    let mut recalc_queues = graph.recalc_queues.borrow_mut();
-    let mut head_ptr = recalc_queues.get(height_idx).copied().flatten();
-
-    let target_ptr = node.make_ptr();
-    let mut found_prev: Option<NodePtr> = None;
-    let mut found_cur: Option<NodePtr> = None;
-
-    while let Some(cur_ptr) = head_ptr {
-        if cur_ptr == target_ptr {
-            found_cur = Some(cur_ptr);
-            break;
-        }
-        found_prev = head_ptr;
-        head_ptr = unsafe { cur_ptr.lookup_unchecked() }.ptrs.next.get();
-    }
-
-    // 若队列中已找不到该节点，直接重置状态后返回，避免 panic 连环崩溃。
-    let Some(cur_ptr) = found_cur else {
-        if cfg!(debug_assertions) {
-            tracing::warn!(
-                target: "anchors",
-                "dequeue_calc: pending 节点在队列中缺失，直接跳过 token={:?} debug={}",
-                node.key().raw_token(),
-                node.debug_info.get()._to_string()
-            );
-        }
-        node.ptrs.recalc_state.set(RecalcState::Ready);
-        node.ptrs.prev.set(None);
-        node.ptrs.next.set(None);
+    if dequeue_calc_by_ptr(graph, node.make_ptr()) {
         return;
-    };
-
-    let cur_guard = unsafe { cur_ptr.lookup_unchecked() };
-    let next_ptr = cur_guard.ptrs.next.get();
-
-    if let Some(prev_ptr) = found_prev {
-        unsafe { prev_ptr.lookup_unchecked() }
-            .ptrs
-            .next
-            .set(next_ptr);
-    } else {
-        recalc_queues[height_idx] = next_ptr;
     }
 
-    if let Some(next) = next_ptr {
-        unsafe { next.lookup_unchecked() }.ptrs.prev.set(found_prev);
+    // 若队列中已找不到该节点，重置状态后返回，避免 panic 连环崩溃。
+    if cfg!(debug_assertions) {
+        tracing::warn!(
+            target: "anchors",
+            "dequeue_calc: pending 节点在队列中缺失，直接跳过 token={:?} debug={}",
+            node.key().raw_token(),
+            node.debug_info.get()._to_string()
+        );
+    }
+    node.ptrs.recalc_state.set(RecalcState::Ready);
+    node.ptrs.prev.set(None);
+    node.ptrs.next.set(None);
+}
+
+fn dequeue_calc_by_ptr(graph: &Graph2, target_ptr: NodePtr) -> bool {
+    // ─────────────────────────────────────────────────────────────
+    // 关键修复：
+    // - 节点入队后，其 height 可能被 `ensure_height_increases` 提升；
+    // - 但它仍然挂在“旧高度 bucket”的 recalc 队列里；
+    // - 若此时按 `node.height` 去找 bucket，会找不到该节点，导致：
+    //   1) recalc 队列残留指向已回收节点的 NodePtr
+    //   2) remove() 把节点放入 free list 后，队列出队会把 free list 的 next 当成 queue next
+    //   3) 最终 free list 被污染，触发 “活节点被复用 -> stale token -> invalid_token request”
+    //
+    // 这里采取最保守策略：扫描所有 bucket，按 NodePtr 精确摘除目标节点。
+    // - 该函数只用于“修复/回收路径”，允许用时间换正确性。
+    // ─────────────────────────────────────────────────────────────
+    let mut recalc_queues = graph.recalc_queues.borrow_mut();
+    for queue_idx in 0..recalc_queues.len() {
+        let mut head_ptr = recalc_queues[queue_idx];
+        let mut found_prev: Option<NodePtr> = None;
+
+        while let Some(cur_ptr) = head_ptr {
+            if cur_ptr == target_ptr {
+                let cur_guard = unsafe { cur_ptr.lookup_unchecked() };
+                let next_ptr = cur_guard.ptrs.next.get();
+
+                if let Some(prev_ptr) = found_prev {
+                    unsafe { prev_ptr.lookup_unchecked() }
+                        .ptrs
+                        .next
+                        .set(next_ptr);
+                } else {
+                    recalc_queues[queue_idx] = next_ptr;
+                }
+
+                if let Some(next) = next_ptr {
+                    unsafe { next.lookup_unchecked() }.ptrs.prev.set(found_prev);
+                }
+
+                cur_guard.ptrs.prev.set(None);
+                cur_guard.ptrs.next.set(None);
+                cur_guard.ptrs.recalc_state.set(RecalcState::Ready);
+                return true;
+            }
+
+            found_prev = Some(cur_ptr);
+            head_ptr = unsafe { cur_ptr.lookup_unchecked() }.ptrs.next.get();
+        }
     }
 
-    cur_guard.ptrs.prev.set(None);
-    cur_guard.ptrs.next.set(None);
-    cur_guard.ptrs.recalc_state.set(RecalcState::Ready);
+    false
 }
 
 #[cfg(feature = "anchors_slotmap")]
