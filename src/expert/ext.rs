@@ -111,6 +111,7 @@ where
             f,
             output: None,
             output_stale: true,
+            degraded_on_invalid: false,
             location: Location::caller(),
         })
     }
@@ -284,6 +285,7 @@ where
             either_anchor: None,
             location: Location::caller(),
             output_stale: true,
+            degraded_on_invalid: false,
         })
     }
 
@@ -390,6 +392,7 @@ where
             anchors: (self.clone(),),
             version: 0,
             output_stale: true,
+            degraded_on_invalid: false,
             location: Location::caller(),
         })
     }
@@ -404,6 +407,7 @@ where
             anchors: (self.clone(),),
             version: 0,
             output_stale: true,
+            degraded_on_invalid: false,
             location: Location::caller(),
         })
     }
@@ -486,6 +490,7 @@ macro_rules! impl_tuple_ext {
                     f,
                     output: None,
                     output_stale: true,
+                    degraded_on_invalid: false,
                     location: Location::caller(),
                 })
             }
@@ -536,6 +541,7 @@ macro_rules! impl_tuple_ext {
                     either_anchor: None,
                     location: Location::caller(),
                     output_stale: true,
+                    degraded_on_invalid: false,
                 })
             }
 
@@ -579,6 +585,7 @@ macro_rules! impl_tuple_ext {
                     anchors: ($(self.$num.clone(),)+),
                     version: 0,
                     output_stale: true,
+                    degraded_on_invalid: false,
                     location: Location::caller(),
                 })
             }
@@ -593,6 +600,7 @@ macro_rules! impl_tuple_ext {
                     anchors: ($(self.$num.clone(),)+),
                     version: 0,
                     output_stale: true,
+                    degraded_on_invalid: false,
                     location: Location::caller(),
                 })
             }

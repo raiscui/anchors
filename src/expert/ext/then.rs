@@ -105,9 +105,8 @@ macro_rules! impl_tuple_then {
                             return ctx.request(old_anchor, true);
                         }
 
-                        // 首次计算且没有历史输出：只能继续 pending，由上层决定是否兜底/降级。
-                        found_pending = true;
                         self.output_stale = true;
+                        return Poll::PendingInvalidToken;
                     }
 
                     if found_pending {
@@ -341,7 +340,7 @@ where
                         return ctx.request(old_anchor, true);
                     }
                     self.output_stale = true;
-                    return Poll::Pending;
+                    return Poll::PendingInvalidToken;
                 }
                 Poll::Updated => {
                     self.output_stale = true;
@@ -437,8 +436,8 @@ macro_rules! impl_tuple_then_dedupe {
                             self.output_stale = false;
                             return ctx.request(old_anchor, true);
                         }
-                        found_pending = true;
                         self.output_stale = true;
+                        return Poll::PendingInvalidToken;
                     }
                     if found_pending {
                         return Poll::Pending;

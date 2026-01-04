@@ -27,6 +27,10 @@ pub struct DirtyObserverAnchor<A> {
     pub(super) version: u64,
     /// 是否需要推进版本号（由 dirty 或首次计算触发）。
     pub(super) output_stale: bool,
+    /// 一旦检测到依赖 token 已失效（PendingInvalidToken），就进入“冻结降级”模式：
+    /// - 若已有历史输出（version > 0）：保持旧版本号不变，并停止响应 dirty，避免重复 request 失效 token。
+    /// - 若无历史输出：将 PendingInvalidToken 向上传递，交由引擎 panic 暴露根因。
+    pub(super) degraded_on_invalid: bool,
     /// 调试定位信息。
     pub(super) location: &'static Location<'static>,
 }
@@ -44,6 +48,10 @@ macro_rules! impl_tuple_dirty_observer {
             type Output = u64;
 
             fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
+                // 已进入降级冻结：不再响应任何 dirty，等待上层 drop/拆树。
+                if self.degraded_on_invalid {
+                    return;
+                }
                 // 只要任一输入被标脏，就认为“本轮需要推进版本号”。
                 // 这里不去区分到底哪个输入变了，因为我们只做 gating 信号。
                 if self.output_stale {
@@ -58,6 +66,12 @@ macro_rules! impl_tuple_dirty_observer {
             }
 
             fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
+                // 已进入降级冻结：保持旧输出，避免重复 request 失效 token。
+                if self.degraded_on_invalid {
+                    self.output_stale = false;
+                    return Poll::Unchanged;
+                }
+
                 // 首次计算：即使没收到 dirty，也要推进到基线版本，避免下游无法区分“未初始化”。
                 let need_bump = self.output_stale || self.version == 0;
                 if !need_bump {
@@ -79,16 +93,36 @@ macro_rules! impl_tuple_dirty_observer {
                 // 重新 request 输入，用于重建 clean_parent 链路（不关心返回的 Poll）。
                 // 这里选择 necessary=false，避免把输入提升为 necessary（否则会放大重算范围）。
                 let mut found_pending = false;
+                let mut found_invalid = false;
                 $(
                     match ctx.request(&self.anchors.$num, false) {
-                        Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
+                        Poll::Pending | Poll::PendingDefer => {
                             found_pending = true;
+                        }
+                        Poll::PendingInvalidToken => {
+                            found_invalid = true;
                         }
                         Poll::Updated | Poll::Unchanged => {
                             // do nothing
                         }
                     }
                 )+
+
+                ////////////////////////////////////////////////////////////////////////////////
+                // NOTE:
+                // - PendingInvalidToken 表示依赖 token 已失效（节点已被 GC/free），不会再变 Ready。
+                // - 对于 dirty_observer：
+                //   - 若已有历史输出（version > 0）：冻结旧版本号，避免 stabilize 自旋/刷屏。
+                //   - 若无历史输出：必须向上传递 PendingInvalidToken，让引擎 panic 暴露根因。
+                ////////////////////////////////////////////////////////////////////////////////
+                if found_invalid {
+                    if self.version > 0 {
+                        self.output_stale = false;
+                        self.degraded_on_invalid = true;
+                        return Poll::Unchanged;
+                    }
+                    return Poll::PendingInvalidToken;
+                }
 
                 if found_pending {
                     // 输入尚未 Ready，等下一轮 stabilize 再尝试。
@@ -192,8 +226,10 @@ impl_tuple_dirty_observer! {
 
 #[cfg(test)]
 mod tests {
+    use super::DirtyObserverAnchor;
     use crate::{
         expert::MultiAnchor,
+        expert::{Anchor, AnchorInner, Poll},
         singlethread::{Engine, Var},
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -270,5 +306,117 @@ mod tests {
         assert_eq!(MAP_CALLS_0.load(Ordering::Relaxed), 1);
         println!("val:{:?}", _val);
         println!("--------------------------------------");
+    }
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 单测：当依赖返回 PendingInvalidToken 且已存在历史输出（version > 0）时，
+    /// dirty_observer 应冻结旧版本号并进入“降级冻结”模式，避免重复 request 失效 token。
+    /// ////////////////////////////////////////////////////////////////////////////
+    #[test]
+    fn dirty_observer_should_degrade_on_pending_invalid_token_when_has_history() {
+        let _engine = Engine::new();
+        let a: Anchor<u32, Engine> = Anchor::constant(1);
+
+        struct PendingInvalidCtx {
+            requests: usize,
+        }
+
+        impl crate::expert::UpdateContext for PendingInvalidCtx {
+            type Engine = crate::singlethread::Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("dirty_observer 在 PendingInvalidToken 分支不应调用 get()");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                _anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                self.requests += 1;
+                Poll::PendingInvalidToken
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("dirty_observer 在 PendingInvalidToken 分支不应申请 dirty_handle()");
+            }
+        }
+
+        let mut obs: DirtyObserverAnchor<(Anchor<u32, Engine>,)> = DirtyObserverAnchor {
+            anchors: (a,),
+            version: 1,
+            output_stale: true,
+            degraded_on_invalid: false,
+            location: std::panic::Location::caller(),
+        };
+
+        let mut ctx = PendingInvalidCtx { requests: 0 };
+
+        let poll_1 = obs.poll_updated(&mut ctx);
+        assert_eq!(Poll::Unchanged, poll_1);
+        assert!(obs.degraded_on_invalid);
+        assert!(!obs.output_stale);
+        assert_eq!(1, obs.version);
+        assert_eq!(1, ctx.requests);
+
+        // 再次 poll：应直接走冻结快路径，不再 request。
+        let poll_2 = obs.poll_updated(&mut ctx);
+        assert_eq!(Poll::Unchanged, poll_2);
+        assert_eq!(1, ctx.requests, "降级冻结后不应再次 request 失效 token");
+    }
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 单测：当依赖返回 PendingInvalidToken 且不存在历史输出（version == 0）时，
+    /// dirty_observer 必须向上传播 PendingInvalidToken（由引擎 panic 暴露根因）。
+    /// ////////////////////////////////////////////////////////////////////////////
+    #[test]
+    fn dirty_observer_should_propagate_pending_invalid_token_when_no_history() {
+        let _engine = Engine::new();
+        let a: Anchor<u32, Engine> = Anchor::constant(1);
+
+        struct PendingInvalidCtx;
+
+        impl crate::expert::UpdateContext for PendingInvalidCtx {
+            type Engine = crate::singlethread::Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("dirty_observer 在 PendingInvalidToken 分支不应调用 get()");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                _anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                Poll::PendingInvalidToken
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("dirty_observer 在 PendingInvalidToken 分支不应申请 dirty_handle()");
+            }
+        }
+
+        let mut obs: DirtyObserverAnchor<(Anchor<u32, Engine>,)> = DirtyObserverAnchor {
+            anchors: (a,),
+            version: 0,
+            output_stale: true,
+            degraded_on_invalid: false,
+            location: std::panic::Location::caller(),
+        };
+
+        let mut ctx = PendingInvalidCtx;
+        let poll = obs.poll_updated(&mut ctx);
+        assert_eq!(Poll::PendingInvalidToken, poll);
+        assert!(!obs.degraded_on_invalid);
     }
 }

@@ -103,7 +103,7 @@ fn is_token_alive_reflects_drop_and_remove() {
     // - 上层（emg_element）会用 `engine.is_token_alive(token)` 过滤 backfill/patch 中的 stale token；
     // - 该测试用于锁定 `is_token_alive` 的语义：drop 后应变为 false。
     ////////////////////////////////////////////////////////////////////////////////
-    let mut engine = Engine::new();
+    let engine = Engine::new();
 
     let var = Var::new(1i32);
     let watch = var.watch();

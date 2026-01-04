@@ -29,7 +29,12 @@ impl AnchorInner<Engine> for StaleInputProbe {
         let input: &Anchor<u32> = unsafe { &*(&self.input as *const _ as *const Anchor<u32>) };
 
         match ctx.request(input, true) {
-            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
+            Poll::Pending | Poll::PendingDefer => {
+                self.saw_pending.set(true);
+                self.output = 0;
+                Poll::Updated
+            }
+            Poll::PendingInvalidToken => {
                 self.saw_pending.set(true);
                 self.output = 0;
                 Poll::Updated

@@ -40,9 +40,8 @@ impl AnchorInner<Engine> for PendingWithoutRequestAfterReady {
         // 第一次 poll：建立依赖并产出初始输出，确保后续有“历史输出”可冻结。
         if self.first_poll {
             match ctx.request(&self.input, true) {
-                Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
-                    return Poll::Pending;
-                }
+                Poll::Pending | Poll::PendingDefer => return Poll::Pending,
+                Poll::PendingInvalidToken => return Poll::PendingInvalidToken,
                 Poll::Updated | Poll::Unchanged => {}
             }
             self.output = *ctx.get(&self.input);

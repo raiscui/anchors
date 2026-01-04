@@ -38,11 +38,13 @@ pub enum Poll {
 
 impl Poll {
     #[inline]
-    pub fn is_pending(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending | Self::PendingDefer | Self::PendingInvalidToken
-        )
+    pub fn is_waiting(&self) -> bool {
+        matches!(self, Self::Pending | Self::PendingDefer)
+    }
+
+    #[inline]
+    pub fn is_invalid_token(&self) -> bool {
+        matches!(self, Self::PendingInvalidToken)
     }
 }
 

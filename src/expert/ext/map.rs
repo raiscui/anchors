@@ -7,6 +7,10 @@ pub struct Map<A, F, Out> {
     pub(super) f: F,
     pub(super) output: Option<Out>,
     pub(super) output_stale: bool,
+    /// 一旦检测到依赖 token 已失效（PendingInvalidToken），就进入“冻结降级”模式：
+    /// - 若已有旧输出：保持旧输出不变，并停止响应 dirty，避免重复 request 失效 token 刷屏/自旋。
+    /// - 若无旧输出：将 PendingInvalidToken 向上传递，交由引擎 panic 暴露根因。
+    pub(super) degraded_on_invalid: bool,
     pub(super) anchors: A,
     pub(super) location: &'static Location<'static>,
 }
@@ -25,6 +29,10 @@ macro_rules! impl_tuple_map {
         {
             type Output = Out;
             fn dirty(&mut self, edge:  &<E::AnchorHandle as AnchorHandle>::Token) {
+                // 已进入降级冻结：不再响应任何 dirty，等待上层 drop/拆树。
+                if self.degraded_on_invalid {
+                    return;
+                }
                 if self.output_stale {
                     return;
                 }
@@ -41,6 +49,16 @@ macro_rules! impl_tuple_map {
                 &mut self,
                 ctx: &mut G,
             ) -> Poll {
+                // 已进入降级冻结：保持旧输出，避免重复 request 失效 token。
+                if self.degraded_on_invalid {
+                    self.output_stale = false;
+                    return self
+                        .output
+                        .as_ref()
+                        .map(|_| Poll::Unchanged)
+                        .unwrap_or(Poll::PendingInvalidToken);
+                }
+
                 if !self.output_stale && self.output.is_some() {
                     return Poll::Unchanged;
                 }
@@ -58,12 +76,16 @@ macro_rules! impl_tuple_map {
                 }
 
                 let mut found_pending = false;
+                let mut found_invalid = false;
                 let mut found_updated = false;
 
                 $(
                     match ctx.request(&self.anchors.$num, true) {
-                        Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
+                        Poll::Pending | Poll::PendingDefer => {
                             found_pending = true;
+                        }
+                        Poll::PendingInvalidToken => {
+                            found_invalid = true;
                         }
                         Poll::Updated => {
                             found_updated = true;
@@ -73,6 +95,22 @@ macro_rules! impl_tuple_map {
                         }
                     }
                 )+
+
+                ////////////////////////////////////////////////////////////////////////////////
+                // NOTE:
+                // - PendingInvalidToken 表示依赖 token 已失效（节点已被 GC/free），不会再变 Ready。
+                // - 对于 map：
+                //   - 若已有旧输出：直接冻结旧输出，并停止后续 dirty 响应，避免 stabilize 自旋或刷屏。
+                //   - 若无旧输出：无法降级，必须向上传递 PendingInvalidToken，让引擎 panic 暴露根因。
+                ////////////////////////////////////////////////////////////////////////////////
+                if found_invalid {
+                    if self.output.is_some() {
+                        self.output_stale = false;
+                        self.degraded_on_invalid = true;
+                        return Poll::Unchanged;
+                    }
+                    return Poll::PendingInvalidToken;
+                }
 
                 if found_pending {
                     return Poll::Pending;
@@ -188,4 +226,135 @@ impl_tuple_map! {
     [O6, 6]
     [O7, 7]
     [O8, 8]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 单测：当依赖返回 PendingInvalidToken 且已存在旧输出时，map 应冻结旧输出并返回 Unchanged，
+    /// 同时进入“降级冻结”模式，避免后续重复 request 失效 token 导致刷屏/自旋。
+    /// ////////////////////////////////////////////////////////////////////////////
+    #[test]
+    fn map_should_degrade_on_pending_invalid_token_when_has_old_output() {
+        use crate::singlethread::Engine;
+
+        // 初始化默认 mounter（Anchor::constant 依赖 Engine::new）
+        let _engine = Engine::new();
+        let a: Anchor<u32, Engine> = Anchor::constant(1);
+
+        struct PendingInvalidCtx {
+            requests: usize,
+        }
+
+        impl crate::expert::UpdateContext for PendingInvalidCtx {
+            type Engine = crate::singlethread::Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("map 在 PendingInvalidToken 分支不应调用 get()");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                _anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                self.requests += 1;
+                Poll::PendingInvalidToken
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("map 在 PendingInvalidToken 分支不应申请 dirty_handle()");
+            }
+        }
+
+        let mut mapped: Map<(Anchor<u32, Engine>,), _, u32> = Map {
+            anchors: (a,),
+            f: |_x: &u32| -> u32 {
+                panic!("PendingInvalidToken 时不应执行 f（因为依赖不可用）");
+            },
+            output: Some(123),
+            output_stale: true,
+            degraded_on_invalid: false,
+            location: std::panic::Location::caller(),
+        };
+
+        let mut ctx = PendingInvalidCtx { requests: 0 };
+
+        let poll_1 = mapped.poll_updated(&mut ctx);
+        assert_eq!(Poll::Unchanged, poll_1);
+        assert!(mapped.degraded_on_invalid);
+        assert!(!mapped.output_stale);
+        assert_eq!(Some(123), mapped.output);
+        assert_eq!(1, ctx.requests);
+
+        // 再次 poll：应直接走冻结快路径，不再 request。
+        let poll_2 = mapped.poll_updated(&mut ctx);
+        assert_eq!(Poll::Unchanged, poll_2);
+        assert_eq!(1, ctx.requests, "降级冻结后不应再次 request 失效 token");
+    }
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 单测：当依赖返回 PendingInvalidToken 且不存在旧输出时，map 必须向上传播
+    /// PendingInvalidToken（由引擎 panic 暴露根因），不能把 invalid 当作普通 Pending。
+    /// ////////////////////////////////////////////////////////////////////////////
+    #[test]
+    fn map_should_propagate_pending_invalid_token_when_no_old_output() {
+        use crate::singlethread::Engine;
+
+        let _engine = Engine::new();
+        let a: Anchor<u32, Engine> = Anchor::constant(1);
+
+        struct PendingInvalidCtx;
+
+        impl crate::expert::UpdateContext for PendingInvalidCtx {
+            type Engine = crate::singlethread::Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("map 在 PendingInvalidToken 分支不应调用 get()");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                _anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                Poll::PendingInvalidToken
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("map 在 PendingInvalidToken 分支不应申请 dirty_handle()");
+            }
+        }
+
+        let mut mapped: Map<(Anchor<u32, Engine>,), _, u32> = Map {
+            anchors: (a,),
+            f: |_x: &u32| -> u32 {
+                panic!("PendingInvalidToken 时不应执行 f（因为依赖不可用）");
+            },
+            output: None,
+            output_stale: true,
+            degraded_on_invalid: false,
+            location: std::panic::Location::caller(),
+        };
+
+        let mut ctx = PendingInvalidCtx;
+        let poll = mapped.poll_updated(&mut ctx);
+        assert_eq!(Poll::PendingInvalidToken, poll);
+        assert!(
+            !mapped.degraded_on_invalid,
+            "无旧输出时不应进入降级冻结；应直接向上传播 invalid"
+        );
+    }
 }
