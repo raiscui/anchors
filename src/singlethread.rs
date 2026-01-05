@@ -126,8 +126,6 @@ pub use crate::expert::MultiAnchor;
 use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 
 use emg_hasher::std::HashMap;
-#[cfg(feature = "anchors_slotmap")]
-use emg_hasher::std::HashSet;
 use generation::Generation;
 use indexmap::{IndexMap, IndexSet};
 #[cfg(feature = "anchors_slotmap")]
@@ -217,73 +215,9 @@ struct PendingQueue {
 }
 
 #[cfg(feature = "anchors_slotmap")]
-#[derive(Default)]
-struct PendingSubsetFilter {
-    /// 需要立刻冲刷的节点 token 集，触发 subset stabilize 时仅处理这些节点。
-    tokens: IndexSet<NodeKey>,
-}
-
-#[cfg(feature = "anchors_slotmap")]
-impl PendingSubsetFilter {
-    fn new(tokens: &[NodeKey]) -> Self {
-        Self {
-            tokens: tokens.iter().copied().collect(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
-    }
-
-    #[allow(dead_code)]
-    fn contains(&self, token: &NodeKey) -> bool {
-        self.tokens.contains(token)
-    }
-
-    fn len(&self) -> usize {
-        self.tokens.len()
-    }
-
-    #[allow(dead_code)]
-    fn sample_raw_tokens(&self, limit: usize) -> Vec<u64> {
-        self.tokens
-            .iter()
-            .take(limit)
-            .map(|token| token.raw_token())
-            .collect()
-    }
-}
-
-#[cfg(feature = "anchors_slotmap")]
-type PendingSubsetArg<'a> = Option<&'a PendingSubsetFilter>;
-#[cfg(not(feature = "anchors_slotmap"))]
-type PendingSubsetArg<'a> = Option<&'a ()>;
-
-#[cfg(feature = "anchors_slotmap")]
 enum PendingEnqueueOutcome {
     Inserted,
     Replaced,
-}
-
-#[cfg(feature = "anchors_slotmap")]
-struct PendingDrainOutcome {
-    requests: Vec<PendingRequest>,
-    subset_stats: Option<PendingSubsetDrainStats>,
-}
-
-#[cfg(feature = "anchors_slotmap")]
-struct PendingSubsetDrainStats {
-    requested_tokens: usize,
-    drained_tokens: usize,
-    unmatched_tokens: usize,
-    remaining_after: usize,
-    parent_match_hits: usize,
-    sample_filter: Vec<NodeKey>,
-    sample_drained: Vec<NodeKey>,
-    sample_unmatched: Vec<NodeKey>,
-    sample_remaining: Vec<NodeKey>,
-    drained_priority_hist: BTreeMap<u8, usize>,
-    remaining_priority_hist: BTreeMap<u8, usize>,
 }
 
 #[cfg(feature = "anchors_slotmap")]
@@ -353,157 +287,12 @@ impl PendingQueue {
         result
     }
 
-    fn drain_all(&mut self) -> PendingDrainOutcome {
+    fn drain_all(&mut self) -> Vec<PendingRequest> {
         let mut drained = Vec::with_capacity(self.len());
         while let Some(entry) = self.pop_front() {
             drained.push(entry);
         }
-        PendingDrainOutcome {
-            requests: drained,
-            subset_stats: None,
-        }
-    }
-
-    fn drain_subset(&mut self, filter: &PendingSubsetFilter) -> PendingDrainOutcome {
-        if filter.is_empty() {
-            return PendingDrainOutcome {
-                requests: Vec::new(),
-                subset_stats: None,
-            };
-        }
-        if Self::debug_pending_queue_sample_enabled() && self.len() > 0 {
-            // 仅采样前 20 条 pending 子节点，辅助定位未命中的种子链路
-            const SAMPLE_LIMIT: usize = 20;
-            let mut sample_tokens = Vec::with_capacity(SAMPLE_LIMIT);
-            for bucket in self.buckets.values() {
-                for token in bucket.keys().copied() {
-                    sample_tokens.push(token);
-                    if sample_tokens.len() >= SAMPLE_LIMIT {
-                        break;
-                    }
-                }
-                if sample_tokens.len() >= SAMPLE_LIMIT {
-                    break;
-                }
-            }
-            let sample_raw: Vec<u64> = sample_tokens.iter().map(NodeKey::raw_token).collect();
-            tracing::info!(
-                target: "anchors",
-                log_event = "pending_subset_queue_sample",
-                queue_len = self.len(),
-                sample_raw = ?sample_raw,
-                "pending queue sample before subset drain"
-            );
-        }
-        let mut drained = Vec::new();
-        let mut empty_priorities = Vec::new();
-        let mut parent_match_hits = 0usize;
-        let mut allowed = filter.tokens.clone();
-        // 采样规模：扩大到 64，便于 subset retry/backfill 捕获更多剩余/未命中 token
-        const SAMPLE: usize = 64;
-        for (&priority, bucket) in self.buckets.iter_mut().rev() {
-            let mut pending_keys: Vec<NodeKey> = bucket.keys().copied().collect();
-            let mut progressed = true;
-            while progressed && !pending_keys.is_empty() {
-                progressed = false;
-                let mut remaining = Vec::with_capacity(pending_keys.len());
-                for token in pending_keys {
-                    let matches_child = allowed.contains(&token);
-                    let matches_parent = if matches_child {
-                        false
-                    } else {
-                        bucket
-                            .get(&token)
-                            .map(|req| allowed.contains(&req.parent))
-                            .unwrap_or(false)
-                    };
-                    if !matches_child && !matches_parent {
-                        remaining.push(token);
-                        continue;
-                    }
-                    progressed = true;
-                    let entry = bucket
-                        .shift_remove(&token)
-                        .expect("pending entry missing while draining subset");
-                    if matches_parent {
-                        parent_match_hits = parent_match_hits.saturating_add(1);
-                    }
-                    self.index.remove(&token);
-                    allowed.insert(entry.child);
-                    drained.push(entry);
-                }
-                pending_keys = remaining;
-            }
-            if bucket.is_empty() {
-                empty_priorities.push(priority);
-            }
-        }
-        for priority in empty_priorities {
-            self.buckets.remove(&priority);
-        }
-        let requested_total = filter.len();
-        let drained_set: HashSet<NodeKey> = drained.iter().map(|req| req.child).collect();
-        let unmatched_total = filter
-            .tokens
-            .iter()
-            .filter(|token| !drained_set.contains(token))
-            .count();
-        let mut drained_hist = BTreeMap::new();
-        for req in &drained {
-            *drained_hist.entry(req.priority.as_u8()).or_insert(0usize) += 1;
-        }
-        let mut remaining_hist = BTreeMap::new();
-        for (priority, bucket) in self.buckets.iter() {
-            if bucket.is_empty() {
-                continue;
-            }
-            remaining_hist.insert(priority.as_u8(), bucket.len());
-        }
-        let sample_filter: Vec<NodeKey> = filter.tokens.iter().take(SAMPLE).copied().collect();
-        let sample_drained: Vec<NodeKey> =
-            drained.iter().take(SAMPLE).map(|req| req.child).collect();
-        let sample_unmatched: Vec<NodeKey> = filter
-            .tokens
-            .iter()
-            .filter(|token| !drained_set.contains(token))
-            .take(SAMPLE)
-            .copied()
-            .collect();
-        let sample_remaining: Vec<NodeKey> = self
-            .buckets
-            .values()
-            .flat_map(|bucket| bucket.values().map(|req| req.child))
-            .take(SAMPLE)
-            .collect();
-        let stats = PendingSubsetDrainStats {
-            requested_tokens: requested_total,
-            drained_tokens: drained.len(),
-            unmatched_tokens: unmatched_total,
-            remaining_after: self.len(),
-            parent_match_hits,
-            sample_filter,
-            sample_drained,
-            sample_unmatched,
-            sample_remaining,
-            drained_priority_hist: drained_hist,
-            remaining_priority_hist: remaining_hist,
-        };
-        PendingDrainOutcome {
-            requests: drained,
-            subset_stats: Some(stats),
-        }
-    }
-
-    #[cfg(feature = "anchors_slotmap")]
-    fn debug_pending_queue_sample_enabled() -> bool {
-        use std::sync::OnceLock;
-
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("ANCHORS_PENDING_DEBUG_SAMPLE")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-                .unwrap_or(false)
-        })
+        drained
     }
 }
 
@@ -523,10 +312,6 @@ pub struct Engine {
     invalid_token_log: Rc<RefCell<InvalidTokenLogInner>>,
     #[cfg(feature = "anchors_slotmap")]
     unexpected_pending_log: Rc<RefCell<UnexpectedPendingLogInner>>,
-    #[cfg(feature = "anchors_slotmap")]
-    last_subset_remaining: Rc<RefCell<Vec<NodeKey>>>,
-    #[cfg(feature = "anchors_slotmap")]
-    last_subset_remaining_debug: Rc<RefCell<Vec<String>>>,
 }
 
 struct Mounter {
@@ -623,10 +408,6 @@ impl Engine {
             invalid_token_log: Rc::new(RefCell::new(InvalidTokenLogInner::default())),
             #[cfg(feature = "anchors_slotmap")]
             unexpected_pending_log: Rc::new(RefCell::new(UnexpectedPendingLogInner::default())),
-            #[cfg(feature = "anchors_slotmap")]
-            last_subset_remaining: Rc::new(RefCell::new(Vec::new())),
-            #[cfg(feature = "anchors_slotmap")]
-            last_subset_remaining_debug: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -767,19 +548,6 @@ impl Engine {
     fn should_log_unexpected_pending(count: u32) -> bool {
         // 复用同一套“稀疏采样”策略：1/10/100/每 1000 次
         Self::should_log_invalid_token(count)
-    }
-
-    #[cfg(feature = "anchors_slotmap")]
-    pub fn take_last_subset_remaining_samples(&self) -> (Vec<AnchorToken>, Vec<String>) {
-        let tokens = {
-            let mut slot = self.last_subset_remaining.borrow_mut();
-            slot.drain(..).collect::<Vec<_>>()
-        };
-        let debugs = {
-            let mut slot = self.last_subset_remaining_debug.borrow_mut();
-            slot.drain(..).collect::<Vec<_>>()
-        };
-        (tokens, debugs)
     }
 
     #[inline]
@@ -1077,85 +845,16 @@ impl Engine {
         trace!("stabilize");
         self.update_dirty_marks();
         self.generation.increment();
-        self.stabilize_with_pending_subset(None);
+        self.stabilize_with_pending_queue();
         trace!("....stabilize");
-    }
-
-    pub fn stabilize_subset(&mut self, tokens: &[NodeKey]) {
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            if tokens.is_empty() {
-                return;
-            }
-            trace!("stabilize_subset");
-            self.update_dirty_marks();
-            self.generation.increment();
-            let filter = PendingSubsetFilter::new(tokens);
-            self.stabilize_with_pending_subset(Some(&filter));
-            trace!("....stabilize_subset");
-            return;
-        }
-
-        #[cfg(not(feature = "anchors_slotmap"))]
-        {
-            let _ = tokens;
-            self.stabilize();
-        }
-    }
-
-    #[cfg(feature = "anchors_slotmap")]
-    pub fn collect_related_tokens(&self, roots: &[NodeKey], depth: usize) -> Vec<NodeKey> {
-        if roots.is_empty() {
-            return Vec::new();
-        }
-        if depth == 0 {
-            return roots.to_vec();
-        }
-
-        let mut visited: IndexSet<NodeKey> = IndexSet::new();
-        let mut queue: VecDeque<(NodeKey, usize)> = VecDeque::new();
-        for &root in roots {
-            if visited.insert(root) {
-                queue.push_back((root, 0));
-            }
-        }
-
-        self.graph.with(|graph| {
-            while let Some((token, level)) = queue.pop_front() {
-                if level >= depth {
-                    continue;
-                }
-                if let Some(node) = graph.get(token) {
-                    for parent in node.clean_parents() {
-                        let key = parent.key();
-                        if visited.insert(key) {
-                            queue.push_back((key, level + 1));
-                        }
-                    }
-                    for child in node.necessary_children() {
-                        let key = child.key();
-                        if visited.insert(key) {
-                            queue.push_back((key, level + 1));
-                        }
-                    }
-                }
-            }
-        });
-
-        visited.into_iter().collect()
-    }
-
-    #[cfg(not(feature = "anchors_slotmap"))]
-    pub fn collect_related_tokens(&self, roots: &[NodeKey], _depth: usize) -> Vec<NodeKey> {
-        roots.to_vec()
     }
 
     /// internal function for stabilization. does not update dirty marks or increment the stabilization number
     fn stabilize0(&self) {
-        self.stabilize_with_pending_subset(None);
+        self.stabilize_with_pending_queue();
     }
 
-    fn stabilize_with_pending_subset(&self, pending_subset: PendingSubsetArg<'_>) {
+    fn stabilize_with_pending_queue(&self) {
         trace!("stabilize0");
         self.graph.with(|graph| {
             // ─────────────────────────────────────────────────────────────
@@ -1281,12 +980,12 @@ impl Engine {
             }
         });
         #[cfg(feature = "anchors_slotmap")]
-        self.process_pending_requests(pending_subset);
+        self.process_pending_requests();
         trace!("...stabilize0");
     }
 
     #[cfg(feature = "anchors_slotmap")]
-    fn process_pending_requests(&self, pending_subset: PendingSubsetArg<'_>) {
+    fn process_pending_requests(&self) {
         if Self::defer_disabled() {
             let mut queue = self.pending_requests.borrow_mut();
             queue.buckets.clear();
@@ -1299,15 +998,9 @@ impl Engine {
             if queue.is_empty() {
                 return;
             }
-            match pending_subset {
-                Some(filter) => queue.drain_subset(filter),
-                None => queue.drain_all(),
-            }
+            queue.drain_all()
         };
-        let drained = outcome.requests;
-        if let Some(stats) = outcome.subset_stats {
-            self.log_pending_subset_stats(stats);
-        }
+        let drained = outcome;
         let total_to_retry = drained.len();
         if total_to_retry > 0 {
             self.pending_stats.total_drained.set(
@@ -1430,49 +1123,6 @@ impl Engine {
     }
 
     #[cfg(feature = "anchors_slotmap")]
-    fn log_pending_subset_stats(&self, stats: PendingSubsetDrainStats) {
-        if !tracing::enabled!(tracing::Level::INFO) {
-            return;
-        }
-        let sample_filter = Self::raw_tokens(&stats.sample_filter);
-        let sample_drained = Self::raw_tokens(&stats.sample_drained);
-        let sample_unmatched = Self::raw_tokens(&stats.sample_unmatched);
-        let sample_remaining = Self::raw_tokens(&stats.sample_remaining);
-        let sample_filter_debug = self.describe_tokens(&stats.sample_filter);
-        let sample_unmatched_debug = self.describe_tokens(&stats.sample_unmatched);
-        let sample_remaining_debug = self.describe_tokens(&stats.sample_remaining);
-        {
-            let mut slot = self.last_subset_remaining.borrow_mut();
-            slot.clear();
-            slot.extend(stats.sample_remaining.iter().copied());
-        }
-        {
-            let mut slot = self.last_subset_remaining_debug.borrow_mut();
-            slot.clear();
-            slot.extend(sample_remaining_debug.iter().cloned());
-        }
-        tracing::info!(
-            target: "anchors",
-            log_event = "pending_subset_drain",
-            requested_tokens = stats.requested_tokens,
-            drained_tokens = stats.drained_tokens,
-            unmatched_tokens = stats.unmatched_tokens,
-            remaining_after = stats.remaining_after,
-            parent_match_hits = stats.parent_match_hits,
-            sample_filter = ?sample_filter,
-            sample_filter_debug = ?sample_filter_debug,
-            sample_drained = ?sample_drained,
-            sample_unmatched = ?sample_unmatched,
-            sample_unmatched_debug = ?sample_unmatched_debug,
-            sample_remaining = ?sample_remaining,
-            sample_remaining_debug = ?sample_remaining_debug,
-            drained_priority_hist = ?stats.drained_priority_hist,
-            remaining_priority_hist = ?stats.remaining_priority_hist,
-            "pending subset drain stats"
-        );
-    }
-
-    #[cfg(feature = "anchors_slotmap")]
     fn describe_tokens(&self, tokens: &[NodeKey]) -> Vec<String> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1500,11 +1150,6 @@ impl Engine {
                 .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
                 .unwrap_or(false)
         })
-    }
-
-    #[cfg(feature = "anchors_slotmap")]
-    fn raw_tokens(tokens: &[NodeKey]) -> Vec<u64> {
-        tokens.iter().map(|token| token.raw_token()).collect()
     }
 
     /// returns false if calculation is still pending
