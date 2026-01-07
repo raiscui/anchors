@@ -283,10 +283,7 @@ where
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
-        if std::env::var("ANCHORS_DEBUG_COLLECT")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_COLLECT") {
             println!(
                 "OrdMapCollectStream poll: dirty={} loc={:?}",
                 self.dirty, self.location
@@ -372,10 +369,7 @@ where
         let mut dict = OrdMap::with_pool(&pool);
         ready_entries.into_iter().collect_into(&mut dict);
 
-        if std::env::var("ANCHORS_DEBUG_COLLECT")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_COLLECT") {
             println!(
                 "OrdMapCollectStream 重建完成，条目={} loc={:?}",
                 dict.len(),

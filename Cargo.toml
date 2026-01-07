@@ -29,6 +29,7 @@ lock_strict = []
 # typed-arena = { version = "2.0.1" }
 arena-graph = { version = "0.1.0", path = "../arena-graph" }
 cfg-if = "1.0.0"
+emg_debug_env = { workspace = true } #unified
 emg_common = { workspace = true, optional = true, features = ["debug"] } #unified
 emg_hasher = { workspace = true } #unified
 indexmap = { workspace = true } #unified
@@ -63,4 +64,3 @@ harness = false
 
 # [profile.release]
 # debug = true
-

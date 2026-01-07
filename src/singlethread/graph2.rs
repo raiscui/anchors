@@ -9,7 +9,7 @@ use std::{backtrace::Backtrace, sync::OnceLock};
 struct FreeTraceConfig {
     enabled: bool,
     token_filter: Option<u64>,
-    match_substr: Option<String>,
+    match_substr: Option<&'static str>,
     backtrace: bool,
 }
 
@@ -18,7 +18,7 @@ struct FreeTraceConfig {
 struct TokenTraceConfig {
     enabled: bool,
     token_filter: Option<u64>,
-    match_substr: Option<String>,
+    match_substr: Option<&'static str>,
     backtrace: bool,
 }
 
@@ -34,21 +34,10 @@ impl FreeTraceConfig {
         // - ANCHORS_TRACE_FREE=1 ANCHORS_TRACE_FREE_TOKEN=4799 ANCHORS_TRACE_FREE_BACKTRACE=1
         // - ANCHORS_TRACE_FREE=1 ANCHORS_TRACE_FREE_MATCH=node_builder.rs:169
         ////////////////////////////////////////////////////////////////////////////////
-        let enabled = std::env::var("ANCHORS_TRACE_FREE")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-            .unwrap_or(false);
-
-        let token_filter = std::env::var("ANCHORS_TRACE_FREE_TOKEN")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok());
-
-        let match_substr = std::env::var("ANCHORS_TRACE_FREE_MATCH")
-            .ok()
-            .filter(|s| !s.is_empty());
-
-        let backtrace = std::env::var("ANCHORS_TRACE_FREE_BACKTRACE")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-            .unwrap_or(false);
+        let enabled = emg_debug_env::bool_strict("ANCHORS_TRACE_FREE");
+        let token_filter = emg_debug_env::u64_opt("ANCHORS_TRACE_FREE_TOKEN");
+        let match_substr = emg_debug_env::str_non_empty("ANCHORS_TRACE_FREE_MATCH");
+        let backtrace = emg_debug_env::bool_strict("ANCHORS_TRACE_FREE_BACKTRACE");
 
         Self {
             enabled,
@@ -68,8 +57,8 @@ impl FreeTraceConfig {
                 return false;
             }
         }
-        if let Some(substr) = &self.match_substr {
-            if !debug_info.contains(substr.as_str()) {
+        if let Some(substr) = self.match_substr {
+            if !debug_info.contains(substr) {
                 return false;
             }
         }
@@ -86,21 +75,16 @@ fn free_trace_cfg() -> &'static FreeTraceConfig {
 #[cfg(feature = "anchors_slotmap")]
 impl TokenTraceConfig {
     fn from_env(prefix: &str) -> Self {
-        let enabled = std::env::var(prefix)
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-            .unwrap_or(false);
+        let enabled = emg_debug_env::bool_strict(prefix);
 
-        let token_filter = std::env::var(format!("{prefix}_TOKEN"))
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok());
+        let token_key = format!("{prefix}_TOKEN");
+        let token_filter = emg_debug_env::u64_opt(token_key.as_str());
 
-        let match_substr = std::env::var(format!("{prefix}_MATCH"))
-            .ok()
-            .filter(|s| !s.is_empty());
+        let match_key = format!("{prefix}_MATCH");
+        let match_substr = emg_debug_env::str_non_empty(match_key.as_str());
 
-        let backtrace = std::env::var(format!("{prefix}_BACKTRACE"))
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-            .unwrap_or(false);
+        let backtrace_key = format!("{prefix}_BACKTRACE");
+        let backtrace = emg_debug_env::bool_strict(backtrace_key.as_str());
 
         Self {
             enabled,
@@ -120,8 +104,8 @@ impl TokenTraceConfig {
                 return false;
             }
         }
-        if let Some(substr) = &self.match_substr {
-            if !debug_info.contains(substr.as_str()) {
+        if let Some(substr) = self.match_substr {
+            if !debug_info.contains(substr) {
                 return false;
             }
         }
@@ -784,10 +768,7 @@ impl<'a> NodeGuard<'a> {
         } else {
             self.ptrs.clean_parents.borrow_mut().push(parent.make_ptr())
         }
-        if std::env::var("ANCHORS_DEBUG_PARENT_LINK")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_LINK") {
             // 调试输出：带上节点的 debug_info，便于定位父子是谁
             let child_dbg = self.debug_info.get()._to_string();
             let parent_dbg = parent.debug_info.get()._to_string();
@@ -812,10 +793,7 @@ impl<'a> NodeGuard<'a> {
                 .iter()
                 .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() })),
         );
-        if std::env::var("ANCHORS_DEBUG_PARENT_FLOW")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_FLOW") {
             println!(
                 "CLEAN_PARENTS node={:?} count={}",
                 self.debug_info.get()._to_string(),
@@ -857,10 +835,7 @@ impl<'a> NodeGuard<'a> {
         let res = self.clean_parents();
         self.ptrs.clean_parent0.set(None);
         self.ptrs.clean_parents.borrow_mut().clear();
-        if std::env::var("ANCHORS_DEBUG_PARENT_FLOW")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_FLOW") {
             println!(
                 "DRAIN_CLEAN_PARENTS node={:?} drained={}",
                 self.debug_info.get()._to_string(),
@@ -998,10 +973,7 @@ impl<'gg> Graph2Guard<'gg> {
                 // │ 这些节点若继续出队将触发重算 panic，故在此直接跳过。           │
                 // └─────────────────────────────────────────────────────────────┘
                 if unsafe { (*node.anchor.get()).is_none() } {
-                    if std::env::var("ANCHORS_DEBUG_QUEUE")
-                        .map(|v| v != "0")
-                        .unwrap_or(false)
-                    {
+                    if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
                         println!(
                             "QUEUE POP skip freed token={:?} debug={}",
                             node.key().raw_token(),
@@ -1019,10 +991,7 @@ impl<'gg> Graph2Guard<'gg> {
                     }
                     continue;
                 }
-                if std::env::var("ANCHORS_DEBUG_QUEUE")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
                     println!(
                         "QUEUE POP height={} token={:?} debug={}",
                         self.graph.recalc_min_height.get(),
@@ -1058,10 +1027,7 @@ impl<'gg> Graph2Guard<'gg> {
         if node.ptrs.recalc_state.get() == RecalcState::Pending {
             let node_height = height(node);
             if self.graph.recalc_min_height.get() > node_height {
-                if std::env::var("ANCHORS_DEBUG_QUEUE")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
                     println!(
                         "queue_recalc requeue pending (min_height={} > node_height={}) token={:?} debug={}",
                         self.graph.recalc_min_height.get(),
@@ -1073,10 +1039,7 @@ impl<'gg> Graph2Guard<'gg> {
                 // 若节点确实已丢队列，dequeue_calc 会把它恢复到 Ready；随后走常规入队逻辑。
                 dequeue_calc(self.graph, node);
             } else {
-                if std::env::var("ANCHORS_DEBUG_QUEUE")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
                     println!(
                         "queue_recalc skip (already pending) token={:?} debug={}",
                         node.key().raw_token(),
@@ -1101,10 +1064,7 @@ impl<'gg> Graph2Guard<'gg> {
             node.pending_recalc.set(true);
             return;
         }
-        if std::env::var("ANCHORS_DEBUG_QUEUE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
             println!(
                 "queue_recalc enqueue token={:?} height={} debug={}",
                 node.key().raw_token(),
@@ -1306,7 +1266,7 @@ impl Graph2 {
     #[cfg(feature = "anchors_slotmap")]
     fn epoch_trace_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("ANCHORS_EPOCH_TRACE").ok().as_deref() == Some("1"))
+        *ENABLED.get_or_init(|| emg_debug_env::bool_strict("ANCHORS_EPOCH_TRACE"))
     }
 
     #[cfg(feature = "anchors_slotmap")]

@@ -20,7 +20,7 @@ fn workload(strict: bool, c: &mut Criterion) {
     };
 
     // 保存旧值，基准结束后恢复，避免影响其他基准或外部环境。
-    let old_env = std::env::var("ANCHORS_LOCK_STRICT").ok();
+    let old_env = emg_debug_env::str_allow_empty("ANCHORS_LOCK_STRICT");
     // std 环境操作在本基准中可控，显式标记 unsafe 以通过编译检查。
     unsafe {
         std::env::set_var("ANCHORS_LOCK_STRICT", if strict { "1" } else { "0" });

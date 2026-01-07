@@ -339,11 +339,7 @@ impl Engine {
     #[cfg(feature = "anchors_slotmap")]
     fn debug_pending_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("ANCHORS_DEBUG_PENDING")
-                .map(|v| v != "0")
-                .unwrap_or(false)
-        })
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_PENDING"))
     }
 
     #[cfg(not(feature = "anchors_slotmap"))]
@@ -355,11 +351,7 @@ impl Engine {
     #[cfg(feature = "anchors_slotmap")]
     fn defer_disabled() -> bool {
         static DISABLED: OnceLock<bool> = OnceLock::new();
-        *DISABLED.get_or_init(|| {
-            std::env::var("ANCHORS_DEFER_DISABLED")
-                .map(|v| v != "0")
-                .unwrap_or(false)
-        })
+        *DISABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEFER_DISABLED"))
     }
 
     #[cfg(not(feature = "anchors_slotmap"))]
@@ -499,11 +491,7 @@ impl Engine {
     #[cfg(feature = "anchors_slotmap")]
     fn invalid_token_backtrace_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("ANCHORS_INVALID_TOKEN_BACKTRACE")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-                .unwrap_or(false)
-        })
+        *ENABLED.get_or_init(|| emg_debug_env::bool_strict("ANCHORS_INVALID_TOKEN_BACKTRACE"))
     }
 
     #[cfg(not(feature = "anchors_slotmap"))]
@@ -872,13 +860,11 @@ impl Engine {
             // - 不再逐步 println（会产生海量日志并影响时序），只在超过阈值时 panic；
             // - panic 消息包含“最近 N 次出队”的 token + debug_info，便于快速定位闭环。
             // ─────────────────────────────────────────────────────────────
-            let spin_debug = std::env::var("ANCHORS_DEBUG_SPIN")
-                .map(|v| v != "0")
-                .unwrap_or(false);
+            let spin_debug = emg_debug_env::bool_lenient("ANCHORS_DEBUG_SPIN");
             let mut spin_counter: usize = 0;
             let spin_limit: usize = if spin_debug {
-                if let Ok(v) = std::env::var("ANCHORS_DEBUG_SPIN_LIMIT") {
-                    v.parse::<usize>().unwrap_or(0)
+                if let Some(v) = emg_debug_env::str_allow_empty("ANCHORS_DEBUG_SPIN_LIMIT") {
+                    v.trim().parse::<usize>().unwrap_or(0)
                 } else {
                     #[cfg(feature = "anchors_slotmap")]
                     {
@@ -952,7 +938,7 @@ impl Engine {
             #[cfg(feature = "anchors_slotmap")]
             {
                 graph.retry_pending_free();
-                if std::env::var("ANCHORS_ACTIVE_NODES_LOG").is_ok() {
+                if emg_debug_env::bool_lenient("ANCHORS_ACTIVE_NODES_LOG") {
                     let rss = Self::current_rss_bytes();
                     let active = graph.active_nodes();
                     let gc_stats = graph.gc_stats();
@@ -1145,11 +1131,7 @@ impl Engine {
         use std::sync::OnceLock;
 
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("ANCHORS_PENDING_DEBUG_SAMPLE")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-                .unwrap_or(false)
-        })
+        *ENABLED.get_or_init(|| emg_debug_env::bool_strict("ANCHORS_PENDING_DEBUG_SAMPLE"))
     }
 
     /// returns false if calculation is still pending
@@ -1171,9 +1153,11 @@ impl Engine {
             {
                 static STRICT: OnceLock<bool> = OnceLock::new();
                 return *STRICT.get_or_init(|| {
-                    std::env::var("ANCHORS_LOCK_STRICT")
-                        .map(|v| v != "0")
-                        .unwrap_or(true)
+                    // 默认严格（true），仅在显式设置为 0/false/off/no 时关闭。
+                    if emg_debug_env::str_allow_empty("ANCHORS_LOCK_STRICT").is_none() {
+                        return true;
+                    }
+                    emg_debug_env::bool_lenient("ANCHORS_LOCK_STRICT")
                 });
             }
 
@@ -1188,11 +1172,7 @@ impl Engine {
         /// 在 strict 模式下 panic 时，会把上一次持锁时的调用栈附带出来。
         fn lock_trace_enabled() -> bool {
             static TRACE: OnceLock<bool> = OnceLock::new();
-            *TRACE.get_or_init(|| {
-                std::env::var("ANCHORS_LOCK_TRACE")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-            })
+            *TRACE.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_LOCK_TRACE"))
         }
 
         #[derive(Clone)]
@@ -1262,10 +1242,7 @@ impl Engine {
             fn drop(&mut self) {
                 if let Some(node) = self.graph.get(self.node_key) {
                     node.anchor_locked.set(false);
-                    if std::env::var("ANCHORS_DEBUG_REQUEUE")
-                        .map(|v| v != "0")
-                        .unwrap_or(false)
-                    {
+                    if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEUE") {
                         println!(
                             "REQUEUE check node={:?} pending_recalc={}",
                             node.debug_info.get()._to_string(),
@@ -1274,10 +1251,7 @@ impl Engine {
                     }
                     // 若锁期间收到“补偿重算”标记，解锁后再入队自身，既避免重入也不丢更新。
                     if node.pending_recalc.get() {
-                        if std::env::var("ANCHORS_DEBUG_REQUEUE")
-                            .map(|v| v != "0")
-                            .unwrap_or(false)
-                        {
+                        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEUE") {
                             println!(
                                 "REQUEUE pending node={:?} state_before={:?} height={}",
                                 node.debug_info.get()._to_string(),
@@ -1328,10 +1302,7 @@ impl Engine {
         node.anchor_locked.set(true);
 
         // 可选调试：设置 `ANCHORS_RECALC_TRACE=1` 可打印正在重算的节点信息，便于跟踪依赖链。
-        if std::env::var("ANCHORS_RECALC_TRACE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_RECALC_TRACE") {
             println!("RECALC {:?}", node.debug_info.get()._to_string());
         }
 
@@ -1386,10 +1357,7 @@ impl Engine {
         let invalid_token_requested = ecx.invalid_token_requested;
         match poll_result {
             Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
-                if std::env::var("ANCHORS_DEBUG_PENDING")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PENDING") {
                     println!(
                         "PENDING node={:?} pending_on_anchor_get={}",
                         node.debug_info.get()._to_string(),
@@ -1458,10 +1426,7 @@ impl Engine {
                 }
             }
             Poll::Updated => {
-                if std::env::var("ANCHORS_DEBUG_PARENTS")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENTS") {
                     let parents = node.clean_parents();
                     println!(
                         "UPDATED {:?} parents={}",
@@ -1745,11 +1710,7 @@ impl Default for Engine {
 // 全局可用的锁 trace 开关，供 mark_dirty 等非 recalc 路径复用。
 fn lock_trace_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
-    *TRACE.get_or_init(|| {
-        std::env::var("ANCHORS_LOCK_TRACE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-    })
+    *TRACE.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_LOCK_TRACE"))
 }
 
 // skip_self = true indicates output has *definitely* changed, but node has been recalculated
@@ -1757,10 +1718,7 @@ fn lock_trace_enabled() -> bool {
 fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) {
     trace!("mark_dirty {:?} ", node.debug_info.get(),);
     if skip_self {
-        if std::env::var("ANCHORS_DEBUG_MARK")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MARK") {
             let parents_len = node.parents_len();
             println!(
                 "mark_dirty skip_self node={:?} parents={}",
@@ -1773,10 +1731,7 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
             if parent.anchor_locked.get() {
                 // 父节点正在重算，记录一次补偿重算请求，解锁后再统一入队，避免 strict 模式下的重入 panic。
                 parent.pending_recalc.set(true);
-                if std::env::var("ANCHORS_DEBUG_DIRTY_FLOW")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_DIRTY_FLOW") {
                     println!(
                         "DIRTY flow skip queue (parent locked) child={:?} parent={:?}",
                         node.debug_info.get()._to_string(),
@@ -1807,10 +1762,7 @@ fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
     let mut pending = parent.pending_dirty.borrow_mut();
     if !pending.contains(&child) {
         pending.push(child);
-        if std::env::var("ANCHORS_DEBUG_DIRTY_FLOW")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_DIRTY_FLOW") {
             println!(
                 "PENDING_DIRTY child={:?} ({}) -> parent={:?} ({})",
                 child.raw_token(),
@@ -1835,10 +1787,7 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
         }
     } else if graph2::recalc_state(next) == RecalcState::Ready {
         graph2::needs_recalc(next);
-        if std::env::var("ANCHORS_DEBUG_MARK")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MARK") {
             println!(
                 "mark_dirty0 unnecessary node={:?} parents={}",
                 next.debug_info.get()._to_string(),
@@ -2087,10 +2036,7 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             }
         };
 
-        if std::env::var("ANCHORS_DEBUG_REQUEST")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-        {
+        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEST") {
             println!(
                 "REQUEST parent_token={} parent={:?} child_token={} child={:?} ready={:?} height_ok={}",
                 self.node.key().raw_token(),
@@ -2108,10 +2054,7 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
             self.graph.queue_recalc(child);
-            if std::env::var("ANCHORS_DEBUG_REQUEST")
-                .map(|v| v != "0")
-                .unwrap_or(false)
-            {
+            if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEST") {
                 println!(
                     "REQUEST pending parent_token={} parent={:?} child_token={} child={:?} state={:?}",
                     self.node.key().raw_token(),

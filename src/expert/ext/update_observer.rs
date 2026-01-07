@@ -72,10 +72,7 @@ macro_rules! impl_tuple_update_observer {
                     return Poll::Unchanged;
                 }
 
-                if std::env::var("ANCHORS_DEBUG_UPDATE_OBSERVER")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_UPDATE_OBSERVER") {
                     println!(
                         "UPDATE_OBSERVER poll stale={} ver={} loc={:?}",
                         self.output_stale,

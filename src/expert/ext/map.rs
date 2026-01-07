@@ -63,10 +63,7 @@ macro_rules! impl_tuple_map {
                     return Poll::Unchanged;
                 }
 
-                if std::env::var("ANCHORS_DEBUG_MAP")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP") {
                     println!(
                         "MAP poll output_stale={} has_output={} loc={:?}",
                         self.output_stale,
@@ -121,10 +118,7 @@ macro_rules! impl_tuple_map {
                 if self.output.is_none() || found_updated {
                     let new_val = Some((self.f)($(ctx.get(&self.anchors.$num)),+));
                     if new_val != self.output {
-                        if std::env::var("ANCHORS_DEBUG_MAP")
-                            .map(|v| v != "0")
-                            .unwrap_or(false)
-                        {
+                        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP") {
                             println!(
                                 "MAP 更新 loc={:?} type={} (值已变更)",
                                 self.location,

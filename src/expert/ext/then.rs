@@ -60,10 +60,7 @@ macro_rules! impl_tuple_then {
                 ctx: &mut G,
             ) -> Poll {
                 if self.f_anchor.is_none() || self.output_stale {
-                    if std::env::var("ANCHORS_DEBUG_THEN")
-                        .map(|v| v != "0")
-                        .unwrap_or(false)
-                    {
+                    if emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN") {
                         println!(
                             "THEN poll: output_stale={} f_anchor_present={} loc={:?}",
                             self.output_stale,
@@ -112,10 +109,7 @@ macro_rules! impl_tuple_then {
                     if found_pending {
                         #[cfg(debug_assertions)]
                         {
-                            if std::env::var("ANCHORS_DEBUG_THEN")
-                                .map(|v| v != "0")
-                                .unwrap_or(false)
-                            {
+                            if emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN") {
                                 tracing::warn!(
                                     target: "anchors",
                                     "then pending: loc={:?} anchors={}",
@@ -132,10 +126,7 @@ macro_rules! impl_tuple_then {
                     match self.f_anchor.as_ref() {
                         Some(outdated_anchor) if outdated_anchor != &new_anchor => {
                             #[cfg(debug_assertions)]
-                            if std::env::var("ANCHORS_DEBUG_THEN")
-                                .map(|v| v != "0")
-                                .unwrap_or(false)
-                            {
+                            if emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN") {
                                 tracing::warn!(
                                     target: "anchors",
                                     "then switching output anchor old={:?} new={:?} loc={:?}",
@@ -144,7 +135,7 @@ macro_rules! impl_tuple_then {
                                     self.location
                                 );
                             }
-                            if std::env::var("ANCHORS_DEBUG_THEN").map(|v| v != "0").unwrap_or(false) {
+                            if emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN") {
                                 println!(
                                     "THEN 切换输出 Anchor old={:?} new={:?} loc={:?}",
                                     outdated_anchor.token(),
