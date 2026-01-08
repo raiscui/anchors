@@ -1,4 +1,4 @@
-#![cfg(feature = "anchors_slotmap")]
+#![cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
 
 use std::{cell::RefCell, rc::Rc};
 

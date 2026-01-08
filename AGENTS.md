@@ -24,7 +24,7 @@
 `cargo test singlethread::test::test_readme_example -- --exact`.
 性能回归执行 `cargo bench --bench stabilize_linear_nodes_simple`.
 如需 Criterion 网页报告, 附加 `--features html_reports`.
-SlotMap 流程建议跑 `cargo test --test slotmap_pending_requests`.
+SlotMap 流程建议跑 `cargo test --test slotmap_pending_requests --features anchors_pending_queue`（pending queue 默认关闭）。
 
 ## 编码风格与命名约定
 `Cargo.toml` 配置 `edition = "2024"`, 需在 nightly 下编译.

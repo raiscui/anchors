@@ -191,6 +191,14 @@ Maybe twice as fast?
   </tr>
 </table>
 
+## Cargo features
+
+- `anchors_slotmap` (default): enable the slotmap-based engine backend and related diagnostics.
+- `anchors_pending_queue` (default off): enable the pending request queue (`PendingDefer` + drain via `process_pending_requests`).
+  - Useful for tests/debugging of deferred dependency requests.
+  - Enable with `--features anchors_pending_queue`.
+- `lock_strict` (default): enable strict lock checks in `singlethread`.
+
 ## See Also
 
 - https://github.com/Adapton/adapton.rust

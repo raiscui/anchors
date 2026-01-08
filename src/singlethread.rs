@@ -22,7 +22,7 @@ pub use graph2::EpochGuard;
 pub use graph2::GcStatsSnapshot;
 pub use graph2::NodeKey as AnchorToken;
 
-#[cfg(feature = "anchors_slotmap")]
+#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
 #[derive(Default)]
 struct PendingStatsInner {
     total_enqueued_raw: Cell<u64>,
@@ -136,8 +136,10 @@ use libc::getrusage;
 use libc::rusage;
 use std::any::Any;
 use std::backtrace::Backtrace;
-use std::cell::{Cell, RefCell};
-#[cfg(feature = "anchors_slotmap")]
+#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+use std::cell::Cell;
+use std::cell::RefCell;
+#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -193,12 +195,13 @@ impl PendingPriority {
         }
     }
 
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     fn as_u8(self) -> u8 {
         self as u8
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
+#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
 #[derive(Clone, Copy, Debug)]
 struct PendingRequest {
     parent: NodeKey,
@@ -207,20 +210,20 @@ struct PendingRequest {
     priority: PendingPriority,
 }
 
-#[cfg(feature = "anchors_slotmap")]
+#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
 #[derive(Default)]
 struct PendingQueue {
     buckets: BTreeMap<PendingPriority, IndexMap<NodeKey, PendingRequest>>,
     index: HashMap<NodeKey, PendingPriority>,
 }
 
-#[cfg(feature = "anchors_slotmap")]
+#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
 enum PendingEnqueueOutcome {
     Inserted,
     Replaced,
 }
 
-#[cfg(feature = "anchors_slotmap")]
+#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
 impl PendingQueue {
     fn len(&self) -> usize {
         self.index.len()
@@ -304,9 +307,9 @@ pub struct Engine {
 
     // tracks the current stabilization generation; incremented on every stabilize
     generation: Generation,
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     pending_requests: Rc<RefCell<PendingQueue>>,
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     pending_stats: Rc<PendingStatsInner>,
     #[cfg(feature = "anchors_slotmap")]
     invalid_token_log: Rc<RefCell<InvalidTokenLogInner>>,
@@ -336,28 +339,16 @@ impl crate::expert::Engine for Engine {
 }
 
 impl Engine {
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     fn debug_pending_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_PENDING"))
     }
 
-    #[cfg(not(feature = "anchors_slotmap"))]
-    #[inline]
-    fn debug_pending_enabled() -> bool {
-        false
-    }
-
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     fn defer_disabled() -> bool {
         static DISABLED: OnceLock<bool> = OnceLock::new();
         *DISABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEFER_DISABLED"))
-    }
-
-    #[cfg(not(feature = "anchors_slotmap"))]
-    #[inline]
-    fn defer_disabled() -> bool {
-        true
     }
     #[cfg(feature = "anchors_slotmap")]
     fn current_rss_bytes() -> u64 {
@@ -392,9 +383,9 @@ impl Engine {
             graph,
             dirty_marks: Default::default(),
             generation: Generation::new(),
-            #[cfg(feature = "anchors_slotmap")]
+            #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
             pending_requests: Rc::new(RefCell::new(PendingQueue::default())),
-            #[cfg(feature = "anchors_slotmap")]
+            #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
             pending_stats: Rc::new(PendingStatsInner::default()),
             #[cfg(feature = "anchors_slotmap")]
             invalid_token_log: Rc::new(RefCell::new(InvalidTokenLogInner::default())),
@@ -406,7 +397,7 @@ impl Engine {
     /// 输出 pending 队列的聚合指标，便于在 demo/集成测试后记录基线。
     #[must_use]
     pub fn pending_stats_snapshot(&self) -> AnchorsPendingStats {
-        #[cfg(feature = "anchors_slotmap")]
+        #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
         {
             let stats = &self.pending_stats;
             return AnchorsPendingStats {
@@ -421,7 +412,7 @@ impl Engine {
             };
         }
 
-        #[cfg(not(feature = "anchors_slotmap"))]
+        #[cfg(not(all(feature = "anchors_slotmap", feature = "anchors_pending_queue")))]
         {
             AnchorsPendingStats::default()
         }
@@ -578,7 +569,7 @@ impl Engine {
         })
     }
 
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     fn enqueue_pending_keys(
         &self,
         parent: NodeKey,
@@ -642,7 +633,7 @@ impl Engine {
         true
     }
 
-    #[cfg(not(feature = "anchors_slotmap"))]
+    #[cfg(not(all(feature = "anchors_slotmap", feature = "anchors_pending_queue")))]
     #[inline]
     fn enqueue_pending_keys(
         &self,
@@ -671,6 +662,7 @@ impl Engine {
         if !self.dirty_marks.borrow().is_empty() {
             return None;
         }
+        #[cfg(feature = "anchors_pending_queue")]
         if !self.pending_requests.borrow().is_empty() {
             return None;
         }
@@ -965,12 +957,12 @@ impl Engine {
                 }
             }
         });
-        #[cfg(feature = "anchors_slotmap")]
+        #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
         self.process_pending_requests();
         trace!("...stabilize0");
     }
 
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     fn process_pending_requests(&self) {
         if Self::defer_disabled() {
             let mut queue = self.pending_requests.borrow_mut();
@@ -1108,7 +1100,7 @@ impl Engine {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     fn describe_tokens(&self, tokens: &[NodeKey]) -> Vec<String> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1126,7 +1118,7 @@ impl Engine {
         })
     }
 
-    #[cfg(feature = "anchors_slotmap")]
+    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
     fn debug_pending_queue_sample_enabled() -> bool {
         use std::sync::OnceLock;
 

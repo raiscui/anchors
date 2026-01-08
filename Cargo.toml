@@ -19,6 +19,7 @@ default = ["generic_size_voa", "anchors_slotmap", "lock_strict"]
 pool = []
 generic_size_voa = ["emg_common"]
 anchors_slotmap = ["libc"]
+anchors_pending_queue = ["anchors_slotmap"]
 lock_strict = []
 
 
@@ -60,6 +61,10 @@ harness = false
 
 [[bench]]
 name = "slotmap_feature_overhead"
+harness = false
+
+[[bench]]
+name = "pending_queue_feature_overhead"
 harness = false
 
 # [profile.release]
