@@ -70,8 +70,8 @@ impl AnchorInner<Engine> for ToggleChildAnchor {
 
         // 先 request enable，保证 enable 变化能驱动该节点重算。
         match ctx.request(&self.enable, true) {
-            Poll::Pending | Poll::PendingDefer => return Poll::Pending,
-            Poll::PendingInvalidToken => return Poll::Pending,
+            poll if poll.is_waiting() => return Poll::Pending,
+            poll if poll.is_invalid_token() => return Poll::Pending,
             Poll::Updated | Poll::Unchanged => {}
         }
 
@@ -89,8 +89,8 @@ impl AnchorInner<Engine> for ToggleChildAnchor {
 
         // enable=true 时才 request child，用于制造“首次引入依赖”的场景。
         match ctx.request(&self.child, true) {
-            Poll::Pending | Poll::PendingDefer => return Poll::Pending,
-            Poll::PendingInvalidToken => return Poll::Pending,
+            poll if poll.is_waiting() => return Poll::Pending,
+            poll if poll.is_invalid_token() => return Poll::Pending,
             Poll::Updated | Poll::Unchanged => {}
         }
 

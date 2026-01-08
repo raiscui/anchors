@@ -1347,16 +1347,58 @@ impl Engine {
         node.recalc_retry.set(0);
         let pending_on_anchor_get = ecx.pending_on_anchor_get;
         let invalid_token_requested = ecx.invalid_token_requested;
-        match poll_result {
-            Poll::Pending | Poll::PendingDefer | Poll::PendingInvalidToken => {
-                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PENDING") {
-                    println!(
-                        "PENDING node={:?} pending_on_anchor_get={}",
-                        node.debug_info.get()._to_string(),
-                        pending_on_anchor_get
-                    );
-                }
+        let handle_waiting = |poll_debug: Poll| {
+            if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PENDING") {
+                println!(
+                    "PENDING node={:?} pending_on_anchor_get={}",
+                    node.debug_info.get()._to_string(),
+                    pending_on_anchor_get
+                );
+            }
+            if pending_on_anchor_get {
+                // looks like we requested an anchor that isn't yet calculated, so we
+                // reinsert into the graph directly; our height either was higher than this
+                // requested anchor's already, or it was updated so it's higher now.
+                return false;
+            }
 
+            // ──────────────────────────────────────────────────────────────
+            // 意外 Pending：
+            // - `poll_updated` 返回 Pending，但本次 poll 没有 request 任何“未 Ready 的子 Anchor”。
+            // - 这意味着它在等待“非 anchors 依赖”（比如外部 Future/通道/时钟），
+            //   anchors 无法追踪依赖关系，继续 requeue 会导致 stabilize 自旋。
+            //
+            // 处理策略：
+            // - 若该节点曾经 Ready 过（有旧输出）：冻结旧输出并记录告警，避免 GUI 崩溃；
+            // - 若从未 Ready（无旧输出）：无法提供降级输出，仍然 panic，且附带 node 信息。
+            // ──────────────────────────────────────────────────────────────
+            let raw_token = node.key().raw_token();
+            let count = self.bump_unexpected_pending_count(raw_token);
+            if Self::should_log_unexpected_pending(count) {
+                let debug = node.debug_info.get()._to_string();
+                eprintln!(
+                    "[anchors][unexpected_pending] node={debug} token={raw_token} seen={count} poll={poll_debug:?}"
+                );
+                // NOTE: 只在第一次采样时抓一次回溯，避免高频路径产生大量 backtrace 分配。
+                if count == 1 {
+                    let bt = Backtrace::force_capture();
+                    eprintln!("[anchors][unexpected_pending] backtrace:\n{bt}");
+                }
+            }
+
+            if node.last_ready.get().is_some() {
+                // 冻结：把本轮视为“已 ready”，避免不断 requeue。
+                node.last_ready.set(Some(self.generation));
+                return true;
+            }
+
+            panic!(
+                "poll_updated 返回 Pending，但未 request 任何未就绪子 Anchor，且节点无历史输出无法降级；node={} token={raw_token}",
+                node.debug_info.get()._to_string(),
+            );
+        };
+        match poll_result {
+            Poll::PendingInvalidToken => {
                 // ──────────────────────────────────────────────────────────────
                 // 失效 token 兜底：
                 // - invalid token 并非“子节点尚未计算完成”，而是“子节点已被回收”。
@@ -1365,58 +1407,23 @@ impl Engine {
                 //   - 若该节点曾经 Ready 过（有旧输出），则保持旧输出并标记为 Ready，避免死循环；
                 //   - 若该节点从未 Ready（无旧输出），无法降级，直接 panic 以便定位根因。
                 // ──────────────────────────────────────────────────────────────
-                if invalid_token_requested {
-                    if node.last_ready.get().is_some() {
-                        node.last_ready.set(Some(self.generation));
-                        return true;
-                    }
-                    panic!(
-                        "slotmap: 检测到失效 token request，且节点尚无历史输出无法降级；请开启 ANCHORS_INVALID_TOKEN_BACKTRACE=1 定位根因，node={}",
-                        node.debug_info.get()._to_string()
-                    );
+                debug_assert!(
+                    invalid_token_requested || !cfg!(debug_assertions),
+                    "poll_updated 返回 PendingInvalidToken，但 ecx.invalid_token_requested=false，node={}",
+                    node.debug_info.get()._to_string()
+                );
+                if node.last_ready.get().is_some() {
+                    node.last_ready.set(Some(self.generation));
+                    return true;
                 }
-                if pending_on_anchor_get {
-                    // looks like we requested an anchor that isn't yet calculated, so we
-                    // reinsert into the graph directly; our height either was higher than this
-                    // requested anchor's already, or it was updated so it's higher now.
-                    false
-                } else {
-                    // ──────────────────────────────────────────────────────────────
-                    // 意外 Pending：
-                    // - `poll_updated` 返回 Pending，但本次 poll 没有 request 任何“未 Ready 的子 Anchor”。
-                    // - 这意味着它在等待“非 anchors 依赖”（比如外部 Future/通道/时钟），
-                    //   anchors 无法追踪依赖关系，继续 requeue 会导致 stabilize 自旋。
-                    //
-                    // 处理策略：
-                    // - 若该节点曾经 Ready 过（有旧输出）：冻结旧输出并记录告警，避免 GUI 崩溃；
-                    // - 若从未 Ready（无旧输出）：无法提供降级输出，仍然 panic，且附带 node 信息。
-                    // ──────────────────────────────────────────────────────────────
-                    let raw_token = node.key().raw_token();
-                    let count = self.bump_unexpected_pending_count(raw_token);
-                    if Self::should_log_unexpected_pending(count) {
-                        let debug = node.debug_info.get()._to_string();
-                        eprintln!(
-                            "[anchors][unexpected_pending] node={debug} token={raw_token} seen={count} poll={poll_result:?}"
-                        );
-                        // NOTE: 只在第一次采样时抓一次回溯，避免高频路径产生大量 backtrace 分配。
-                        if count == 1 {
-                            let bt = Backtrace::force_capture();
-                            eprintln!("[anchors][unexpected_pending] backtrace:\n{bt}");
-                        }
-                    }
-
-                    if node.last_ready.get().is_some() {
-                        // 冻结：把本轮视为“已 ready”，避免不断 requeue。
-                        node.last_ready.set(Some(self.generation));
-                        return true;
-                    }
-
-                    panic!(
-                        "poll_updated 返回 Pending，但未 request 任何未就绪子 Anchor，且节点无历史输出无法降级；node={} token={raw_token}",
-                        node.debug_info.get()._to_string(),
-                    );
-                }
+                panic!(
+                    "slotmap: 检测到失效 token request，且节点尚无历史输出无法降级；请开启 ANCHORS_INVALID_TOKEN_BACKTRACE=1 定位根因，node={}",
+                    node.debug_info.get()._to_string()
+                );
             }
+            poll @ Poll::Pending => handle_waiting(poll),
+            #[cfg(feature = "anchors_pending_queue")]
+            poll @ Poll::PendingDefer => handle_waiting(poll),
             Poll::Updated => {
                 if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENTS") {
                     let parents = node.clean_parents();
@@ -2087,10 +2094,12 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             .engine
             .enqueue_pending_keys(self.node.key(), child.key(), necessary, priority)
         {
-            Poll::PendingDefer
-        } else {
-            Poll::Pending
+            #[cfg(feature = "anchors_pending_queue")]
+            return Poll::PendingDefer;
+            #[cfg(not(feature = "anchors_pending_queue"))]
+            return Poll::Pending;
         }
+        Poll::Pending
     }
 }
 

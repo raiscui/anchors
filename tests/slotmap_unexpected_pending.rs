@@ -39,10 +39,12 @@ impl AnchorInner<Engine> for PendingWithoutRequestAfterReady {
     fn poll_updated<G: UpdateContext<Engine = Engine>>(&mut self, ctx: &mut G) -> Poll {
         // 第一次 poll：建立依赖并产出初始输出，确保后续有“历史输出”可冻结。
         if self.first_poll {
-            match ctx.request(&self.input, true) {
-                Poll::Pending | Poll::PendingDefer => return Poll::Pending,
-                Poll::PendingInvalidToken => return Poll::PendingInvalidToken,
-                Poll::Updated | Poll::Unchanged => {}
+            let poll = ctx.request(&self.input, true);
+            if poll.is_waiting() {
+                return Poll::Pending;
+            }
+            if poll.is_invalid_token() {
+                return Poll::PendingInvalidToken;
             }
             self.output = *ctx.get(&self.input);
             self.first_poll = false;

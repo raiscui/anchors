@@ -25,6 +25,11 @@ pub enum Poll {
 
     /// Indicates该节点尚未完成计算，并且被延迟到下一轮 `stabilize`/drain
     /// 再次尝试，通常用于打断同帧内的循环请求。
+    ///
+    /// NOTE:
+    /// - 该分支仅在启用 `anchors_pending_queue` feature 时存在；
+    /// - 未启用 feature 时，所有“延迟到下一轮再尝试”的语义都会退化为普通 `Pending`。
+    #[cfg(feature = "anchors_pending_queue")]
     PendingDefer,
 
     /// 表示 request 的 token 已失效（节点可能已被 GC/free）。
@@ -37,9 +42,16 @@ pub enum Poll {
 }
 
 impl Poll {
+    #[cfg(feature = "anchors_pending_queue")]
     #[inline]
     pub fn is_waiting(&self) -> bool {
         matches!(self, Self::Pending | Self::PendingDefer)
+    }
+
+    #[cfg(not(feature = "anchors_pending_queue"))]
+    #[inline]
+    pub fn is_waiting(&self) -> bool {
+        matches!(self, Self::Pending)
     }
 
     #[inline]

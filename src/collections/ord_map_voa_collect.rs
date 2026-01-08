@@ -208,10 +208,11 @@ where
         // - 正确做法：当 input Updated 时，必须在同一轮直接进入重建逻辑。
         // ─────────────────────────────────────────────────────────────
         // 1) 先 request 输入字典，确保依赖关系/必要性正确，同时判定是否需要重建。
-        match ctx.request(&self.input, true) {
-            Poll::Pending | Poll::PendingDefer => {
-                return Poll::Pending;
-            }
+        let input_poll = ctx.request(&self.input, true);
+        if input_poll.is_waiting() {
+            return Poll::Pending;
+        }
+        match input_poll {
             Poll::PendingInvalidToken => {
                 // 输入 token 失效属于“无法恢复的依赖丢失”，交给上层/引擎做冻结或 panic（无历史输出）。
                 return Poll::PendingInvalidToken;
@@ -222,8 +223,10 @@ where
                 // 输入已变化：之前记录的 invalid key 可能被替换为新的有效 Anchor，需要清空后重新判定。
                 self.invalid_keys.clear();
             }
-            Poll::Unchanged => {}
-        }
+            Poll::Unchanged | Poll::Pending => {}
+            #[cfg(feature = "anchors_pending_queue")]
+            Poll::PendingDefer => {}
+        };
 
         // 2) 若无需重建，则保持 Unchanged。
         if !self.dirty {
@@ -250,12 +253,12 @@ where
                     ready_entries.push((k, v));
                 }
                 ValOrAnchor::Anchor(an) => {
-                    match ctx.request(&an, true) {
-                        Poll::Pending | Poll::PendingDefer => {
-                            pending_child = true;
-                            continue;
-                        }
-                        Poll::PendingInvalidToken => {
+                    let poll = ctx.request(&an, true);
+                    if poll.is_waiting() {
+                        pending_child = true;
+                        continue;
+                    }
+                    if poll.is_invalid_token() {
                             ////////////////////////////////////////////////////////////////////////////////
                             // `PendingInvalidToken` 不会变 Ready：
                             // - 将该 key 视为“元素已被移除”，从输出中剔除；
@@ -264,8 +267,6 @@ where
                             self.invalid_keys.insert(k.clone());
                             ctx.unrequest(&an);
                             continue;
-                        }
-                        _ => {}
                     }
                     ready_entries.push((k, ctx.get(&an).clone()));
                 }
@@ -625,6 +626,7 @@ mod test {
                     Some(Poll::Updated) => Poll::Updated,
                     Some(Poll::Unchanged) => Poll::Unchanged,
                     Some(Poll::Pending) => Poll::Pending,
+                    #[cfg(feature = "anchors_pending_queue")]
                     Some(Poll::PendingDefer) => Poll::PendingDefer,
                     Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
                     None => Poll::Unchanged,

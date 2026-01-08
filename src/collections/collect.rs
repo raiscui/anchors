@@ -65,8 +65,10 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VecCollect<T, E> {
 
             for anchor in self.anchors.iter() {
                 let s = ctx.request(anchor, true);
+                if s.is_waiting() {
+                    return Poll::Pending;
+                }
                 match s {
-                    Poll::Pending | Poll::PendingDefer => return Poll::Pending,
                     Poll::PendingInvalidToken => {
                         invalid_found = true;
                     }

@@ -80,10 +80,12 @@ where
             ////////////////////////////////////////////////////////////////////////////////
             let mut invalid_anchors: Vec<Anchor<T, E>> = Vec::new();
             for anchor in self.anchors.iter() {
-                match ctx.request(anchor, true) {
-                    Poll::Pending | Poll::PendingDefer => return Poll::Pending,
-                    Poll::PendingInvalidToken => invalid_anchors.push(anchor.clone()),
-                    _ => {}
+                let poll = ctx.request(anchor, true);
+                if poll.is_waiting() {
+                    return Poll::Pending;
+                }
+                if poll.is_invalid_token() {
+                    invalid_anchors.push(anchor.clone());
                 }
             }
 

@@ -78,19 +78,13 @@ macro_rules! impl_tuple_either {
                     let mut found_updated = false;
 
                     $(
-                        match ctx.request(&self.anchors.$num, true) {
-                            Poll::Pending | Poll::PendingDefer => {
-                                found_pending = true;
-                            }
-                            Poll::PendingInvalidToken => {
-                                found_invalid = true;
-                            }
-                            Poll::Updated => {
-                                found_updated = true;
-                            }
-                            Poll::Unchanged => {
-                                // do nothing
-                            }
+                        let anchor_poll = ctx.request(&self.anchors.$num, true);
+                        if anchor_poll.is_waiting() {
+                            found_pending = true;
+                        } else if anchor_poll.is_invalid_token() {
+                            found_invalid = true;
+                        } else if anchor_poll == Poll::Updated {
+                            found_updated = true;
                         }
                     )+
 
@@ -132,29 +126,25 @@ macro_rules! impl_tuple_either {
                             );
                             if !is_same_anchor {
                                 let new_poll = ctx.request(new_anchor, true);
-                                match new_poll {
-                                    Poll::PendingInvalidToken => {
-                                        if self.either_anchor.is_some() {
-                                            // 回退到旧输出：不更新 either_anchor。
-                                            self.output_stale = false;
-                                            return Poll::Unchanged;
-                                        }
-                                        return Poll::PendingInvalidToken;
+                                if new_poll.is_invalid_token() {
+                                    if self.either_anchor.is_some() {
+                                        // 回退到旧输出：不更新 either_anchor。
+                                        self.output_stale = false;
+                                        return Poll::Unchanged;
                                     }
-                                    Poll::Pending | Poll::PendingDefer => {
-                                        // 切换到新输出并等待它 ready。
-                                        if let Some(ValOrAnchor::Anchor(outdated_anchor)) =
-                                            self.either_anchor.as_ref()
-                                        {
-                                            ctx.unrequest(outdated_anchor);
-                                        }
-                                        self.either_anchor = Some(new_either_anchor);
-                                        return Poll::Pending;
-                                    }
-                                    ready_poll @ (Poll::Updated | Poll::Unchanged) => {
-                                        output_anchor_poll = Some(ready_poll);
-                                    }
+                                    return Poll::PendingInvalidToken;
                                 }
+                                if new_poll.is_waiting() {
+                                    // 切换到新输出并等待它 ready。
+                                    if let Some(ValOrAnchor::Anchor(outdated_anchor)) =
+                                        self.either_anchor.as_ref()
+                                    {
+                                        ctx.unrequest(outdated_anchor);
+                                    }
+                                    self.either_anchor = Some(new_either_anchor);
+                                    return Poll::Pending;
+                                }
+                                output_anchor_poll = Some(new_poll);
                             }
                         }
 
@@ -199,12 +189,19 @@ macro_rules! impl_tuple_either {
 
                 match self.either_anchor.as_ref().unwrap() {
                     ValOrAnchor::Val(_) => poll,
-                    ValOrAnchor::Anchor(an) => match output_anchor_poll.unwrap_or_else(|| ctx.request(an, true)) {
-                        Poll::Updated => Poll::Updated,
-                        Poll::Unchanged => poll,
-                        Poll::Pending | Poll::PendingDefer => Poll::Pending,
-                        Poll::PendingInvalidToken => Poll::PendingInvalidToken,
-                    },
+                    ValOrAnchor::Anchor(an) => {
+                        let out_poll = output_anchor_poll.unwrap_or_else(|| ctx.request(an, true));
+                        if out_poll.is_waiting() {
+                            Poll::Pending
+                        } else if out_poll.is_invalid_token() {
+                            Poll::PendingInvalidToken
+                        } else if out_poll == Poll::Updated {
+                            Poll::Updated
+                        } else {
+                            // out_poll == Unchanged：沿用外层 poll 的语义（例如自身 Updated，但输出 anchor 未变）
+                            poll
+                        }
+                    }
                 }
             }
             fn output<'slf, 'out, G: OutputContext<'out, Engine=E>>(

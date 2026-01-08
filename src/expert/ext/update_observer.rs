@@ -86,19 +86,13 @@ macro_rules! impl_tuple_update_observer {
                 let mut found_updated = false;
 
                 $(
-                    match ctx.request(&self.anchors.$num, true) {
-                        Poll::Pending | Poll::PendingDefer => {
-                            found_pending = true;
-                        }
-                        Poll::PendingInvalidToken => {
-                            found_invalid = true;
-                        }
-                        Poll::Updated => {
-                            found_updated = true;
-                        }
-                        Poll::Unchanged => {
-                            // do nothing
-                        }
+                    let poll = ctx.request(&self.anchors.$num, true);
+                    if poll.is_waiting() {
+                        found_pending = true;
+                    } else if poll.is_invalid_token() {
+                        found_invalid = true;
+                    } else if matches!(poll, Poll::Updated) {
+                        found_updated = true;
                     }
                 )+
 

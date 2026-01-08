@@ -72,12 +72,11 @@ macro_rules! impl_tuple_then {
                     let mut found_invalid = false;
 
                     $(
-                        match ctx.request(&self.anchors.$num, true) {
-                            Poll::Pending | Poll::PendingDefer => {
-                                found_pending = true;
-                                self.output_stale = true;
-                            }
-                            Poll::PendingInvalidToken => {
+                        let poll = ctx.request(&self.anchors.$num, true);
+                        if poll.is_waiting() {
+                            found_pending = true;
+                            self.output_stale = true;
+                        } else if poll.is_invalid_token() {
                                 ////////////////////////////////////////////////////////////////////////////////
                                 // NOTE:
                                 // - slotmap 模式下，拆树/GC 期间可能遇到 “依赖 token 已失效”。
@@ -85,13 +84,8 @@ macro_rules! impl_tuple_then {
                                 //   我们可以直接复用旧输出，避免把 Pending 继续向上传播导致 stabilize 自旋。
                                 ////////////////////////////////////////////////////////////////////////////////
                                 found_invalid = true;
-                            }
-                            Poll::Updated => {
-                                self.output_stale = true;
-                            }
-                            Poll::Unchanged => {
-                                // do nothing
-                            }
+                        } else if poll == Poll::Updated {
+                            self.output_stale = true;
                         }
                     )+
 
@@ -221,22 +215,20 @@ where
         let mut switched_output_anchor = false;
 
         if self.f_anchor.is_none() || self.output_stale {
-            match ctx.request(&self.anchor, true) {
-                Poll::Pending | Poll::PendingDefer => {
-                    self.output_stale = true;
-                    return Poll::Pending;
-                }
-                Poll::PendingInvalidToken => {
-                    // 输入 token 已失效：说明当前节点大概率处于拆树/回收期。
-                    // 由于我们持有 cached_output，可以直接冻结并保留旧输出。
-                    self.degraded_on_invalid = true;
-                    self.output_stale = false;
-                    return Poll::Unchanged;
-                }
-                Poll::Updated => {
-                    self.output_stale = true;
-                }
-                Poll::Unchanged => {}
+            let poll = ctx.request(&self.anchor, true);
+            if poll.is_waiting() {
+                self.output_stale = true;
+                return Poll::Pending;
+            }
+            if poll.is_invalid_token() {
+                // 输入 token 已失效：说明当前节点大概率处于拆树/回收期。
+                // 由于我们持有 cached_output，可以直接冻结并保留旧输出。
+                self.degraded_on_invalid = true;
+                self.output_stale = false;
+                return Poll::Unchanged;
+            }
+            if poll == Poll::Updated {
+                self.output_stale = true;
             }
 
             self.output_stale = false;
@@ -261,8 +253,11 @@ where
             .f_anchor
             .as_ref()
             .expect("then_clone1: f_anchor must exist");
-        match ctx.request(out_anchor, true) {
-            Poll::Pending | Poll::PendingDefer => Poll::Pending,
+        let out_poll = ctx.request(out_anchor, true);
+        if out_poll.is_waiting() {
+            return Poll::Pending;
+        }
+        match out_poll {
             Poll::PendingInvalidToken => {
                 // 输出 anchor 已失效：冻结并保留 cached_output，避免 output 阶段崩溃。
                 self.degraded_on_invalid = true;
@@ -281,6 +276,9 @@ where
                 }
                 Poll::Unchanged
             }
+            Poll::Pending => Poll::Pending,
+            #[cfg(feature = "anchors_pending_queue")]
+            Poll::PendingDefer => Poll::Pending,
         }
     }
 
@@ -319,24 +317,22 @@ where
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         if self.f_anchor.is_none() || self.output_stale {
-            match ctx.request(&self.anchor, true) {
-                Poll::Pending | Poll::PendingDefer => {
-                    self.output_stale = true;
-                    return Poll::Pending;
+            let poll = ctx.request(&self.anchor, true);
+            if poll.is_waiting() {
+                self.output_stale = true;
+                return Poll::Pending;
+            }
+            if poll.is_invalid_token() {
+                // 有历史输出时可直接复用旧输出，避免 then_dedupe1 反复 pending。
+                if let Some(old_anchor) = self.f_anchor.as_ref() {
+                    self.output_stale = false;
+                    return ctx.request(old_anchor, true);
                 }
-                Poll::PendingInvalidToken => {
-                    // 有历史输出时可直接复用旧输出，避免 then_dedupe1 反复 pending。
-                    if let Some(old_anchor) = self.f_anchor.as_ref() {
-                        self.output_stale = false;
-                        return ctx.request(old_anchor, true);
-                    }
-                    self.output_stale = true;
-                    return Poll::PendingInvalidToken;
-                }
-                Poll::Updated => {
-                    self.output_stale = true;
-                }
-                Poll::Unchanged => {}
+                self.output_stale = true;
+                return Poll::PendingInvalidToken;
+            }
+            if poll == Poll::Updated {
+                self.output_stale = true;
             }
 
             let cur = ctx.get(&self.anchor).clone();
@@ -406,19 +402,15 @@ macro_rules! impl_tuple_then_dedupe {
                     let mut found_pending = false;
                     let mut found_invalid = false;
                     $(
-                        match ctx.request(&self.anchors.$num, true) {
-                            Poll::Pending | Poll::PendingDefer => {
-                                found_pending = true;
-                                self.output_stale = true;
-                            }
-                            Poll::PendingInvalidToken => {
-                                // 有历史输出时可降级复用旧输出，避免稳定化自旋。
-                                found_invalid = true;
-                            }
-                            Poll::Updated => {
-                                self.output_stale = true;
-                            }
-                            Poll::Unchanged => {}
+                        let poll = ctx.request(&self.anchors.$num, true);
+                        if poll.is_waiting() {
+                            found_pending = true;
+                            self.output_stale = true;
+                        } else if poll.is_invalid_token() {
+                            // 有历史输出时可降级复用旧输出，避免稳定化自旋。
+                            found_invalid = true;
+                        } else if poll == Poll::Updated {
+                            self.output_stale = true;
                         }
                     )+
 

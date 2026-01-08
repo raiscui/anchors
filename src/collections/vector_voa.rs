@@ -154,16 +154,13 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorVOACollect<T, E> {
                     }
                     ValOrAnchor::Anchor(an) => {
                         let s = ctx.request(an, true);
-                        match s {
-                            Poll::Pending | Poll::PendingDefer => return Poll::Pending,
-                            Poll::PendingInvalidToken => {
-                                invalid_mask[idx] = true;
-                                polls.push((s, Some(an)));
-                            }
-                            _ => {
-                                polls.push((s, Some(an)));
-                            }
+                        if s.is_waiting() {
+                            return Poll::Pending;
                         }
+                        if s.is_invalid_token() {
+                            invalid_mask[idx] = true;
+                        }
+                        polls.push((s, Some(an)));
                     }
                 }
             }
@@ -433,6 +430,7 @@ mod test {
                     Some(Poll::Updated) => Poll::Updated,
                     Some(Poll::Unchanged) => Poll::Unchanged,
                     Some(Poll::Pending) => Poll::Pending,
+                    #[cfg(feature = "anchors_pending_queue")]
                     Some(Poll::PendingDefer) => Poll::PendingDefer,
                     Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
                     None => Poll::Unchanged,

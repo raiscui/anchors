@@ -591,16 +591,13 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
                     }
                 }
             };
-            match poll {
-                Poll::Pending | Poll::PendingDefer => {
-                    debug!("a pending");
-                    return Poll::Pending;
-                }
-                Poll::PendingInvalidToken => {
-                    debug!("a invalid token pending");
-                    return Poll::PendingInvalidToken;
-                }
-                Poll::Updated | Poll::Unchanged => {}
+            if poll.is_waiting() {
+                debug!("a pending");
+                return Poll::Pending;
+            }
+            if poll.is_invalid_token() {
+                debug!("a invalid token pending");
+                return Poll::PendingInvalidToken;
             }
             inner.output_stale = false;
 
@@ -818,6 +815,7 @@ mod tests {
                     Some(Poll::Updated) => Poll::Updated,
                     Some(Poll::Unchanged) => Poll::Unchanged,
                     Some(Poll::Pending) => Poll::Pending,
+                    #[cfg(feature = "anchors_pending_queue")]
                     Some(Poll::PendingDefer) => Poll::PendingDefer,
                     Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
                     None => Poll::Unchanged,
@@ -945,6 +943,7 @@ mod tests {
                     Some(Poll::Updated) => Poll::Updated,
                     Some(Poll::Unchanged) => Poll::Unchanged,
                     Some(Poll::Pending) => Poll::Pending,
+                    #[cfg(feature = "anchors_pending_queue")]
                     Some(Poll::PendingDefer) => Poll::PendingDefer,
                     Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
                     None => Poll::Unchanged,

@@ -28,22 +28,14 @@ impl AnchorInner<Engine> for StaleInputProbe {
         // SAFETY: `ManuallyDrop<T>` 是 `repr(transparent)` 包装；这里仅获取只读引用，避免触发 drop。
         let input: &Anchor<u32> = unsafe { &*(&self.input as *const _ as *const Anchor<u32>) };
 
-        match ctx.request(input, true) {
-            Poll::Pending | Poll::PendingDefer => {
-                self.saw_pending.set(true);
-                self.output = 0;
-                Poll::Updated
-            }
-            Poll::PendingInvalidToken => {
-                self.saw_pending.set(true);
-                self.output = 0;
-                Poll::Updated
-            }
-            Poll::Updated | Poll::Unchanged => {
-                self.output = *ctx.get(input);
-                Poll::Updated
-            }
+        let poll = ctx.request(input, true);
+        if poll.is_waiting() || poll.is_invalid_token() {
+            self.saw_pending.set(true);
+            self.output = 0;
+            return Poll::Updated;
         }
+        self.output = *ctx.get(input);
+        Poll::Updated
     }
 
     fn output<'slf, 'out, G: OutputContext<'out, Engine = Engine>>(
