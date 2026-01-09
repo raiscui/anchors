@@ -1006,6 +1006,16 @@ impl<'gg> Graph2Guard<'gg> {
                     .set(self.graph.recalc_min_height.get() + 1);
             }
         }
+        ////////////////////////////////////////////////////////////////////////////////
+        // NOTE: 队列已耗尽时，恢复到 Graph2::new() 的“空队列哨兵”语义：
+        // - recalc_min_height = recalc_queues.len()
+        // - recalc_max_height = 0
+        //
+        // 这样下一次入队时：
+        // - 无论 node_height 多大，都能立刻把 min_height 拉回正确起点
+        // - 且更配合 queue_recalc() 里对 Pending 丢队列的“min_height > node_height”判断
+        ////////////////////////////////////////////////////////////////////////////////
+        self.graph.recalc_min_height.set(recalc_queues.len());
         self.graph.recalc_max_height.set(0);
         None
     }

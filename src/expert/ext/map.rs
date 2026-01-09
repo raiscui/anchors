@@ -75,6 +75,17 @@ macro_rules! impl_tuple_map {
                 let mut found_pending = false;
                 let mut found_invalid = false;
                 let mut found_updated = false;
+                #[cfg(debug_assertions)]
+                let debug_degrade =
+                    emg_debug_env::bool_lenient("ANCHORS_DEBUG_DEGRADE_ON_INVALID");
+                #[cfg(debug_assertions)]
+                let mut invalid_inputs: Option<
+                    Vec<<<E as Engine>::AnchorHandle as AnchorHandle>::Token>,
+                > = if debug_degrade {
+                    Some(Vec::new())
+                } else {
+                    None
+                };
 
                 $(
                     let poll = ctx.request(&self.anchors.$num, true);
@@ -82,6 +93,10 @@ macro_rules! impl_tuple_map {
                         found_pending = true;
                     } else if poll.is_invalid_token() {
                         found_invalid = true;
+                        #[cfg(debug_assertions)]
+                        if let Some(v) = invalid_inputs.as_mut() {
+                            v.push(self.anchors.$num.token());
+                        }
                     } else if poll == Poll::Updated {
                         found_updated = true;
                     }
@@ -98,6 +113,15 @@ macro_rules! impl_tuple_map {
                     if self.output.is_some() {
                         self.output_stale = false;
                         self.degraded_on_invalid = true;
+                        #[cfg(debug_assertions)]
+                        if debug_degrade {
+                            eprintln!(
+                                "[anchors][degrade_on_invalid] op=map loc={:?} out_type={} invalid_inputs={:?}",
+                                self.location,
+                                std::any::type_name::<Out>(),
+                                invalid_inputs.unwrap_or_default(),
+                            );
+                        }
                         return Poll::Unchanged;
                     }
                     return Poll::PendingInvalidToken;
