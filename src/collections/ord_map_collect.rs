@@ -349,14 +349,14 @@ where
                 continue;
             }
             if poll.is_invalid_token() {
-                    ////////////////////////////////////////////////////////////////////////////////
-                    // `PendingInvalidToken` 不会变 Ready：
-                    // - 将该 key 视为“元素已被移除”，从输出中剔除；
-                    // - 同时缓存 key，避免后续重复 request 造成刷屏。
-                    ////////////////////////////////////////////////////////////////////////////////
-                    self.invalid_keys.insert(i.clone());
-                    ctx.unrequest(&anchor);
-                    continue;
+                ////////////////////////////////////////////////////////////////////////////////
+                // `PendingInvalidToken` 不会变 Ready：
+                // - 将该 key 视为“元素已被移除”，从输出中剔除；
+                // - 同时缓存 key，避免后续重复 request 造成刷屏。
+                ////////////////////////////////////////////////////////////////////////////////
+                self.invalid_keys.insert(i.clone());
+                ctx.unrequest(&anchor);
+                continue;
             }
             ready_entries.push((i, ctx.get(&anchor).clone()));
         }
