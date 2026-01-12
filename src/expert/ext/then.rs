@@ -24,6 +24,7 @@ pub struct ThenClone1<O1, Out, F, E: Engine> {
     pub(super) cached_output: Out,
     pub(super) degraded_on_invalid: bool,
     pub(super) output_stale: bool,
+    pub(super) output_dirty: bool,
     pub(super) anchor: Anchor<O1, E>,
     pub(super) location: &'static Location<'static>,
 }
@@ -198,18 +199,123 @@ where
     type Output = Out;
 
     fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
-        if self.degraded_on_invalid || self.output_stale {
+        let debug_then = emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN")
+            && self.location.file().ends_with("node_item_rc_sv.rs");
+        if edge == &self.anchor.data.token() {
+            self.degraded_on_invalid = false;
+            self.output_stale = true;
+            if debug_then {
+                let input_token = self.anchor.token();
+                let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
+                println!(
+                    "THEN_CLONE1 dirty input token={input_token:?} output_token={output_token:?} degraded={} output_stale={} output_dirty={} loc={:?}",
+                    self.degraded_on_invalid, self.output_stale, self.output_dirty, self.location
+                );
+            }
             return;
         }
-        if edge == &self.anchor.data.token() {
-            self.output_stale = true;
+
+        if let Some(out_anchor) = self.f_anchor.as_ref() {
+            if edge == &out_anchor.data.token() {
+                self.output_dirty = true;
+                if debug_then {
+                    let input_token = self.anchor.token();
+                    let output_token = out_anchor.token();
+                    println!(
+                        "THEN_CLONE1 dirty output token={output_token:?} input_token={input_token:?} degraded={} output_stale={} output_dirty={} loc={:?}",
+                        self.degraded_on_invalid,
+                        self.output_stale,
+                        self.output_dirty,
+                        self.location
+                    );
+                }
+                return;
+            }
+        }
+
+        if self.output_stale {
+            return;
         }
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
-        // 一旦进入降级冻结模式，就不再做任何 request，避免对已失效 token 刷屏。
+        let debug_then = emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN")
+            && self.location.file().ends_with("node_item_rc_sv.rs");
+        if debug_then {
+            let input_token = self.anchor.token();
+            let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
+            println!(
+                "THEN_CLONE1 poll start degraded={} output_dirty={} output_stale={} input_token={input_token:?} output_token={output_token:?} loc={:?}",
+                self.degraded_on_invalid, self.output_dirty, self.output_stale, self.location
+            );
+        }
+        // 降级冻结模式：
+        // - 仍然需要 request 输入，用于重建 clean_parent 链路（上游 Updated 会 drain 父链路）。
+        // - 只有当输入 Updated 时，才尝试解除冻结并重新选择输出 Anchor。
         if self.degraded_on_invalid {
-            return Poll::Unchanged;
+            let poll = ctx.request(&self.anchor, true);
+            if poll.is_waiting() || poll.is_invalid_token() {
+                if debug_then {
+                    let input_token = self.anchor.token();
+                    let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
+                    println!(
+                        "THEN_CLONE1 degraded input poll={poll:?} input_token={input_token:?} output_token={output_token:?} loc={:?}",
+                        self.location
+                    );
+                }
+                return Poll::Unchanged;
+            }
+
+            if self.output_dirty {
+                if let Some(out_anchor) = self.f_anchor.as_ref() {
+                    let out_poll = ctx.request(out_anchor, true);
+                    if debug_then {
+                        let input_token = self.anchor.token();
+                        let output_token = out_anchor.token();
+                        println!(
+                            "THEN_CLONE1 degraded output poll={out_poll:?} input_poll={poll:?} input_token={input_token:?} output_token={output_token:?} loc={:?}",
+                            self.location
+                        );
+                    }
+                    match out_poll {
+                        Poll::PendingInvalidToken => {
+                            self.output_dirty = false;
+                            self.output_stale = true;
+                            return Poll::Unchanged;
+                        }
+                        Poll::Updated => {
+                            self.cached_output = ctx.get(out_anchor).clone();
+                            self.output_dirty = false;
+                            self.degraded_on_invalid = false;
+                            self.output_stale = false;
+                            return Poll::Updated;
+                        }
+                        Poll::Unchanged => {
+                            self.output_dirty = false;
+                            self.degraded_on_invalid = false;
+                            self.output_stale = false;
+                            return Poll::Unchanged;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                        #[cfg(feature = "anchors_pending_queue")]
+                        Poll::PendingDefer => return Poll::Pending,
+                    }
+                }
+            }
+
+            if poll != Poll::Updated && !self.output_stale {
+                if debug_then {
+                    let input_token = self.anchor.token();
+                    let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
+                    println!(
+                        "THEN_CLONE1 degraded keep old output poll={poll:?} input_token={input_token:?} output_token={output_token:?} output_stale={} loc={:?}",
+                        self.output_stale, self.location
+                    );
+                }
+                return Poll::Unchanged;
+            }
+            self.degraded_on_invalid = false;
+            self.output_stale = true;
         }
 
         let mut switched_output_anchor = false;
@@ -221,10 +327,17 @@ where
                 return Poll::Pending;
             }
             if poll.is_invalid_token() {
-                // 输入 token 已失效：说明当前节点大概率处于拆树/回收期。
-                // 由于我们持有 cached_output，可以直接冻结并保留旧输出。
                 self.degraded_on_invalid = true;
                 self.output_stale = false;
+                self.output_dirty = false;
+                if debug_then {
+                    let input_token = self.anchor.token();
+                    let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
+                    println!(
+                        "THEN_CLONE1 enter degraded input_poll={poll:?} input_token={input_token:?} output_token={output_token:?} loc={:?}",
+                        self.location
+                    );
+                }
                 return Poll::Unchanged;
             }
             if poll == Poll::Updated {
@@ -247,6 +360,7 @@ where
                     // 输出 anchor 未变化，复用即可
                 }
             }
+            self.output_dirty = false;
         }
 
         let out_anchor = self
@@ -259,19 +373,29 @@ where
         }
         match out_poll {
             Poll::PendingInvalidToken => {
-                // 输出 anchor 已失效：冻结并保留 cached_output，避免 output 阶段崩溃。
                 self.degraded_on_invalid = true;
+                self.output_dirty = false;
+                self.output_stale = true;
+                if debug_then {
+                    let input_token = self.anchor.token();
+                    let output_token = out_anchor.token();
+                    println!(
+                        "THEN_CLONE1 output invalid token input_token={input_token:?} output_token={output_token:?} loc={:?}",
+                        self.location
+                    );
+                }
+                let _ = ctx.request(&self.anchor, true);
                 Poll::Unchanged
             }
             Poll::Updated => {
                 self.cached_output = ctx.get(out_anchor).clone();
+                self.output_dirty = false;
                 Poll::Updated
             }
             Poll::Unchanged => {
-                // 切换了输出 anchor 但 poll 返回 Unchanged 时，cached_output 仍需刷新一次，
-                // 否则会继续输出旧缓存（语义错误）。这里保守视为 Updated。
-                if switched_output_anchor {
+                if switched_output_anchor || self.output_dirty {
                     self.cached_output = ctx.get(out_anchor).clone();
+                    self.output_dirty = false;
                     return Poll::Updated;
                 }
                 Poll::Unchanged
@@ -745,6 +869,7 @@ mod tests {
             cached_output: 777,
             degraded_on_invalid: false,
             output_stale: false,
+            output_dirty: false,
             anchor: input,
             location: Location::caller(),
         };
@@ -820,6 +945,7 @@ mod tests {
             cached_output: 42,
             degraded_on_invalid: false,
             output_stale: true,
+            output_dirty: false,
             anchor: input,
             location: Location::caller(),
         };
@@ -840,6 +966,423 @@ mod tests {
         assert_eq!(ctx.requested_input.get(), 1);
         assert_eq!(ctx.requested_output.get(), 0);
         assert!(inner.degraded_on_invalid, "then_clone1 应进入冻结模式");
+    }
+
+    #[test]
+    fn then_clone1_degraded_should_request_input() {
+        let _engine = Engine::new();
+
+        let input: Anchor<u32, Engine> = Anchor::constant(1);
+        let output: Anchor<u32, Engine> = Anchor::constant(2);
+
+        struct Ctx {
+            input_token: Token,
+            output_token: Token,
+            requested_input: Cell<u32>,
+        }
+
+        impl crate::expert::UpdateContext for Ctx {
+            type Engine = Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("then_clone1 冻结模式不应调用 get()")
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                let token = anchor.token();
+                if token == self.input_token {
+                    self.requested_input.set(self.requested_input.get() + 1);
+                    return Poll::Unchanged;
+                }
+                if token == self.output_token {
+                    panic!("then_clone1 冻结模式不应 request 输出 anchor")
+                }
+                panic!("unexpected token requested: {token:?}");
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {
+                panic!("then_clone1 冻结模式不应调用 unrequest()")
+            }
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("then_clone1 冻结模式不应申请 dirty_handle()")
+            }
+        }
+
+        let mut inner = ThenClone1::<u32, u32, _, Engine> {
+            f: |_v: &u32| panic!("then_clone1 冻结模式不应重新计算 f()"),
+            f_anchor: Some(output.clone()),
+            cached_output: 42,
+            degraded_on_invalid: true,
+            output_stale: false,
+            output_dirty: false,
+            anchor: input.clone(),
+            location: Location::caller(),
+        };
+
+        let mut ctx = Ctx {
+            input_token: input.token(),
+            output_token: output.token(),
+            requested_input: Cell::new(0),
+        };
+
+        let poll = inner.poll_updated(&mut ctx);
+        assert_eq!(poll, Poll::Unchanged);
+        assert_eq!(ctx.requested_input.get(), 1);
+        assert!(inner.degraded_on_invalid);
+    }
+
+    #[test]
+    fn then_clone1_degraded_should_recover_on_output_dirty() {
+        let _engine = Engine::new();
+
+        let input: Anchor<u32, Engine> = Anchor::constant(1);
+        let output: Anchor<u32, Engine> = Anchor::constant(2);
+
+        struct Ctx {
+            input_token: Token,
+            output_token: Token,
+            input_value: u32,
+            output_value: u32,
+            requested_input: Cell<u32>,
+            requested_output: Cell<u32>,
+        }
+
+        impl crate::expert::UpdateContext for Ctx {
+            type Engine = Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                use std::any::Any;
+
+                let token = anchor.token();
+                if token == self.input_token {
+                    return (&self.input_value as &dyn Any)
+                        .downcast_ref::<O>()
+                        .expect("unexpected input type");
+                }
+                if token == self.output_token {
+                    return (&self.output_value as &dyn Any)
+                        .downcast_ref::<O>()
+                        .expect("unexpected output type");
+                }
+                panic!("unexpected token requested: {token:?}");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                let token = anchor.token();
+                if token == self.input_token {
+                    self.requested_input
+                        .set(self.requested_input.get().saturating_add(1));
+                    return Poll::Unchanged;
+                }
+                if token == self.output_token {
+                    self.requested_output
+                        .set(self.requested_output.get().saturating_add(1));
+                    return Poll::Updated;
+                }
+                panic!("unexpected token requested: {token:?}");
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {
+                panic!("then_clone1 恢复测试不应调用 unrequest()");
+            }
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("then_clone1 恢复测试不应申请 dirty_handle()");
+            }
+        }
+
+        let output_for_f = output.clone();
+        let mut inner = ThenClone1::<u32, u32, _, Engine> {
+            f: move |_v: &u32| output_for_f.clone(),
+            f_anchor: Some(output.clone()),
+            cached_output: 42,
+            degraded_on_invalid: true,
+            output_stale: false,
+            output_dirty: false,
+            anchor: input.clone(),
+            location: Location::caller(),
+        };
+
+        inner.dirty(&output.token());
+
+        let mut ctx = Ctx {
+            input_token: input.token(),
+            output_token: output.token(),
+            input_value: 1,
+            output_value: 99,
+            requested_input: Cell::new(0),
+            requested_output: Cell::new(0),
+        };
+
+        let poll = inner.poll_updated(&mut ctx);
+        assert_eq!(poll, Poll::Updated);
+        assert_eq!(ctx.requested_input.get(), 1);
+        assert_eq!(ctx.requested_output.get(), 1);
+        assert!(!inner.degraded_on_invalid, "应当从冻结模式恢复");
+        assert!(!inner.output_dirty);
+        assert_eq!(inner.cached_output, 99);
+    }
+
+    #[test]
+    fn then_clone1_should_recover_after_output_invalid_when_input_ready() {
+        let _engine = Engine::new();
+
+        let input: Anchor<u32, Engine> = Anchor::constant(1);
+        let output_old: Anchor<u32, Engine> = Anchor::constant(2);
+        let output_new: Anchor<u32, Engine> = Anchor::constant(3);
+
+        struct Ctx {
+            phase: u8,
+            input_token: Token,
+            output_old_token: Token,
+            output_new_token: Token,
+            input_value: u32,
+            output_new_value: u32,
+            requested_input: Cell<u32>,
+            requested_output_old: Cell<u32>,
+            requested_output_new: Cell<u32>,
+            unrequested_output_old: Cell<u32>,
+        }
+
+        impl crate::expert::UpdateContext for Ctx {
+            type Engine = Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                use std::any::Any;
+
+                let token = anchor.token();
+                if token == self.input_token {
+                    return (&self.input_value as &dyn Any)
+                        .downcast_ref::<O>()
+                        .expect("unexpected input type");
+                }
+                if token == self.output_new_token {
+                    return (&self.output_new_value as &dyn Any)
+                        .downcast_ref::<O>()
+                        .expect("unexpected output type");
+                }
+                if token == self.output_old_token {
+                    panic!("old output should not be read after invalid token");
+                }
+                panic!("unexpected token requested: {token:?}");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                let token = anchor.token();
+                if token == self.input_token {
+                    self.requested_input.set(self.requested_input.get() + 1);
+                    return Poll::Unchanged;
+                }
+                if token == self.output_old_token {
+                    self.requested_output_old
+                        .set(self.requested_output_old.get() + 1);
+                    return Poll::PendingInvalidToken;
+                }
+                if token == self.output_new_token {
+                    self.requested_output_new
+                        .set(self.requested_output_new.get() + 1);
+                    return match self.phase {
+                        0 => Poll::PendingInvalidToken,
+                        1 => Poll::Updated,
+                        _ => panic!("unexpected phase={}", self.phase),
+                    };
+                }
+                panic!("unexpected token requested: {token:?}");
+            }
+
+            fn unrequest<O: 'static>(&mut self, anchor: &Anchor<O, Self::Engine>) {
+                let token = anchor.token();
+                if token == self.output_old_token {
+                    self.unrequested_output_old
+                        .set(self.unrequested_output_old.get() + 1);
+                    return;
+                }
+                panic!("unexpected token unrequested: {token:?}");
+            }
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("then_clone1 恢复路径不应申请 dirty_handle()");
+            }
+        }
+
+        let called = Rc::new(Cell::new(0));
+        let called2 = called.clone();
+        let output_for_f = output_new.clone();
+
+        let mut inner = ThenClone1::<u32, u32, _, Engine> {
+            f: move |_v: &u32| {
+                called2.set(called2.get() + 1);
+                output_for_f.clone()
+            },
+            f_anchor: Some(output_old),
+            cached_output: 42,
+            degraded_on_invalid: false,
+            output_stale: false,
+            output_dirty: false,
+            anchor: input,
+            location: Location::caller(),
+        };
+
+        let mut ctx = Ctx {
+            phase: 0,
+            input_token: inner.anchor.token(),
+            output_old_token: inner.f_anchor.as_ref().unwrap().token(),
+            output_new_token: output_new.token(),
+            input_value: 1,
+            output_new_value: 777,
+            requested_input: Cell::new(0),
+            requested_output_old: Cell::new(0),
+            requested_output_new: Cell::new(0),
+            unrequested_output_old: Cell::new(0),
+        };
+
+        let poll0 = inner.poll_updated(&mut ctx);
+        assert_eq!(poll0, Poll::Unchanged);
+        assert!(inner.degraded_on_invalid);
+        assert_eq!(called.get(), 0);
+
+        ctx.phase = 1;
+        let poll1 = inner.poll_updated(&mut ctx);
+        assert_eq!(poll1, Poll::Updated);
+        assert_eq!(inner.cached_output, 777);
+        assert_eq!(called.get(), 1);
+        assert_eq!(ctx.requested_output_new.get(), 1);
+        assert_eq!(ctx.unrequested_output_old.get(), 1);
+    }
+
+    #[test]
+    fn then_clone1_should_recover_after_input_dirty() {
+        let _engine = Engine::new();
+
+        let input: Anchor<u32, Engine> = Anchor::constant(1);
+        let output: Anchor<u32, Engine> = Anchor::constant(2);
+        let output_for_f = output.clone();
+
+        struct Ctx {
+            phase: u8,
+            input_token: Token,
+            output_token: Token,
+            input_value: u32,
+            output_value: u32,
+            requested_input: Cell<u32>,
+            requested_output: Cell<u32>,
+        }
+
+        impl crate::expert::UpdateContext for Ctx {
+            type Engine = Engine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                use std::any::Any;
+
+                let token = anchor.token();
+                if token == self.input_token {
+                    return (&self.input_value as &dyn Any)
+                        .downcast_ref::<O>()
+                        .expect("unexpected input type");
+                }
+                if token == self.output_token {
+                    return (&self.output_value as &dyn Any)
+                        .downcast_ref::<O>()
+                        .expect("unexpected output type");
+                }
+                panic!("unexpected token requested: {token:?}");
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                let token = anchor.token();
+                if token == self.input_token {
+                    self.requested_input.set(self.requested_input.get() + 1);
+                    return match self.phase {
+                        0 => Poll::Unchanged,
+                        1 => Poll::Updated,
+                        _ => panic!("unexpected phase={}", self.phase),
+                    };
+                }
+                if token == self.output_token {
+                    self.requested_output.set(self.requested_output.get() + 1);
+                    return match self.phase {
+                        0 => Poll::PendingInvalidToken,
+                        1 => Poll::Updated,
+                        _ => panic!("unexpected phase={}", self.phase),
+                    };
+                }
+                panic!("unexpected token requested: {token:?}");
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {
+                panic!("then_clone1 恢复测试不应调用 unrequest()");
+            }
+
+            fn dirty_handle(&mut self) -> <Self::Engine as crate::expert::Engine>::DirtyHandle {
+                panic!("then_clone1 恢复测试不应申请 dirty_handle()");
+            }
+        }
+
+        let mut inner = ThenClone1::<u32, u32, _, Engine> {
+            f: move |_v: &u32| output_for_f.clone(),
+            f_anchor: Some(output),
+            cached_output: 42,
+            degraded_on_invalid: false,
+            output_stale: false,
+            output_dirty: false,
+            anchor: input,
+            location: Location::caller(),
+        };
+
+        let mut ctx = Ctx {
+            phase: 0,
+            input_token: inner.anchor.token(),
+            output_token: inner.f_anchor.as_ref().unwrap().token(),
+            input_value: 1,
+            output_value: 999,
+            requested_input: Cell::new(0),
+            requested_output: Cell::new(0),
+        };
+
+        let poll0 = inner.poll_updated(&mut ctx);
+        assert_eq!(poll0, Poll::Unchanged);
+        assert!(inner.degraded_on_invalid);
+
+        let input_token = inner.anchor.token();
+        inner.dirty(&input_token);
+        assert!(!inner.degraded_on_invalid, "输入变动后应解除冻结");
+        assert!(inner.output_stale, "输入变动后应标记 output_stale");
+
+        ctx.phase = 1;
+        let poll1 = inner.poll_updated(&mut ctx);
+        assert_eq!(poll1, Poll::Updated);
+        assert_eq!(inner.cached_output, 999);
+        assert_eq!(ctx.requested_input.get(), 2);
+        assert_eq!(ctx.requested_output.get(), 2);
     }
 }
 

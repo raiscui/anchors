@@ -2077,7 +2077,10 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
                 self.node.add_necessary_child(child);
             }
             match (child.last_update.get(), self.node.last_ready.get()) {
-                (Some(a), Some(b)) if a <= b => Poll::Unchanged,
+                (Some(a), Some(b)) if a < b => Poll::Unchanged,
+                (Some(a), Some(b)) if a == b && b == self.engine.generation => Poll::Updated,
+                (Some(a), Some(b)) if a == b => Poll::Unchanged,
+                (Some(_), Some(_)) => Poll::Updated,
                 _ => Poll::Updated,
             }
         }

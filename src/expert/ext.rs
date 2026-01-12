@@ -201,6 +201,7 @@ where
             cached_output: initial,
             degraded_on_invalid: false,
             output_stale: true,
+            output_dirty: false,
             location: Location::caller(),
         })
     }
