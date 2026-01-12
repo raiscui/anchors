@@ -254,19 +254,11 @@ where
         // - 只有当输入 Updated 时，才尝试解除冻结并重新选择输出 Anchor。
         if self.degraded_on_invalid {
             let poll = ctx.request(&self.anchor, true);
-            if poll.is_waiting() || poll.is_invalid_token() {
-                if debug_then {
-                    let input_token = self.anchor.token();
-                    let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
-                    println!(
-                        "THEN_CLONE1 degraded input poll={poll:?} input_token={input_token:?} output_token={output_token:?} loc={:?}",
-                        self.location
-                    );
-                }
-                return Poll::Unchanged;
-            }
 
-            if self.output_dirty {
+            // 说明：degraded 期间当输出 dirty/stale 时仍需 request 输出，避免恢复后卡旧缓存。
+            let output_stale_before = self.output_stale;
+            let should_probe_output = self.output_dirty || self.output_stale;
+            if should_probe_output {
                 if let Some(out_anchor) = self.f_anchor.as_ref() {
                     let out_poll = ctx.request(out_anchor, true);
                     if debug_then {
@@ -281,7 +273,9 @@ where
                         Poll::PendingInvalidToken => {
                             self.output_dirty = false;
                             self.output_stale = true;
-                            return Poll::Unchanged;
+                            if !output_stale_before {
+                                return Poll::Unchanged;
+                            }
                         }
                         Poll::Updated => {
                             self.cached_output = ctx.get(out_anchor).clone();
@@ -291,16 +285,31 @@ where
                             return Poll::Updated;
                         }
                         Poll::Unchanged => {
+                            if self.output_dirty {
+                                self.output_dirty = false;
+                                self.degraded_on_invalid = false;
+                                self.output_stale = false;
+                                return Poll::Unchanged;
+                            }
                             self.output_dirty = false;
-                            self.degraded_on_invalid = false;
-                            self.output_stale = false;
-                            return Poll::Unchanged;
                         }
                         Poll::Pending => return Poll::Pending,
                         #[cfg(feature = "anchors_pending_queue")]
                         Poll::PendingDefer => return Poll::Pending,
                     }
                 }
+            }
+
+            if poll.is_waiting() || poll.is_invalid_token() {
+                if debug_then {
+                    let input_token = self.anchor.token();
+                    let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
+                    println!(
+                        "THEN_CLONE1 degraded input poll={poll:?} input_token={input_token:?} output_token={output_token:?} loc={:?}",
+                        self.location
+                    );
+                }
+                return Poll::Unchanged;
             }
 
             if poll != Poll::Updated && !self.output_stale {
@@ -663,7 +672,7 @@ impl_tuple_then! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::singlethread::Engine;
+    use crate::singlethread::{Engine, Var};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -1383,6 +1392,41 @@ mod tests {
         assert_eq!(inner.cached_output, 999);
         assert_eq!(ctx.requested_input.get(), 2);
         assert_eq!(ctx.requested_output.get(), 2);
+    }
+
+    #[test]
+    fn repro_then_switch_can_leave_downstream_map_stale() {
+        let mut engine = Engine::new();
+
+        let out_old: Anchor<u32, Engine> = Anchor::constant(111);
+        let out_new: Anchor<u32, Engine> = Anchor::constant(222);
+
+        assert_eq!(engine.get(&out_new), 222);
+
+        let flag = Var::new(false);
+
+        let then_anchor: Anchor<u32, Engine> = flag.watch().then({
+            let out_old = out_old.clone();
+            let out_new = out_new.clone();
+            move |b: &bool| {
+                if *b { out_new.clone() } else { out_old.clone() }
+            }
+        });
+
+        let mapped: Anchor<u32, Engine> = then_anchor.map(|v| *v);
+
+        assert_eq!(engine.get(&mapped), 111);
+
+        flag.set(true);
+
+        let mapped_after = engine.get(&mapped);
+        assert_eq!(
+            mapped_after, 111,
+            "mapped stayed stale after then switched output"
+        );
+
+        let then_after = engine.get(&then_anchor);
+        assert_eq!(then_after, 222);
     }
 }
 
