@@ -60,6 +60,7 @@ macro_rules! impl_tuple_then {
                 &mut self,
                 ctx: &mut G,
             ) -> Poll {
+                let mut switched_output_anchor = false;
                 if self.f_anchor.is_none() || self.output_stale {
                     if emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN") {
                         println!(
@@ -140,9 +141,11 @@ macro_rules! impl_tuple_then {
                             }
                             ctx.unrequest(outdated_anchor);
                             self.f_anchor = Some(new_anchor);
+                            switched_output_anchor = true;
                         }
                         None => {
                             self.f_anchor = Some(new_anchor);
+                            switched_output_anchor = true;
                         }
                         _ => {
                             // 相同输出 Anchor，复用即可
@@ -150,7 +153,11 @@ macro_rules! impl_tuple_then {
                     }
                 }
 
-                ctx.request(self.f_anchor.as_ref().unwrap(), true)
+                let poll = ctx.request(self.f_anchor.as_ref().unwrap(), true);
+                if switched_output_anchor && poll == Poll::Unchanged {
+                    return Poll::Updated;
+                }
+                poll
             }
             fn output<'slf, 'out, G: OutputContext<'out, Engine=E>>(
                 &'slf self,
@@ -249,13 +256,9 @@ where
                 self.degraded_on_invalid, self.output_dirty, self.output_stale, self.location
             );
         }
-        // 降级冻结模式：
-        // - 仍然需要 request 输入，用于重建 clean_parent 链路（上游 Updated 会 drain 父链路）。
-        // - 只有当输入 Updated 时，才尝试解除冻结并重新选择输出 Anchor。
         if self.degraded_on_invalid {
             let poll = ctx.request(&self.anchor, true);
 
-            // 说明：degraded 期间当输出 dirty/stale 时仍需 request 输出，避免恢复后卡旧缓存。
             let output_stale_before = self.output_stale;
             let should_probe_output = self.output_dirty || self.output_stale;
             if should_probe_output {
@@ -449,6 +452,7 @@ where
     }
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
+        let mut switched_output_anchor = false;
         if self.f_anchor.is_none() || self.output_stale {
             let poll = ctx.request(&self.anchor, true);
             if poll.is_waiting() {
@@ -478,12 +482,20 @@ where
 
             self.output_stale = false;
             let new_anchor = (self.f)(ctx.get(&self.anchor));
+            switched_output_anchor = match self.f_anchor.as_ref() {
+                Some(old_anchor) => old_anchor != &new_anchor,
+                None => true,
+            };
             if let Some(old) = self.f_anchor.replace(new_anchor) {
                 ctx.unrequest(&old);
             }
             self.cached_input = Some(cur);
         }
-        ctx.request(self.f_anchor.as_ref().unwrap(), true)
+        let out_poll = ctx.request(self.f_anchor.as_ref().unwrap(), true);
+        if switched_output_anchor && out_poll == Poll::Unchanged {
+            return Poll::Updated;
+        }
+        out_poll
     }
 
     fn output<'slf, 'out, G: OutputContext<'out, Engine = E>>(
@@ -531,6 +543,7 @@ macro_rules! impl_tuple_then_dedupe {
                 &mut self,
                 ctx: &mut G,
             ) -> Poll {
+                let mut switched_output_anchor = false;
                 if self.f_anchor.is_none() || self.output_stale {
                     let mut found_pending = false;
                     let mut found_invalid = false;
@@ -573,12 +586,20 @@ macro_rules! impl_tuple_then_dedupe {
 
                     self.output_stale = false;
                     let new_anchor = (self.f)($(ctx.get(&self.anchors.$num)),+);
+                    switched_output_anchor = match self.f_anchor.as_ref() {
+                        Some(old_anchor) => old_anchor != &new_anchor,
+                        None => true,
+                    };
                     if let Some(old) = self.f_anchor.replace(new_anchor) {
                         ctx.unrequest(&old);
                     }
                     self.cached_inputs = Some(Box::new(current_inputs));
                 }
-                ctx.request(self.f_anchor.as_ref().unwrap(), true)
+                let out_poll = ctx.request(self.f_anchor.as_ref().unwrap(), true);
+                if switched_output_anchor && out_poll == Poll::Unchanged {
+                    return Poll::Updated;
+                }
+                out_poll
             }
 
             fn output<'slf, 'out, G: OutputContext<'out, Engine=E>>(
@@ -1395,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn repro_then_switch_can_leave_downstream_map_stale() {
+    fn then_switch_should_update_downstream_map() {
         let mut engine = Engine::new();
 
         let out_old: Anchor<u32, Engine> = Anchor::constant(111);
@@ -1420,10 +1441,7 @@ mod tests {
         flag.set(true);
 
         let mapped_after = engine.get(&mapped);
-        assert_eq!(
-            mapped_after, 111,
-            "mapped stayed stale after then switched output"
-        );
+        assert_eq!(mapped_after, 222);
 
         let then_after = engine.get(&then_anchor);
         assert_eq!(then_after, 222);
