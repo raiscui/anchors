@@ -60,6 +60,9 @@ macro_rules! impl_tuple_map_mut {
                 let mut found_invalid = false;
                 let mut found_updated = false;
                 #[cfg(debug_assertions)]
+                let debug_map_mut = emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP_MUT")
+                    && self.location.file().ends_with("node_builder.rs");
+                #[cfg(debug_assertions)]
                 let debug_degrade =
                     emg_debug_env::bool_lenient("ANCHORS_DEBUG_DEGRADE_ON_INVALID");
                 #[cfg(debug_assertions)]
@@ -110,6 +113,21 @@ macro_rules! impl_tuple_map_mut {
 
                 if found_pending {
                     return Poll::Pending;
+                }
+
+                #[cfg(debug_assertions)]
+                if !found_updated && debug_map_mut {
+                    let mut tokens: Vec<<<E as Engine>::AnchorHandle as AnchorHandle>::Token> =
+                        Vec::new();
+                    $(
+                        tokens.push(self.anchors.$num.token());
+                    )+
+                    eprintln!(
+                        "[anchors][map_mut] skip_f loc={:?} out_type={} tokens={:?}",
+                        self.location,
+                        std::any::type_name::<Out>(),
+                        tokens
+                    );
                 }
 
                 self.output_stale = false;
