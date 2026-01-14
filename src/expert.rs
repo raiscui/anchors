@@ -185,6 +185,26 @@ pub trait Engine: 'static {
     fn fallback_mark_dirty(_token: <Self::AnchorHandle as AnchorHandle>::Token) -> bool {
         false
     }
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 兜底 dirty_handle：允许在没有 UpdateContext 的情况下创建 dirty_handle。
+    ///
+    /// 背景：
+    /// - 某些 `set` 发生在首次 poll_updated 之前，导致 dirty_handle 仍为 None；
+    /// - 仅靠 fallback_mark_dirty 只能入队 token，但无法持久化 dirty_handle；
+    /// - 这会让后续 set 继续走“无 handle”的慢路径。
+    ///
+    /// 语义：
+    /// - 该函数不触发 get/stabilize，只返回可用于 mark_dirty 的 handle；
+    /// - 默认返回 None，表示该 Engine 不支持兜底创建。
+    ///
+    /// singlethread::Engine 会覆盖该实现，借助 `DEFAULT_MOUNTER` 生成 DirtyHandle。
+    /// ////////////////////////////////////////////////////////////////////////////
+    fn fallback_dirty_handle(
+        _token: <Self::AnchorHandle as AnchorHandle>::Token,
+    ) -> Option<Self::DirtyHandle> {
+        None
+    }
 }
 
 /// Allows a node with non-Anchors inputs to manually mark itself as dirty. Each engine implements its own.

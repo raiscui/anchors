@@ -468,6 +468,16 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
         // }
         // debug!("set0");
 
+        ////////////////////////////////////////////////////////////////////////////////
+        // 优先尝试在 set 阶段建立 dirty_handle,避免持续走“无 handle”路径。
+        ////////////////////////////////////////////////////////////////////////////////
+        if inner.dirty_handle.is_none() {
+            let token = self.anchor.token();
+            if let Some(handle) = <E as Engine>::fallback_dirty_handle(token) {
+                inner.dirty_handle = Some(handle);
+            }
+        }
+
         if let Some(waker) = &inner.dirty_handle {
             // debug!( "===mark_dirty()");
 

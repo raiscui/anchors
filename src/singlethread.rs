@@ -352,6 +352,19 @@ impl crate::expert::Engine for Engine {
     fn fallback_mark_dirty(token: <Self::AnchorHandle as crate::expert::AnchorHandle>::Token) -> bool {
         Self::push_dirty_mark_without_handle(token)
     }
+
+    fn fallback_dirty_handle(
+        token: <Self::AnchorHandle as crate::expert::AnchorHandle>::Token,
+    ) -> Option<DirtyHandle> {
+        DEFAULT_MOUNTER.with(|mounter| {
+            let borrowed = mounter.borrow();
+            let mounter = borrowed.as_ref()?;
+            Some(DirtyHandle {
+                num: token,
+                dirty_marks: mounter.dirty_marks.clone(),
+            })
+        })
+    }
 }
 
 impl Engine {
