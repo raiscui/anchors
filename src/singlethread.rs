@@ -767,43 +767,87 @@ impl Engine {
             .clone()
     }
 
-    /// Retrieves the value of an Anchor, recalculating dependencies as necessary to get the
-    /// latest value.
     pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
         #[cfg(feature = "anchors_slotmap")]
         if let Some(val) = self.fast_path_ready_value(anchor) {
             return val;
         }
 
-        // 在读取前主动标记为 observed，确保父链路必要关系被建立，避免 clean_parents 被回收后无法向上脏传播。
-        // self.mark_observed(anchor);
-        self.stabilize();
-        self.graph.with(|graph| {
-            let anchor_node = self.ready_node(&graph, anchor.token(), "get::<O> 读取节点");
-            self.read_ready_output(anchor_node, "get::<O> 读取节点")
-        })
+        ////////////////////////////////////////////////////////////////////////////////
+        // 方案A: get 内部稳定化重试
+        //
+        // 目标:
+        // - 当 output 阶段产生新的 dirty_marks 时, 在同一次 get 内再 stabilize 一轮
+        // - 避免 "先算 0 -> set 宽高 -> dirty 排队到下一帧" 的中间态被返回
+        ////////////////////////////////////////////////////////////////////////////////
+        const MAX_STABLE_GET_ROUNDS: usize = 4;
+        let mut rounds: usize = 0;
+        loop {
+            self.stabilize();
+            let out = self.graph.with(|graph| {
+                let anchor_node = self.ready_node(&graph, anchor.token(), "get::<O> 读取节点");
+                self.read_ready_output(anchor_node, "get::<O> 读取节点")
+            });
+
+            let pending = !self.dirty_marks.borrow().is_empty();
+            if !pending || rounds >= MAX_STABLE_GET_ROUNDS {
+                if pending && rounds >= MAX_STABLE_GET_ROUNDS {
+                    tracing::warn!(
+                        target: "anchors",
+                        rounds,
+                        "get::<O> stabilize 重试达到上限, dirty_marks 仍未清空"
+                    );
+                }
+                return out;
+            }
+
+            rounds = rounds.saturating_add(1);
+        }
     }
     pub fn get_with<O: Clone + 'static, F: FnOnce(&O) -> R, R>(
         &mut self,
         anchor: &Anchor<O>,
         func: F,
     ) -> R {
-        // self.mark_observed(anchor);
-        // stabilize once before, since the stabilization process may mark our requested node
-        // as dirty
-        self.stabilize();
-        self.graph.with(|graph| {
-            let target_node =
-                self.ready_node(&graph, anchor.token(), "get_with 读取 anchor/output");
-            let borrowed = unsafe { &*target_node.anchor.get() };
-            let o = borrowed
-                .as_ref()
-                .unwrap()
-                .output(&mut EngineContext { engine: self })
-                .downcast_ref::<O>()
-                .unwrap();
-            func(o)
-        })
+        ////////////////////////////////////////////////////////////////////////////////
+        // 方案A: get_with 内部稳定化重试
+        //
+        // 约束:
+        // - FnOnce 只能执行一次,因此必须在稳定后再调用
+        // - 若 output 阶段触发 dirty_marks,先重试,最后一次才执行 func
+        ////////////////////////////////////////////////////////////////////////////////
+        const MAX_STABLE_GET_ROUNDS: usize = 4;
+        let mut rounds: usize = 0;
+        let mut func = Some(func);
+        loop {
+            self.stabilize();
+            let out = self.graph.with(|graph| {
+                let target_node = self.ready_node(&graph, anchor.token(), "get_with 读取 anchor/output");
+                let borrowed = unsafe { &*target_node.anchor.get() };
+                let o = borrowed
+                    .as_ref()
+                    .unwrap()
+                    .output(&mut EngineContext { engine: self })
+                    .downcast_ref::<O>()
+                    .unwrap();
+                o.clone()
+            });
+
+            let pending = !self.dirty_marks.borrow().is_empty();
+            if !pending || rounds >= MAX_STABLE_GET_ROUNDS {
+                if pending && rounds >= MAX_STABLE_GET_ROUNDS {
+                    tracing::warn!(
+                        target: "anchors",
+                        rounds,
+                        "get_with stabilize 重试达到上限, dirty_marks 仍未清空"
+                    );
+                }
+                let f = func.take().expect("get_with: func 已被消费");
+                return f(&out);
+            }
+
+            rounds = rounds.saturating_add(1);
+        }
     }
 
     /// 读取已 Ready 节点的输出副本，不触发重算，仅在 anchors_slotmap 下可用。
