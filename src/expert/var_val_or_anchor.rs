@@ -472,6 +472,17 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             // debug!( "===mark_dirty()");
 
             waker.mark_dirty();
+        } else {
+            // 诊断: dirty_handle 尚未建立时, 本次 set 无法进入 dirty_marks 队列
+            // 仅在调试开关开启时输出,避免影响正常性能
+            #[cfg(debug_assertions)]
+            if emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
+                eprintln!(
+                    "[anchors][var_voa] dirty_handle missing type={} val_ptr={:p}",
+                    std::any::type_name::<T>(),
+                    Rc::as_ptr(&inner.val)
+                );
+            }
         }
         // debug!("set2");
 
