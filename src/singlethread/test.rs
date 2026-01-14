@@ -74,6 +74,51 @@ fn test_mark_observed() {
     assert_eq!(engine.dirty_marks.borrow().len(), 0);
 }
 
+#[test]
+fn stabilize_consumes_dirty_marks_created_during_stabilize() {
+    ////////////////////////////////////////////////////////////////////////////////
+    // 回归测试：锁定“方案A”的关键语义
+    //
+    // 现象：
+    // - 某些 Anchor 在 poll_updated 期间会调用外部 `Var::set`（例如 CSS shaper 写入 layout.w/h）。
+    // - 这些 set 只会把 dirty_marks 追加进队列；如果 stabilize 只跑一轮，
+    //   那么本次 `Engine::get()` 可能返回“中间态”（需要下一次 get 才能看到最终值）。
+    //
+    // 期望：
+    // - `Engine::stabilize()` 需要在同一次 get 内继续吃掉 stabilize 期间新增的 dirty_marks，
+    //   直到收敛，从而返回最终值。
+    ////////////////////////////////////////////////////////////////////////////////
+    let mut engine = Engine::new();
+
+    // 1) 被写入的目标 Var（模拟 layout.w/h）
+    let width = Var::new(0usize);
+
+    // 2) 触发器 Var：当它变为 true 时，在 map 闭包里写入 width
+    let trigger = Var::new(false);
+
+    // 3) 触发器 Anchor：在 stabilize 期间执行 side-effect（写入 width）
+    let trigger_anchor = trigger.watch().map({
+        let width = width.clone();
+        move |flag: &bool| {
+            if *flag {
+                width.set(1);
+            }
+            // 返回值本身不重要；我们只用它来保证该 Anchor 会被计算。
+            0usize
+        }
+    });
+
+    // 4) 输出 Anchor：读取 width 的值（我们断言第二次 get 就应当看到 1）
+    let out = (&width.watch(), &trigger_anchor).map(|w, _| *w);
+
+    // 首次 get：建立 dirty_handle（否则 set 不会 mark_dirty）
+    assert_eq!(engine.get(&out), 0);
+
+    // 第二次 get：在 stabilize 期间会触发 width.set(1)，并要求同一次 get 内收敛到 1
+    trigger.set(true);
+    assert_eq!(engine.get(&out), 1);
+}
+
 #[cfg(feature = "anchors_slotmap")]
 #[test]
 fn peek_value_respects_ready() {

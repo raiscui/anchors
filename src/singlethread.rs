@@ -826,6 +826,44 @@ impl Engine {
         self.update_dirty_marks();
         self.generation.increment();
         self.stabilize_with_pending_queue();
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // 方案A(彻底正确)：让一次 `Engine::get()` 内部的 stabilize 具备“收敛性”
+        //
+        // 背景：
+        // - 在当前架构里，某些节点在 poll_updated 期间会触发 `StateVOA/StateVar::set`，
+        //   这些 set 只会把 token 追加到 `dirty_marks`；
+        // - 但 `Engine::get()` 只在开头调用一次 stabilize；
+        // - 因此同一帧内会出现“先用旧值算出 0 → 再写入宽高 → dirty 需要下一轮 get 才生效”的窗口，
+        //   最终导致 present 采样到 size=0 的中间态（表现为新增条目不显示/位置不对）。
+        //
+        // 解决：
+        // - 在本次 stabilize 结束后，若发现 stabilize 期间又产生了新的 dirty_marks，
+        //   则继续补一轮 update_dirty_marks + stabilize_with_pending_queue，直到收敛。
+        // - 这样 `scene_ctx_sa.get()` 返回的是“本次 get 期间可达的收敛结果”，避免中间态进入 present。
+        //
+        // 安全阀：
+        // - 额外轮次做上限，避免异常情况下 dirty_marks 被持续写入导致事件循环卡死。
+        ////////////////////////////////////////////////////////////////////////////////
+        const MAX_EXTRA_ROUNDS: usize = 8;
+        let mut extra_rounds: usize = 0;
+        while !self.dirty_marks.borrow().is_empty() && extra_rounds < MAX_EXTRA_ROUNDS {
+            extra_rounds = extra_rounds.saturating_add(1);
+            trace!(
+                "stabilize: extra_rounds={} reason=dirty_marks_not_empty",
+                extra_rounds
+            );
+            self.update_dirty_marks();
+            self.stabilize_with_pending_queue();
+        }
+
+        if !self.dirty_marks.borrow().is_empty() {
+            tracing::warn!(
+                target: "anchors",
+                extra_rounds,
+                "stabilize: dirty_marks 仍未收敛（已达额外轮次上限），本轮将返回可能的中间态；建议排查是否存在 stabilize 期间反复 set 的非收敛依赖"
+            );
+        }
         trace!("....stabilize");
     }
 
