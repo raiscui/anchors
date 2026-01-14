@@ -349,7 +349,9 @@ impl crate::expert::Engine for Engine {
         })
     }
 
-    fn fallback_mark_dirty(token: <Self::AnchorHandle as crate::expert::AnchorHandle>::Token) -> bool {
+    fn fallback_mark_dirty(
+        token: <Self::AnchorHandle as crate::expert::AnchorHandle>::Token,
+    ) -> bool {
         Self::push_dirty_mark_without_handle(token)
     }
 
@@ -835,7 +837,8 @@ impl Engine {
         loop {
             self.stabilize();
             let out = self.graph.with(|graph| {
-                let target_node = self.ready_node(&graph, anchor.token(), "get_with 读取 anchor/output");
+                let target_node =
+                    self.ready_node(&graph, anchor.token(), "get_with 读取 anchor/output");
                 let borrowed = unsafe { &*target_node.anchor.get() };
                 let o = borrowed
                     .as_ref()
