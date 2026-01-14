@@ -167,6 +167,24 @@ pub trait Engine: 'static {
     type DirtyHandle: DirtyHandle;
 
     fn mount<I: AnchorInner<Self> + 'static>(inner: I) -> Anchor<I::Output, Self>;
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 兜底 dirty：允许在没有 dirty_handle 的情况下把 token 推入 dirty 队列。
+    ///
+    /// 背景：
+    /// - `Var/VarVOA` 的 dirty_handle 只会在第一次 poll_updated 时通过 `ctx.dirty_handle()` 建立；
+    /// - 但在 Dyn 增量构建/布局 shaper 场景里，set 可能发生在第一次 poll 之前；
+    /// - 若 set 时无法进入 dirty 队列，就会出现“同一帧中间态被 present 采样”的现象。
+    ///
+    /// 语义：
+    /// - 该函数不做 “额外 get”，只做“入队 token”。
+    /// - 默认返回 false，表示该 Engine 不支持兜底入队。
+    ///
+    /// singlethread::Engine 会覆盖该实现，借助 `DEFAULT_MOUNTER` 写入 dirty_marks。
+    /// ////////////////////////////////////////////////////////////////////////////
+    fn fallback_mark_dirty(_token: <Self::AnchorHandle as AnchorHandle>::Token) -> bool {
+        false
+    }
 }
 
 /// Allows a node with non-Anchors inputs to manually mark itself as dirty. Each engine implements its own.

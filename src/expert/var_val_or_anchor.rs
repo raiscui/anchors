@@ -473,10 +473,20 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
 
             waker.mark_dirty();
         } else {
-            // 诊断: dirty_handle 尚未建立时, 本次 set 无法进入 dirty_marks 队列
+            ////////////////////////////////////////////////////////////////////////////////
+            // 兜底：dirty_handle 尚未建立时，仍尝试把自身 token 推入 dirty_marks。
+            //
+            // 说明：
+            // - 这不是“额外 get”，只是入队一个 token；
+            // - 若当前 Engine 不支持兜底入队（fallback_mark_dirty=false），才仅打印诊断信息。
+            ////////////////////////////////////////////////////////////////////////////////
+            let token = self.anchor.token();
+            let queued = <E as Engine>::fallback_mark_dirty(token);
+
+            // 诊断: 当前 Engine 不支持兜底入队时, 本次 set 无法进入 dirty_marks 队列
             // 仅在调试开关开启时输出,避免影响正常性能
             #[cfg(debug_assertions)]
-            if emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
+            if !queued && emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
                 eprintln!(
                     "[anchors][var_voa] dirty_handle missing type={} val_ptr={:p}",
                     std::any::type_name::<T>(),

@@ -319,6 +319,18 @@ pub struct Engine {
 
 struct Mounter {
     graph: Rc<Graph2>,
+    /// 供 `VarVOA::set` 在 dirty_handle 尚未建立时做兜底：直接把 token 推入 dirty_marks。
+    ///
+    /// 背景：
+    /// - 某些 `set` 可能发生在 stabilize 期间、且发生在 Var 第一次被 request/poll 之前；
+    /// - 这时 Var 内部还没有 `dirty_handle`，常规 `mark_dirty()` 走不通；
+    /// - 但如果该 Var 的值被其它 Anchor 在本轮 stabilize 早些时候读取过，
+    ///   就会出现“先算出旧值/0 → 后 set 新值 → 但没有 dirty 触发重算”的中间态窗口。
+    ///
+    /// 目标：
+    /// - 不引入额外的 `Engine::get()`（避免 re-entrant get 改变调度顺序），
+    /// - 仍然保证 `set` 能进入 dirty 队列，从而让 stabilize 的“收敛补轮”有机会吃掉它。
+    dirty_marks: Rc<RefCell<Vec<NodeKey>>>,
 }
 
 impl crate::expert::Engine for Engine {
@@ -335,6 +347,10 @@ impl crate::expert::Engine for Engine {
             let handle = this.graph.insert(Box::new(inner), debug_info);
             Anchor::new_from_expert(handle)
         })
+    }
+
+    fn fallback_mark_dirty(token: <Self::AnchorHandle as crate::expert::AnchorHandle>::Token) -> bool {
+        Self::push_dirty_mark_without_handle(token)
     }
 }
 
@@ -374,14 +390,16 @@ impl Engine {
 
     /// Creates a new Engine with a custom maximum height.
     pub fn new_with_max_height(max_height: usize) -> Self {
+        let dirty_marks: Rc<RefCell<Vec<NodeKey>>> = Default::default();
         let graph = Rc::new(Graph2::new(max_height));
         let mounter = Mounter {
             graph: graph.clone(),
+            dirty_marks: dirty_marks.clone(),
         };
         DEFAULT_MOUNTER.with(|v| *v.borrow_mut() = Some(mounter));
         Self {
             graph,
-            dirty_marks: Default::default(),
+            dirty_marks,
             generation: Generation::new(),
             #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
             pending_requests: Rc::new(RefCell::new(PendingQueue::default())),
@@ -392,6 +410,24 @@ impl Engine {
             #[cfg(feature = "anchors_slotmap")]
             unexpected_pending_log: Rc::new(RefCell::new(UnexpectedPendingLogInner::default())),
         }
+    }
+
+    /// 兜底：在没有 dirty_handle 的情况下，直接把 token 推入当前 Engine 的 dirty_marks。
+    ///
+    /// 说明：
+    /// - 该路径主要用于 `VarVOA::set`：当 Var 第一次 poll_updated 尚未发生时，dirty_handle 为 None。
+    /// - 若此时 set 发生在 stabilize 期间，且上游已经用旧值计算过，则必须能触发一次重算。
+    /// - 这里不做任何 “立刻 stabilize” 的动作，只是把 token 入队，
+    ///   让本轮/下一轮 stabilize 统一消费（由 `Engine::stabilize` 控制收敛轮次）。
+    pub(crate) fn push_dirty_mark_without_handle(token: NodeKey) -> bool {
+        DEFAULT_MOUNTER.with(|mounter| {
+            let borrowed = mounter.borrow();
+            let Some(mounter) = borrowed.as_ref() else {
+                return false;
+            };
+            mounter.dirty_marks.borrow_mut().push(token);
+            true
+        })
     }
 
     /// 输出 pending 队列的聚合指标，便于在 demo/集成测试后记录基线。

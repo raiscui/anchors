@@ -153,6 +153,28 @@ impl<T: 'static, E: Engine> Var<T, E> {
         if let Some(waker) = &inner.dirty_handle {
             // debug!( "===mark_dirty()");
             waker.mark_dirty();
+        } else {
+            ////////////////////////////////////////////////////////////////////////////////
+            // 兜底：dirty_handle 尚未建立时，仍尝试把自身 token 推入 dirty_marks。
+            //
+            // 说明：
+            // - 这不是“额外 get”，只是入队一个 token；
+            // - 目的是让本次/下一次 stabilize 能看到这次 set，并在需要时触发重算；
+            // - 若当前 Engine 不支持兜底入队（fallback_mark_dirty=false），仅在 debug 开关下输出诊断。
+            ////////////////////////////////////////////////////////////////////////////////
+            let token = self.anchor.token();
+            let queued = <E as Engine>::fallback_mark_dirty(token);
+
+            // 诊断：当前 Engine 不支持兜底入队时，本次 set 无法进入 dirty_marks 队列
+            // 仅在调试开关开启时输出，避免影响正常性能
+            #[cfg(debug_assertions)]
+            if !queued && emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
+                eprintln!(
+                    "[anchors][var] dirty_handle missing type={} val_ptr={:p}",
+                    std::any::type_name::<T>(),
+                    Rc::as_ptr(&inner.val)
+                );
+            }
         }
 
         inner.value_changed = true;
