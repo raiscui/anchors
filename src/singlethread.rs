@@ -782,6 +782,38 @@ impl Engine {
             .clone()
     }
 
+    ////////////////////////////////////////////////////////////////////////////////
+    // 汇总当前是否仍有待处理的工作：
+    // - dirty_marks: Var/VarVOA::set 注入的脏标记
+    // - graph.recalc_pending: 已入队但尚未处理的重算
+    // - pending_requests: slotmap+pending_queue 下的延迟请求
+    //
+    // 作用：
+    // - get/get_with 在读取输出后判断是否需要补一轮 stabilize
+    ////////////////////////////////////////////////////////////////////////////////
+    #[inline]
+    fn has_pending_work(&self) -> bool {
+        if !self.dirty_marks.borrow().is_empty() {
+            return true;
+        }
+        #[cfg(feature = "anchors_slotmap")]
+        {
+            let graph_pending = self.graph.with(|graph| {
+                graph.has_recalc_pending() || graph.has_pending_free()
+            });
+            if graph_pending {
+                return true;
+            }
+        }
+        #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+        {
+            if !self.pending_requests.borrow().is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
         #[cfg(feature = "anchors_slotmap")]
         if let Some(val) = self.fast_path_ready_value(anchor) {
@@ -804,13 +836,13 @@ impl Engine {
                 self.read_ready_output(anchor_node, "get::<O> 读取节点")
             });
 
-            let pending = !self.dirty_marks.borrow().is_empty();
+            let pending = self.has_pending_work();
             if !pending || rounds >= MAX_STABLE_GET_ROUNDS {
                 if pending && rounds >= MAX_STABLE_GET_ROUNDS {
                     tracing::warn!(
                         target: "anchors",
                         rounds,
-                        "get::<O> stabilize 重试达到上限, dirty_marks 仍未清空"
+                        "get::<O> stabilize 重试达到上限, 仍存在待处理工作"
                     );
                 }
                 return out;
@@ -849,13 +881,13 @@ impl Engine {
                 o.clone()
             });
 
-            let pending = !self.dirty_marks.borrow().is_empty();
+            let pending = self.has_pending_work();
             if !pending || rounds >= MAX_STABLE_GET_ROUNDS {
                 if pending && rounds >= MAX_STABLE_GET_ROUNDS {
                     tracing::warn!(
                         target: "anchors",
                         rounds,
-                        "get_with stabilize 重试达到上限, dirty_marks 仍未清空"
+                        "get_with stabilize 重试达到上限, 仍存在待处理工作"
                     );
                 }
                 let f = func.take().expect("get_with: func 已被消费");

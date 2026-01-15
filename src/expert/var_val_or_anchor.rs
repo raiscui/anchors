@@ -452,10 +452,16 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             val: val.clone(),
             output_stale: true,
         }));
-        VarVOA {
-            inner: inner.clone(),
-            anchor: E::mount(VarEitherAnchor { inner, val }),
+        let anchor = E::mount(VarEitherAnchor { inner: inner.clone(), val });
+        ////////////////////////////////////////////////////////////////////////////////
+        // 提前建立 dirty_handle，避免首次 set 发生在 poll_updated 之前时丢掉脏标记。
+        // - 这里不会触发 get/stabilize，仅缓存 handle 以便后续 set 直接 mark_dirty。
+        // - 若当前 Engine 不支持兜底句柄，仍保持 None，不改变原有语义。
+        ////////////////////////////////////////////////////////////////////////////////
+        if let Some(handle) = <E as Engine>::fallback_dirty_handle(anchor.token()) {
+            inner.borrow_mut().dirty_handle = Some(handle);
         }
+        VarVOA { inner, anchor }
     }
 
     /// Updates the value inside the VarAnchor, and indicates to the recomputation graph that
@@ -688,6 +694,7 @@ mod tests {
     use crate::{
         expert::{
             Constant,
+            ext::MultiAnchor,
             var_val_or_anchor::{ValOrAnchor, VarVOA},
         },
         singlethread::{Engine, Var},
@@ -761,6 +768,34 @@ mod tests {
 
         debug!("{}", engine.get(&aw));
         debug!("{}", engine.get(&aw));
+    }
+
+    #[test]
+    fn var_voa_set_during_output_should_converge_in_same_get() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 回归测试：
+        // - output 阶段触发 set 时，Engine::get 应能在同一轮内完成收敛；
+        // - 避免“先输出旧值，再把新值留到下一轮”的中间态。
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut engine = Engine::new();
+        let data = VarVOA::new(0i32);
+        let flag = VarVOA::new(false);
+
+        let data_w = data.watch();
+        let flag_w = flag.watch();
+
+        let data_set = data.clone();
+        let flag_set = flag.clone();
+        let out = (&data_w, &flag_w).map(move |v: &i32, f: &bool| {
+            if !*f {
+                data_set.set(1);
+                flag_set.set(true);
+            }
+            *v
+        });
+
+        let got = engine.get(&out);
+        assert_eq!(got, 1);
     }
 
     #[test]

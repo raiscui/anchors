@@ -118,10 +118,19 @@ impl<T: 'static, E: Engine> Var<T, E> {
             val: val.clone(),
             value_changed: true,
         }));
-        Var {
+        let anchor = E::mount(VarAnchor {
             inner: inner.clone(),
-            anchor: E::mount(VarAnchor { inner, val }),
+            val,
+        });
+        ////////////////////////////////////////////////////////////////////////////////
+        // 提前建立 dirty_handle，确保首次 set 即可 mark_dirty，不依赖 poll_updated 时机。
+        // - 仅缓存句柄，不触发任何 get/stabilize。
+        // - 若引擎不支持兜底句柄，保持 None。
+        ////////////////////////////////////////////////////////////////////////////////
+        if let Some(handle) = <E as Engine>::fallback_dirty_handle(anchor.token()) {
+            inner.borrow_mut().dirty_handle = Some(handle);
         }
+        Var { inner, anchor }
     }
 
     // pub fn swap(&self, other: T) -> Rc<T> {
