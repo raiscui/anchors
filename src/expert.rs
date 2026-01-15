@@ -205,6 +205,17 @@ pub trait Engine: 'static {
     ) -> Option<Self::DirtyHandle> {
         None
     }
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 诊断：判断当前线程是否已初始化 Engine
+    ///
+    /// 说明：
+    /// - 仅用于 dirty_handle missing 的定位，不应影响业务逻辑；
+    /// - 默认返回 false，具体引擎可按需覆盖。
+    /// ////////////////////////////////////////////////////////////////////////////
+    fn is_engine_initialized() -> bool {
+        false
+    }
 }
 
 /// Allows a node with non-Anchors inputs to manually mark itself as dirty. Each engine implements its own.

@@ -1,7 +1,7 @@
 /*
  * @Author: Rais
  * @Date: 2023-03-23 10:44:30
- * @LastEditTime: 2025-11-24 12:19:17
+ * @LastEditTime: 2026-01-15 14:37:14
  * @LastEditors: Rais
  * @Description:
  */
@@ -26,6 +26,10 @@ struct VarEAShared<T, E: Engine> {
     dirty_handle: Option<E::DirtyHandle>,
     val: Rc<ValOrAnchor<T, E>>,
     output_stale: bool,
+    ////////////////////////////////////////////////////////////////////////////////
+    // 延迟补偿：记录“set 发生但未能入队 dirty”的情况
+    ////////////////////////////////////////////////////////////////////////////////
+    pending_dirty: bool,
 }
 
 impl<T: Debug, E: Engine> Debug for VarEAShared<T, E>
@@ -38,6 +42,7 @@ where
             .field("dirty_handle", &self.dirty_handle)
             .field("val", &self.val)
             .field("value_changed", &self.output_stale)
+            .field("pending_dirty", &self.pending_dirty)
             .finish()
     }
 }
@@ -451,8 +456,12 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             dirty_handle: None,
             val: val.clone(),
             output_stale: true,
+            pending_dirty: false,
         }));
-        let anchor = E::mount(VarEitherAnchor { inner: inner.clone(), val });
+        let anchor = E::mount(VarEitherAnchor {
+            inner: inner.clone(),
+            val,
+        });
         ////////////////////////////////////////////////////////////////////////////////
         // 提前建立 dirty_handle，避免首次 set 发生在 poll_updated 之前时丢掉脏标记。
         // - 这里不会触发 get/stabilize，仅缓存 handle 以便后续 set 直接 mark_dirty。
@@ -488,6 +497,7 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             // debug!( "===mark_dirty()");
 
             waker.mark_dirty();
+            inner.pending_dirty = false;
         } else {
             ////////////////////////////////////////////////////////////////////////////////
             // 兜底：dirty_handle 尚未建立时，仍尝试把自身 token 推入 dirty_marks。
@@ -499,15 +509,25 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             let token = self.anchor.token();
             let queued = <E as Engine>::fallback_mark_dirty(token);
 
-            // 诊断: 当前 Engine 不支持兜底入队时, 本次 set 无法进入 dirty_marks 队列
-            // 仅在调试开关开启时输出,避免影响正常性能
-            #[cfg(debug_assertions)]
-            if !queued && emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
-                eprintln!(
-                    "[anchors][var_voa] dirty_handle missing type={} val_ptr={:p}",
-                    std::any::type_name::<T>(),
-                    Rc::as_ptr(&inner.val)
-                );
+            ////////////////////////////////////////////////////////////////////////////////
+            // 补偿：若本次 set 无法入队，记录 pending_dirty，待首次 poll_updated 建立 handle 后补偿入队。
+            ////////////////////////////////////////////////////////////////////////////////
+            if queued {
+                inner.pending_dirty = false;
+            } else {
+                inner.pending_dirty = true;
+                #[cfg(debug_assertions)]
+                if emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
+                    let thread_id = std::thread::current().id();
+                    let engine_inited = <E as Engine>::is_engine_initialized();
+                    eprintln!(
+                        "[anchors][var_voa] dirty_handle missing type={} val_ptr={:p} thread={:?} engine_inited={}",
+                        std::any::type_name::<T>(),
+                        Rc::as_ptr(&inner.val),
+                        thread_id,
+                        engine_inited
+                    );
+                }
             }
         }
         // debug!("set2");
@@ -559,6 +579,15 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
             let first = inner.dirty_handle.is_none();
             if first {
                 inner.dirty_handle = Some(ctx.dirty_handle());
+                ////////////////////////////////////////////////////////////////////////////////
+                // 补偿：若之前 set 未能入队，首次建立 dirty_handle 后立刻补一次 mark_dirty。
+                ////////////////////////////////////////////////////////////////////////////////
+                if inner.pending_dirty {
+                    if let Some(waker) = &inner.dirty_handle {
+                        waker.mark_dirty();
+                    }
+                    inner.pending_dirty = false;
+                }
             }
             debug!("a0");
             let mut force_unchanged_no_clone = false;
@@ -798,6 +827,131 @@ mod tests {
         assert_eq!(got, 1);
     }
 
+    // * 测试在做什么
+    // 通过 DummyEngine 让 fallback_dirty_handle / fallback_mark_dirty 都失败，模拟“set 发生在 stabilize 期间、且首次 poll 之前”的极端情况。
+    // 在这种情况下，set 没法把 dirty 入队（旧逻辑会丢更新）。
+    // 新逻辑会把 pending_dirty = true，并在首次 poll_updated 建立 dirty_handle 后立即补一次 mark_dirty。
+    // * 测试通过说明什么
+    // set 时无法入队 → pending_dirty 被记录。
+    // 首次 poll_updated 建 handle → 补偿 mark_dirty 被实际调用一次。
+    // 即 “dirty_handle 缺失导致丢更新” 这条路径被修复。
+    //
+    #[test]
+    fn var_voa_pending_dirty_should_mark_on_first_poll() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use crate::expert::{
+            Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine as EngineTrait, Poll,
+            UpdateContext,
+        };
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct PendingToken(u64);
+
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        struct PendingAnchorHandle {
+            token: PendingToken,
+        }
+
+        impl AnchorHandle for PendingAnchorHandle {
+            type Token = PendingToken;
+
+            fn token(&self) -> Self::Token {
+                self.token
+            }
+        }
+
+        #[derive(Clone)]
+        struct PendingDirtyHandle {
+            count: Rc<Cell<usize>>,
+        }
+
+        impl DirtyHandle for PendingDirtyHandle {
+            fn mark_dirty(&self) {
+                let next = self.count.get().saturating_add(1);
+                self.count.set(next);
+            }
+        }
+
+        struct PendingEngine;
+
+        impl EngineTrait for PendingEngine {
+            type AnchorHandle = PendingAnchorHandle;
+            type DirtyHandle = PendingDirtyHandle;
+
+            fn mount<I: AnchorInner<Self> + 'static>(_inner: I) -> Anchor<I::Output, Self> {
+                unreachable!("该测试直接构造 VarEitherAnchor，不需要 mount")
+            }
+        }
+
+        struct PendingCtx {
+            count: Rc<Cell<usize>>,
+        }
+
+        impl UpdateContext for PendingCtx {
+            type Engine = PendingEngine;
+
+            fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
+            where
+                'slf: 'out,
+            {
+                panic!("该测试不应调用 get()")
+            }
+
+            fn request<O: 'static>(
+                &mut self,
+                _anchor: &Anchor<O, Self::Engine>,
+                _necessary: bool,
+            ) -> Poll {
+                Poll::Unchanged
+            }
+
+            fn unrequest<O: 'static>(&mut self, _anchor: &Anchor<O, Self::Engine>) {}
+
+            fn dirty_handle(&mut self) -> <Self::Engine as EngineTrait>::DirtyHandle {
+                PendingDirtyHandle {
+                    count: self.count.clone(),
+                }
+            }
+        }
+
+        let inner = Rc::new(RefCell::new(super::VarEAShared::<u32, PendingEngine> {
+            dirty_handle: None,
+            val: Rc::new(ValOrAnchor::Val(1u32)),
+            output_stale: false,
+            pending_dirty: false,
+        }));
+        let anchor: Anchor<u32, PendingEngine> = Anchor::new_from_expert(PendingAnchorHandle {
+            token: PendingToken(1),
+        });
+        let var = VarVOA::<u32, PendingEngine> {
+            inner: inner.clone(),
+            anchor,
+        };
+
+        var.set(2u32);
+        assert!(inner.borrow().pending_dirty);
+
+        let mut inner_anchor = super::VarEitherAnchor::<u32, PendingEngine> {
+            inner: inner.clone(),
+            val: Rc::new(ValOrAnchor::Val(1u32)),
+        };
+        let marks = Rc::new(Cell::new(0));
+        let mut ctx = PendingCtx {
+            count: marks.clone(),
+        };
+
+        let poll =
+            <super::VarEitherAnchor<u32, PendingEngine> as AnchorInner<PendingEngine>>::poll_updated(
+                &mut inner_anchor,
+                &mut ctx,
+            );
+        assert!(matches!(poll, Poll::Updated | Poll::Unchanged));
+        assert_eq!(marks.get(), 1);
+        assert!(!inner.borrow().pending_dirty);
+    }
+
     #[test]
     fn var_either_should_fallback_on_pending_invalid_token_when_switching_to_new_anchor() {
         ////////////////////////////////////////////////////////////////////////////////
@@ -904,6 +1058,7 @@ mod tests {
             dirty_handle: None,
             val: Rc::new(ValOrAnchor::Anchor(bad_anchor)),
             output_stale: true,
+            pending_dirty: false,
         }));
 
         let mut inner = super::VarEitherAnchor::<u32, DummyEngine> {
@@ -1032,6 +1187,7 @@ mod tests {
             dirty_handle: None,
             val: bad_rc.clone(),
             output_stale: false,
+            pending_dirty: false,
         }));
 
         let mut inner = super::VarEitherAnchor::<u32, DummyEngine> {

@@ -367,6 +367,13 @@ impl crate::expert::Engine for Engine {
             })
         })
     }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // 诊断：判断当前线程是否已初始化 Engine（TLS mounter 是否存在）
+    ////////////////////////////////////////////////////////////////////////////////
+    fn is_engine_initialized() -> bool {
+        DEFAULT_MOUNTER.with(|mounter| mounter.borrow().is_some())
+    }
 }
 
 impl Engine {
@@ -798,9 +805,9 @@ impl Engine {
         }
         #[cfg(feature = "anchors_slotmap")]
         {
-            let graph_pending = self.graph.with(|graph| {
-                graph.has_recalc_pending() || graph.has_pending_free()
-            });
+            let graph_pending = self
+                .graph
+                .with(|graph| graph.has_recalc_pending() || graph.has_pending_free());
             if graph_pending {
                 return true;
             }

@@ -24,6 +24,10 @@ struct VarShared<T, E: Engine> {
     dirty_handle: Option<E::DirtyHandle>,
     val: Rc<T>,
     value_changed: bool,
+    ////////////////////////////////////////////////////////////////////////////////
+    // 延迟补偿：记录“set 发生但未能入队 dirty”的情况
+    ////////////////////////////////////////////////////////////////////////////////
+    pending_dirty: bool,
 }
 
 // impl<T, E: Engine> Drop for VarShared<T, E> {
@@ -42,6 +46,7 @@ where
             .field("dirty_handle", &self.dirty_handle)
             .field("val", &self.val)
             .field("value_changed", &self.value_changed)
+            .field("pending_dirty", &self.pending_dirty)
             .finish()
     }
 }
@@ -117,6 +122,7 @@ impl<T: 'static, E: Engine> Var<T, E> {
             dirty_handle: None,
             val: val.clone(),
             value_changed: true,
+            pending_dirty: false,
         }));
         let anchor = E::mount(VarAnchor {
             inner: inner.clone(),
@@ -172,6 +178,7 @@ impl<T: 'static, E: Engine> Var<T, E> {
         if let Some(waker) = &inner.dirty_handle {
             // debug!( "===mark_dirty()");
             waker.mark_dirty();
+            inner.pending_dirty = false;
         } else {
             ////////////////////////////////////////////////////////////////////////////////
             // 兜底：dirty_handle 尚未建立时，仍尝试把自身 token 推入 dirty_marks。
@@ -184,15 +191,25 @@ impl<T: 'static, E: Engine> Var<T, E> {
             let token = self.anchor.token();
             let queued = <E as Engine>::fallback_mark_dirty(token);
 
-            // 诊断：当前 Engine 不支持兜底入队时，本次 set 无法进入 dirty_marks 队列
-            // 仅在调试开关开启时输出，避免影响正常性能
-            #[cfg(debug_assertions)]
-            if !queued && emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
-                eprintln!(
-                    "[anchors][var] dirty_handle missing type={} val_ptr={:p}",
-                    std::any::type_name::<T>(),
-                    Rc::as_ptr(&inner.val)
-                );
+            ////////////////////////////////////////////////////////////////////////////////
+            // 补偿：若本次 set 无法入队，记录 pending_dirty，待首次 poll_updated 建立 handle 后补偿入队。
+            ////////////////////////////////////////////////////////////////////////////////
+            if queued {
+                inner.pending_dirty = false;
+            } else {
+                inner.pending_dirty = true;
+                #[cfg(debug_assertions)]
+                if emg_debug_env::bool_lenient("EMG_DEBUG_SCENE_CTX_PTR") {
+                    let thread_id = std::thread::current().id();
+                    let engine_inited = <E as Engine>::is_engine_initialized();
+                    eprintln!(
+                        "[anchors][var] dirty_handle missing type={} val_ptr={:p} thread={:?} engine_inited={}",
+                        std::any::type_name::<T>(),
+                        Rc::as_ptr(&inner.val),
+                        thread_id,
+                        engine_inited
+                    );
+                }
             }
         }
 
@@ -233,6 +250,15 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
         let first_update = inner.dirty_handle.is_none();
         if first_update {
             inner.dirty_handle = Some(ctx.dirty_handle());
+            ////////////////////////////////////////////////////////////////////////////////
+            // 补偿：若之前 set 未能入队，首次建立 dirty_handle 后立刻补一次 mark_dirty。
+            ////////////////////////////////////////////////////////////////////////////////
+            if inner.pending_dirty {
+                if let Some(waker) = &inner.dirty_handle {
+                    waker.mark_dirty();
+                }
+                inner.pending_dirty = false;
+            }
         }
         if inner.value_changed {
             inner.value_changed = false;
