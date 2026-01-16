@@ -1449,14 +1449,11 @@ impl Engine {
             // ╚═══════════════════════════════════════════════════════════════╝
             if lock_strict_enabled() {
                 let trace = lock_trace_peek(node.key().raw_token());
-                let bt_now = Backtrace::force_capture();
-                panic!(
-                    "slotmap: detected anchor_locked while strict mode enabled,疑似重入缺陷 {:?}\n上次持锁位置: {}\n当前回溯:\n{:?}",
+                // 冷路径：把 panic/backtrace 的大块逻辑挪到 out-of-line 函数，减少热路径 i-cache 压力。
+                panic_anchor_locked_strict(
+                    node.key().raw_token(),
                     node.debug_info.get()._to_string(),
-                    trace.unwrap_or_else(|| {
-                        "未记录 trace，请开启 ANCHORS_LOCK_TRACE 以获取更多定位信息".to_string()
-                    }),
-                    bt_now
+                    trace,
                 );
             }
             let retry = node.recalc_retry.get().saturating_add(1);
@@ -1972,6 +1969,29 @@ fn recalc_trace_enabled() -> bool {
 fn lock_trace_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_LOCK_TRACE"))
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+/// STRICT 模式下的“重入锁”panic（冷路径）
+///
+/// 背景：
+/// - `Engine::recalculate` 是极热函数；
+/// - 但 “anchor_locked 且 strict=on” 属于极少发生的灾难性路径（应当尽快暴露根因）。
+///
+/// 目标：
+/// - 把大段 format/backtrace/panic 逻辑挪到冷函数中，减少热路径的指令体积与 i-cache 压力；
+/// - 行为保持不变：一旦命中 strict 重入，立刻 panic，并附带足够定位信息。
+/// ══════════════════════════════════════════════════════════════════════
+#[cold]
+#[inline(never)]
+fn panic_anchor_locked_strict(token: u64, node_debug: String, trace: Option<String>) -> ! {
+    let trace = trace.unwrap_or_else(|| {
+        "未记录 trace，请开启 ANCHORS_LOCK_TRACE 以获取更多定位信息".to_string()
+    });
+    let bt_now = Backtrace::force_capture();
+    panic!(
+        "slotmap: detected anchor_locked while strict mode enabled,疑似重入缺陷 token={token} node={node_debug}\n上次持锁位置: {trace}\n当前回溯:\n{bt_now:?}",
+    );
 }
 
 // skip_self = true indicates output has *definitely* changed, but node has been recalculated

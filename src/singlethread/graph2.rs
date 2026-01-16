@@ -1,8 +1,11 @@
-use super::{AnchorDebugInfo, Engine, EngineContext, Generation, GenericAnchor};
+use super::{AnchorDebugInfo, Generation, GenericAnchor};
+#[cfg(feature = "anchors_slotmap")]
+use super::{Engine, EngineContext};
 #[cfg(feature = "anchors_slotmap")]
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
+#[cfg(any(debug_assertions, feature = "anchors_slotmap"))]
 use std::sync::OnceLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -236,12 +239,35 @@ mod node_store {
         }
 
         pub unsafe fn lookup_ptr(&self, ptr: NodePtr<T>) -> &T {
-            debug_assert_eq!(ptr.graph, self.graph);
-            // unsafe: graph 指针来源受 NodeStoreGuard 生命周期约束，确保在 SlotMap 内有效。
             let slots = unsafe { &*(*self.graph).slots.get() };
-            slots
-                .get(ptr.key)
-                .expect("dangling NodePtr: 已释放或跨 Graph2 使用")
+            ////////////////////////////////////////////////////////////////////////////////
+            // 性能关键点（anchors_slotmap）：
+            //
+            // - 我们并不会对 SlotMap 执行物理 remove（仅把 Node 的 anchor 置空并放入 free list 复用）。
+            // - 因此，SlotMap 内的 key 永远在 bounds 内，且不会出现版本失配导致的 None。
+            //
+            // 结论：
+            // - debug 下保留 `.get(...).expect(...)` 以捕获越界/跨 Graph2 的 misuse；
+            // - release/bench 下改用 `get_unchecked` 跳过 version/bounds 检查，减少热路径常数开销。
+            ////////////////////////////////////////////////////////////////////////////////
+            #[cfg(debug_assertions)]
+            {
+                debug_assert_eq!(ptr.graph, self.graph);
+                return slots
+                    .get(ptr.key)
+                    .expect("dangling NodePtr: 已释放或跨 Graph2 使用");
+            }
+
+            #[cfg(not(debug_assertions))]
+            {
+                if ptr.graph != self.graph {
+                    panic!("dangling NodePtr: 跨 Graph2 使用");
+                }
+                // SAFETY:
+                // - ptr.key 来自 SlotMap::insert，且我们不做物理 remove，key 永远有效；
+                // - 上面额外校验 ptr.graph，避免跨 Graph2 误用导致的越界 UB。
+                return unsafe { slots.get_unchecked(ptr.key) };
+            }
         }
     }
 
@@ -327,18 +353,49 @@ mod node_store {
         }
 
         pub fn node(&self) -> &T {
-            // unsafe: NodeGuard 持有 graph 生命周期，保证 slots 指针有效。
             let slots = unsafe { &*(*self.graph).slots.get() };
-            slots
-                .get(self.key)
-                .expect("dangling NodeGuard: 节点已被移除")
+            ////////////////////////////////////////////////////////////////////////////////
+            // 性能关键点（anchors_slotmap）：
+            //
+            // - `NodeGuard` 在热路径中被频繁 `Deref`；
+            // - 若每次都走 `SlotMap::get`，会重复做 version/bounds 检查，在线性链路上放大为可见成本。
+            //
+            // 这里沿用与 `lookup_ptr` 相同的安全前提：
+            // - debug 下保留检查，release/bench 下用 get_unchecked。
+            ////////////////////////////////////////////////////////////////////////////////
+            #[cfg(debug_assertions)]
+            {
+                return slots
+                    .get(self.key)
+                    .expect("dangling NodeGuard: 节点已被移除");
+            }
+
+            #[cfg(not(debug_assertions))]
+            {
+                // SAFETY:
+                // - self.key 来自 SlotMap::insert 且不会被物理 remove，因此恒有效。
+                return unsafe { slots.get_unchecked(self.key) };
+            }
         }
 
         pub unsafe fn lookup_ptr(&self, ptr: NodePtr<T>) -> &T {
-            debug_assert_eq!(ptr.graph, self.graph);
-            // unsafe: graph 指针来自同一 NodeStore，确保访问合法。
             let slots = unsafe { &*(*self.graph).slots.get() };
-            slots.get(ptr.key).expect("dangling NodePtr: 节点已被移除")
+            #[cfg(debug_assertions)]
+            {
+                debug_assert_eq!(ptr.graph, self.graph);
+                return slots.get(ptr.key).expect("dangling NodePtr: 节点已被移除");
+            }
+
+            #[cfg(not(debug_assertions))]
+            {
+                if ptr.graph != self.graph {
+                    panic!("dangling NodePtr: 跨 Graph2 使用");
+                }
+                // SAFETY:
+                // - ptr.key 来自 SlotMap::insert 且不会被物理 remove，因此恒有效；
+                // - 校验 ptr.graph，避免跨 Graph2 误用导致的越界 UB。
+                return unsafe { slots.get_unchecked(ptr.key) };
+            }
         }
     }
 
