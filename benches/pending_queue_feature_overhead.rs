@@ -25,7 +25,8 @@ use anchors::{
     expert::{AnchorInner, Engine as AnchorEngine, OutputContext, Poll, UpdateContext},
     singlethread::{Anchor, AnchorToken, Engine, Var},
 };
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 /// 构造一个“按开关决定是否请求 child”的 AnchorInner。
 ///

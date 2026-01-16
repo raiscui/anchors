@@ -7,7 +7,8 @@ use anchors::{
 use smallvec::{SmallVec, smallvec};
 
 use anchors::im_rc::{Vector, ordmap, vector};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn stabilize_linear_nodes_simple(c: &mut Criterion) {
     for node_count in &[10, 100, 1000] {
@@ -496,7 +497,7 @@ fn ord_map(c: &mut Criterion) {
                     ),
                 ),
                 &(*node_count, *observed),
-                |b, (node_count, observed)| {
+                |b, (node_count, _observed)| {
                     let first_num = 0u64;
                     let node = first_num;
 

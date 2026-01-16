@@ -9,7 +9,8 @@ use anchors::{
     expert::MultiAnchor,
     singlethread::{Engine, Var},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 /// 单轮工作负载：set 一次、get 一次，触发稳定化。
 fn workload(strict: bool, c: &mut Criterion) {

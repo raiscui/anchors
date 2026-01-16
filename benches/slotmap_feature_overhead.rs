@@ -11,7 +11,8 @@ use anchors::{
     expert::MultiAnchor,
     singlethread::{Engine, Var},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn bench_slotmap_toggle(c: &mut Criterion) {
     let label = if cfg!(feature = "anchors_slotmap") {

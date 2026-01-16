@@ -1,5 +1,6 @@
 use anchors::singlethread::{Anchor, Engine, Var};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 /// ════════════════════════════════════════════════════════════════════════
 /// 节点规模组合，用 observed/unobserved 两种场景覆盖典型 workload。
@@ -11,21 +12,45 @@ fn bench_split_paths(c: &mut Criterion) {
     let mut group = c.benchmark_group("stabilize_linear_nodes_split");
     // 为 100 与 1000 做细分
     for &(count, observed) in &[(100usize, true), (100, false), (1000, true), (1000, false)] {
-        let label_build = format!(
-            "build_once_get/{count}/{}",
-            if observed { "obs" } else { "unobs" }
-        );
-        group.bench_function(BenchmarkId::new("build_once_get", &label_build), |b| {
-            b.iter(|| run_build_once_get(count, observed));
-        });
+        let label = if observed { "obs" } else { "unobs" };
 
-        let label_recalc = format!(
-            "recalc_only/{count}/{}",
-            if observed { "obs" } else { "unobs" }
+        // 1) 建链 + 重算：把构建成本单独拿出来看（这部分通常只在 UI 初次创建时发生）。
+        group.bench_function(
+            BenchmarkId::new("build_plus_recalc", format!("{count}/{label}")),
+            |b| {
+                b.iter(|| black_box(run_single_chain(count, observed)));
+            },
         );
-        group.bench_function(BenchmarkId::new("recalc_only", &label_recalc), |b| {
-            b.iter(|| run_recalc_only(count, observed));
-        });
+
+        // 2) 纯 get：只测读取路径（无 set），用于观察 ready fast-path 是否生效。
+        group.bench_function(
+            BenchmarkId::new("get_only", format!("{count}/{label}")),
+            |b| {
+                let mut engine = Engine::new_with_max_height(count + 16);
+                let (_source, tail) = build_linear_chain(&mut engine, count, observed);
+                // 先跑一次，让节点进入 ready 状态（否则首轮会包含完整 stabilize）。
+                black_box(engine.get(&tail));
+                b.iter(|| black_box(engine.get(&tail)));
+            },
+        );
+
+        // 3) 仅重算：只测 set + get 的传播路径（不重复建图），更接近“增量更新”的核心指标。
+        group.bench_function(
+            BenchmarkId::new("recalc_only", format!("{count}/{label}")),
+            |b| {
+                let mut engine = Engine::new_with_max_height(count + 16);
+                let (source, tail) = build_linear_chain(&mut engine, count, observed);
+                // 预热一次，避免把首次 stabilize 计入每次迭代。
+                black_box(engine.get(&tail));
+
+                let mut update_number: u64 = 0;
+                b.iter(|| {
+                    update_number = update_number.wrapping_add(1);
+                    source.set(update_number);
+                    black_box(engine.get(&tail))
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -37,10 +62,21 @@ fn bench_stabilize_linear_nodes_simple(c: &mut Criterion) {
         for &observed in OBSERVED_STATES.iter() {
             let label = if observed { "observed" } else { "unobserved" };
             group.bench_with_input(
-                BenchmarkId::new(label, node_count),
+                // 为了和原版输出对齐，把路径做成 `.../1000/unobserved` 的顺序。
+                BenchmarkId::new(node_count.to_string(), label),
                 &(node_count, observed),
                 |b, &(count, observed)| {
-                    b.iter(|| run_single_chain(count, observed));
+                    // 只测“set + get”的增量重算，不把建图成本混进每次迭代。
+                    let mut engine = Engine::new_with_max_height(count + 16);
+                    let (source, tail) = build_linear_chain(&mut engine, count, observed);
+                    black_box(engine.get(&tail));
+
+                    let mut update_number: u64 = 0;
+                    b.iter(|| {
+                        update_number = update_number.wrapping_add(1);
+                        source.set(update_number);
+                        black_box(engine.get(&tail))
+                    });
                 },
             );
         }
@@ -54,8 +90,7 @@ fn run_single_chain(node_count: usize, observed: bool) -> u64 {
     let mut engine = Engine::new_with_max_height(node_count + 16);
     let (source, tail) = build_linear_chain(&mut engine, node_count, observed);
     // 先确保初始取值无偏差，避免优化器省略。
-    let mut baseline = engine.get(&tail);
-    baseline = black_box(baseline);
+    let baseline = black_box(engine.get(&tail));
     source.set(baseline + 1);
     black_box(engine.get(&tail))
 }
@@ -70,31 +105,12 @@ fn build_linear_chain(
     let source = Var::new(0u64);
     let mut node = source.watch();
     for _ in 0..node_count {
-        node = node.map(|value| value + 1);
+        node = node.map(|value| value + black_box(1u64));
     }
     if observed {
         engine.mark_observed(&node);
     }
     (source, node)
-}
-
-/// 一次构建，随后仅 get，测读取路径；避免把建图成本平均到节点。
-fn run_build_once_get(node_count: usize, observed: bool) -> u64 {
-    let mut engine = Engine::new_with_max_height(node_count + 16);
-    let (source, tail) = build_linear_chain(&mut engine, node_count, observed);
-    engine.get(&tail);
-    // 变更源，触发一次稳定
-    source.set(1);
-    engine.get(&tail)
-}
-
-/// 构建后仅反复 set + stabilize，度量重算链路，不重新建图。
-fn run_recalc_only(node_count: usize, observed: bool) -> u64 {
-    let mut engine = Engine::new_with_max_height(node_count + 16);
-    let (source, tail) = build_linear_chain(&mut engine, node_count, observed);
-    engine.get(&tail);
-    source.set(1);
-    engine.get(&tail)
 }
 
 criterion_group!(
