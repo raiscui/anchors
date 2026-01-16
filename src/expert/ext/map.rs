@@ -2,6 +2,24 @@ use crate::expert::{
     Anchor, AnchorHandle, AnchorInner, Engine, OutputContext, Poll, UpdateContext,
 };
 use std::panic::Location;
+use std::sync::OnceLock;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug 开关缓存
+//
+// 背景：
+// - `Map::poll_updated` 是最热路径之一（每个链节点每次 stabilize 都会进来）。
+// - 若直接在热路径里反复调用 `emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP")`，
+//   即便环境变量已经被 `emg_debug_env` 缓存，仍会产生大量字典查找与字符串比较开销。
+//
+// 策略：
+// - 将开关值在进程内缓存为 OnceLock<bool>，避免每个节点都重复 lookup。
+// ─────────────────────────────────────────────────────────────────────────────
+#[inline]
+fn debug_map_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP"))
+}
 
 pub struct Map<A, F, Out> {
     pub(super) f: F,
@@ -49,6 +67,9 @@ macro_rules! impl_tuple_map {
                 &mut self,
                 ctx: &mut G,
             ) -> Poll {
+                // 只做一次开关判定，避免在热路径里重复查询 debug env。
+                let debug_map = debug_map_enabled();
+
                 // 已进入降级冻结：保持旧输出，避免重复 request 失效 token。
                 if self.degraded_on_invalid {
                     self.output_stale = false;
@@ -63,7 +84,7 @@ macro_rules! impl_tuple_map {
                     return Poll::Unchanged;
                 }
 
-                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP") {
+                if debug_map {
                     println!(
                         "MAP poll output_stale={} has_output={} loc={:?}",
                         self.output_stale,
@@ -136,7 +157,7 @@ macro_rules! impl_tuple_map {
                 if self.output.is_none() || found_updated {
                     let new_val = Some((self.f)($(ctx.get(&self.anchors.$num)),+));
                     if new_val != self.output {
-                        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP") {
+                        if debug_map {
                             println!(
                                 "MAP 更新 loc={:?} type={} (值已变更)",
                                 self.location,

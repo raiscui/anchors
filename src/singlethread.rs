@@ -13,6 +13,7 @@ mod graph2;
 mod test;
 
 use graph2::{Graph2, Graph2Guard, NodeGuard, NodeKey, RecalcState};
+#[cfg(debug_assertions)]
 use tracing::trace;
 
 pub use graph2::AnchorHandle;
@@ -934,6 +935,7 @@ impl Engine {
     }
 
     pub(crate) fn update_dirty_marks(&mut self) {
+        #[cfg(debug_assertions)]
         trace!("update_dirty_marks");
         self.graph.with(|graph| {
             let dirty_marks = std::mem::take(&mut *self.dirty_marks.borrow_mut());
@@ -957,6 +959,7 @@ impl Engine {
     /// Ensure any Observed nodes are up-to-date, recalculating dependencies as necessary. You
     /// should rarely need to call this yourself; `Engine::get` calls it automatically.
     pub fn stabilize(&mut self) {
+        #[cfg(debug_assertions)]
         trace!("stabilize");
         self.update_dirty_marks();
         self.generation.increment();
@@ -984,6 +987,7 @@ impl Engine {
         let mut extra_rounds: usize = 0;
         while !self.dirty_marks.borrow().is_empty() && extra_rounds < MAX_EXTRA_ROUNDS {
             extra_rounds = extra_rounds.saturating_add(1);
+            #[cfg(debug_assertions)]
             trace!(
                 "stabilize: extra_rounds={} reason=dirty_marks_not_empty",
                 extra_rounds
@@ -999,6 +1003,7 @@ impl Engine {
                 "stabilize: dirty_marks 仍未收敛（已达额外轮次上限），本轮将返回可能的中间态；建议排查是否存在 stabilize 期间反复 set 的非收敛依赖"
             );
         }
+        #[cfg(debug_assertions)]
         trace!("....stabilize");
     }
 
@@ -1008,6 +1013,7 @@ impl Engine {
     }
 
     fn stabilize_with_pending_queue(&self) {
+        #[cfg(debug_assertions)]
         trace!("stabilize0");
         self.graph.with(|graph| {
             // ─────────────────────────────────────────────────────────────
@@ -1086,6 +1092,7 @@ impl Engine {
                     }
                 }
                 let calculation_complete = if graph2::height(node) == height {
+                    #[cfg(debug_assertions)]
                     trace!("recalculate height");
 
                     // TODO with new graph we can automatically relocate nodes if their height changes
@@ -1132,6 +1139,7 @@ impl Engine {
         });
         #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
         self.process_pending_requests();
+        #[cfg(debug_assertions)]
         trace!("...stabilize0");
     }
 
@@ -1407,7 +1415,7 @@ impl Engine {
             fn drop(&mut self) {
                 if let Some(node) = self.graph.get(self.node_key) {
                     node.anchor_locked.set(false);
-                    if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEUE") {
+                    if debug_requeue_enabled() {
                         println!(
                             "REQUEUE check node={:?} pending_recalc={}",
                             node.debug_info.get()._to_string(),
@@ -1416,7 +1424,7 @@ impl Engine {
                     }
                     // 若锁期间收到“补偿重算”标记，解锁后再入队自身，既避免重入也不丢更新。
                     if node.pending_recalc.get() {
-                        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEUE") {
+                        if debug_requeue_enabled() {
                             println!(
                                 "REQUEUE pending node={:?} state_before={:?} height={}",
                                 node.debug_info.get()._to_string(),
@@ -1467,7 +1475,7 @@ impl Engine {
         node.anchor_locked.set(true);
 
         // 可选调试：设置 `ANCHORS_RECALC_TRACE=1` 可打印正在重算的节点信息，便于跟踪依赖链。
-        if emg_debug_env::bool_lenient("ANCHORS_RECALC_TRACE") {
+        if recalc_trace_enabled() {
             println!("RECALC {:?}", node.debug_info.get()._to_string());
         }
 
@@ -1879,6 +1887,87 @@ impl Default for Engine {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug 开关（热路径）缓存
+//
+// 背景：
+// - `mark_dirty/request_node/recalculate` 都是“每个节点每次 stabilize 都会走”的热路径。
+// - 若在这些路径里直接 `bool_lenient("XXX")`，会产生大量字符串查找/比较开销。
+//
+// 策略：
+// - 在 debug_assertions 下才允许通过 env 打印调试信息。
+// - release/bench 下直接返回 false，保证零运行时开销。
+// ─────────────────────────────────────────────────────────────────────────────
+#[inline]
+fn debug_mark_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_MARK"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn debug_dirty_flow_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_DIRTY_FLOW"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn debug_request_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEST"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn debug_requeue_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEUE"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn recalc_trace_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_RECALC_TRACE"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
 // 全局可用的锁 trace 开关，供 mark_dirty 等非 recalc 路径复用。
 fn lock_trace_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
@@ -1888,9 +1977,10 @@ fn lock_trace_enabled() -> bool {
 // skip_self = true indicates output has *definitely* changed, but node has been recalculated
 // skip_self = false indicates node has not yet been recalculated
 fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) {
+    #[cfg(debug_assertions)]
     trace!("mark_dirty {:?} ", node.debug_info.get(),);
     if skip_self {
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MARK") {
+        if debug_mark_enabled() {
             let parents_len = node.parents_len();
             println!(
                 "mark_dirty skip_self node={:?} parents={}",
@@ -1898,12 +1988,13 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
                 parents_len
             );
         }
+        let child = node.key();
         node.drain_parents(|parent| {
-            push_pending_dirty(parent, node.key());
             if parent.anchor_locked.get() {
                 // 父节点正在重算，记录一次补偿重算请求，解锁后再统一入队，避免 strict 模式下的重入 panic。
+                push_pending_dirty(parent, child);
                 parent.pending_recalc.set(true);
-                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_DIRTY_FLOW") {
+                if debug_dirty_flow_enabled() {
                     println!(
                         "DIRTY flow skip queue (parent locked) child={:?} parent={:?}",
                         node.debug_info.get()._to_string(),
@@ -1922,6 +2013,12 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
                 graph.queue_recalc_force(parent);
                 return;
             }
+
+            // 常规路径：父节点未锁定时，直接下发 dirty，避免写入 pending_dirty 再补偿。
+            if let Some(anchor_impl) = unsafe { (*parent.anchor.get()).as_mut() } {
+                anchor_impl.dirty(&child);
+            }
+
             graph.queue_recalc(parent);
             mark_dirty0(graph, parent);
         });
@@ -1934,7 +2031,7 @@ fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
     let mut pending = parent.pending_dirty.borrow_mut();
     if !pending.contains(&child) {
         pending.push(child);
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_DIRTY_FLOW") {
+        if debug_dirty_flow_enabled() {
             println!(
                 "PENDING_DIRTY child={:?} ({}) -> parent={:?} ({})",
                 child.raw_token(),
@@ -1950,6 +2047,7 @@ fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
 }
 
 fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
+    #[cfg(debug_assertions)]
     trace!("mark_dirty0 {:?}", next);
     let id = next.key();
     if Engine::check_observed_raw(next) != ObservedState::Unnecessary {
@@ -1959,7 +2057,7 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
         }
     } else if graph2::recalc_state(next) == RecalcState::Ready {
         graph2::needs_recalc(next);
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_MARK") {
+        if debug_mark_enabled() {
             println!(
                 "mark_dirty0 unnecessary node={:?} parents={}",
                 next.debug_info.get()._to_string(),
@@ -1967,11 +2065,21 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
             );
         }
         next.for_each_parent(|parent| {
-            push_pending_dirty(parent, id);
-            if !parent.anchor_locked.get() {
-                graph.queue_recalc(parent);
-                mark_dirty0(graph, parent);
+            if parent.anchor_locked.get() {
+                // 父节点正在重算：只记录 dirty，等待解锁后补偿入队。
+                push_pending_dirty(parent, id);
+                parent.pending_recalc.set(true);
+                graph.queue_recalc_force(parent);
+                return;
             }
+
+            // 常规路径：直接下发 dirty，避免写入 pending_dirty 再补偿。
+            if let Some(anchor_impl) = unsafe { (*parent.anchor.get()).as_mut() } {
+                anchor_impl.dirty(&id);
+            }
+
+            graph.queue_recalc(parent);
+            mark_dirty0(graph, parent);
         });
     }
 }
@@ -2208,7 +2316,7 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             }
         };
 
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEST") {
+        if debug_request_enabled() {
             println!(
                 "REQUEST parent_token={} parent={:?} child_token={} child={:?} ready={:?} height_ok={}",
                 self.node.key().raw_token(),
@@ -2226,7 +2334,7 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
             self.graph.queue_recalc(child);
-            if emg_debug_env::bool_lenient("ANCHORS_DEBUG_REQUEST") {
+            if debug_request_enabled() {
                 println!(
                     "REQUEST pending parent_token={} parent={:?} child_token={} child={:?} state={:?}",
                     self.node.key().raw_token(),
@@ -2305,6 +2413,7 @@ impl<I: AnchorInner<Engine> + 'static> GenericAnchor for I {
             location: self.debug_location(),
             type_info: std::any::type_name::<I>(),
         };
+        #[cfg(debug_assertions)]
         trace!("debug_info: {:?}", &ad._to_string());
         ad
     }

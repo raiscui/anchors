@@ -1,8 +1,62 @@
 use super::{AnchorDebugInfo, Engine, EngineContext, Generation, GenericAnchor};
+#[cfg(feature = "anchors_slotmap")]
+use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
-#[cfg(feature = "anchors_slotmap")]
-use std::{backtrace::Backtrace, sync::OnceLock};
+use std::sync::OnceLock;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug 开关缓存（热路径）
+//
+// 背景：
+// - `add_clean_parent/queue_recalc/recalc_pop_next` 会在稳定化过程中被频繁调用；
+// - 若在这些路径里反复查询 env（字符串查找/比较），会放大到明显的常数开销。
+//
+// 策略：
+// - 仅在 debug_assertions 下允许通过 env 打印调试日志；
+// - release/bench 下直接返回 false，保证热路径零额外开销。
+// ─────────────────────────────────────────────────────────────────────────────
+#[inline]
+fn debug_parent_link_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_LINK"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn debug_parent_flow_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_FLOW"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn debug_queue_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
 
 #[cfg(feature = "anchors_slotmap")]
 #[derive(Debug)]
@@ -768,7 +822,7 @@ impl<'a> NodeGuard<'a> {
         } else {
             self.ptrs.clean_parents.borrow_mut().push(parent.make_ptr())
         }
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_LINK") {
+        if debug_parent_link_enabled() {
             // 调试输出：带上节点的 debug_info，便于定位父子是谁
             let child_dbg = self.debug_info.get()._to_string();
             let parent_dbg = parent.debug_info.get()._to_string();
@@ -793,7 +847,7 @@ impl<'a> NodeGuard<'a> {
                 .iter()
                 .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() })),
         );
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_FLOW") {
+        if debug_parent_flow_enabled() {
             println!(
                 "CLEAN_PARENTS node={:?} count={}",
                 self.debug_info.get()._to_string(),
@@ -835,7 +889,7 @@ impl<'a> NodeGuard<'a> {
         let res = self.clean_parents();
         self.ptrs.clean_parent0.set(None);
         self.ptrs.clean_parents.borrow_mut().clear();
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENT_FLOW") {
+        if debug_parent_flow_enabled() {
             println!(
                 "DRAIN_CLEAN_PARENTS node={:?} drained={}",
                 self.debug_info.get()._to_string(),
@@ -973,7 +1027,7 @@ impl<'gg> Graph2Guard<'gg> {
                 // │ 这些节点若继续出队将触发重算 panic，故在此直接跳过。           │
                 // └─────────────────────────────────────────────────────────────┘
                 if unsafe { (*node.anchor.get()).is_none() } {
-                    if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
+                    if debug_queue_enabled() {
                         println!(
                             "QUEUE POP skip freed token={:?} debug={}",
                             node.key().raw_token(),
@@ -991,7 +1045,7 @@ impl<'gg> Graph2Guard<'gg> {
                     }
                     continue;
                 }
-                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
+                if debug_queue_enabled() {
                     println!(
                         "QUEUE POP height={} token={:?} debug={}",
                         self.graph.recalc_min_height.get(),
@@ -1037,7 +1091,7 @@ impl<'gg> Graph2Guard<'gg> {
         if node.ptrs.recalc_state.get() == RecalcState::Pending {
             let node_height = height(node);
             if self.graph.recalc_min_height.get() > node_height {
-                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
+                if debug_queue_enabled() {
                     println!(
                         "queue_recalc requeue pending (min_height={} > node_height={}) token={:?} debug={}",
                         self.graph.recalc_min_height.get(),
@@ -1049,7 +1103,7 @@ impl<'gg> Graph2Guard<'gg> {
                 // 若节点确实已丢队列，dequeue_calc 会把它恢复到 Ready；随后走常规入队逻辑。
                 dequeue_calc(self.graph, node);
             } else {
-                if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
+                if debug_queue_enabled() {
                     println!(
                         "queue_recalc skip (already pending) token={:?} debug={}",
                         node.key().raw_token(),
@@ -1074,7 +1128,7 @@ impl<'gg> Graph2Guard<'gg> {
             node.pending_recalc.set(true);
             return;
         }
-        if emg_debug_env::bool_lenient("ANCHORS_DEBUG_QUEUE") {
+        if debug_queue_enabled() {
             println!(
                 "queue_recalc enqueue token={:?} height={} debug={}",
                 node.key().raw_token(),
