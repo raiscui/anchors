@@ -487,36 +487,76 @@ mod node_store {
                 return true;
             }
 
-            // 尝试非阻塞清理必要子节点，若外部仍借用则跳过以避免 RefCell panic。
-            let drained_children =
-                if let Ok(mut children) = guard.ptrs.necessary_children.try_borrow_mut() {
-                    for child in children.iter() {
-                        let count = &unsafe { guard.0.lookup_ptr(*child) }.necessary_count;
-                        count.set(count.get().saturating_sub(1));
-                    }
-                    children.clear();
-                    true
-                } else {
-                    false
-                };
-            if !drained_children {
+            ////////////////////////////////////////////////////////////////////////////////
+            // 关键修复：free/remove 时必须解绑 “child -> parent” 的 clean_parents 指针。
+            //
+            // 背景：
+            // - 依赖边是双向维护的：
+            //   - parent.ptrs.necessary_children 记录输入 child
+            //   - child.ptrs.clean_parents 记录依赖者 parent
+            // - 过去我们只清了 parent.necessary_children，但没有把 parent 从 child.clean_parents 移除。
+            // - 在 slotmap/free list “复用槽位”后，旧的 NodePtr 会指向新的节点内容，
+            //   导致 child 更新时把 dirty 误投递给新节点（常见表现：Constant/Var 的 dirty 报错刷屏）。
+            //
+            // 做法：
+            // - 在真正进入 free list 之前，先把本节点从所有 children 的 clean_parents 中移除；
+            // - 全程使用 try_borrow_mut：一旦遇到外部借用冲突，放弃本次 remove，等待下次重试。
+            ////////////////////////////////////////////////////////////////////////////////
+
+            // 预检：父列表（依赖者列表）同样用 try_borrow_mut，避免外层仍持有借用导致 panic。
+            let Ok(mut self_parents) = guard.ptrs.clean_parents.try_borrow_mut() else {
                 graph.inc_gc_skipped();
                 return false;
+            };
+
+            // 尝试非阻塞清理必要子节点，若外部仍借用则跳过以避免 RefCell panic。
+            let Ok(mut children) = guard.ptrs.necessary_children.try_borrow_mut() else {
+                graph.inc_gc_skipped();
+                return false;
+            };
+
+            // 先拷贝一份 children 列表：后续会修改 children 本身（clear）。
+            let children_snapshot: Vec<NodePtr<super::Node>> = children.iter().copied().collect();
+
+            // 预检：确保所有 child 的 clean_parents 都可写，避免“解绑做到一半就失败”的不一致状态。
+            for child_ptr in &children_snapshot {
+                let child = unsafe { guard.0.lookup_ptr(*child_ptr) };
+                if child.ptrs.clean_parents.try_borrow_mut().is_err() {
+                    graph.inc_gc_skipped();
+                    return false;
+                }
             }
 
-            guard.ptrs.clean_parent0.set(None);
-            // 父列表同理，避免在外层持有不可预期借用时触发崩溃。
-            let drained_parents = if let Ok(mut parents) = guard.ptrs.clean_parents.try_borrow_mut()
-            {
-                parents.clear();
-                true
-            } else {
-                false
-            };
-            if !drained_parents {
-                graph.inc_gc_skipped();
-                return false;
+            // 执行解绑：从每个 child.clean_parents 移除当前 parent 指针，并维护 necessary_count。
+            for child_ptr in &children_snapshot {
+                let child = unsafe { guard.0.lookup_ptr(*child_ptr) };
+
+                // fast path：若 parent 恰好在 clean_parent0，直接清空。
+                if child.ptrs.clean_parent0.get().is_some_and(|k| k.ptr == ptr) {
+                    child.ptrs.clean_parent0.set(None);
+                }
+
+                // slow path：在 clean_parents Vec 中移除所有等于 ptr 的条目（允许重复）。
+                let Ok(mut child_parents) = child.ptrs.clean_parents.try_borrow_mut() else {
+                    // 兜底：预检已通过，这里不应失败；若失败，视为并发借用冲突，延后回收。
+                    graph.inc_gc_skipped();
+                    return false;
+                };
+                if !child_parents.is_empty() {
+                    child_parents.retain(|p| p.ptr != ptr);
+                }
+
+                child
+                    .necessary_count
+                    .set(child.necessary_count.get().saturating_sub(1));
             }
+
+            // 清空 parent 的必要子节点列表（输入边）。
+            children.clear();
+
+            // 清空 parent 的父列表（被依赖者列表）。
+            guard.ptrs.clean_parent0.set(None);
+            self_parents.clear();
 
             ////////////////////////////////////////////////////////////////////////////////
             // 关键：节点即将进入 free list，必须确保它已经彻底从 recalc 队列摘除。
@@ -763,8 +803,8 @@ impl NodeKey {
 
 pub struct NodePtrs {
     /// first parent, remaining parents. unsorted, duplicates may exist
-    clean_parent0: Cell<Option<NodePtr>>,
-    clean_parents: RefCell<Vec<NodePtr>>,
+    clean_parent0: Cell<Option<NodeKey>>,
+    clean_parents: RefCell<Vec<NodeKey>>,
 
     graph: *const Graph2,
 
@@ -874,10 +914,11 @@ impl<'a> NodeGuard<'a> {
     }
 
     pub fn add_clean_parent(self, parent: NodeGuard<'a>) {
+        let parent_key = parent.key();
         if self.ptrs.clean_parent0.get().is_none() {
-            self.ptrs.clean_parent0.set(Some(parent.make_ptr()))
+            self.ptrs.clean_parent0.set(Some(parent_key))
         } else {
-            self.ptrs.clean_parents.borrow_mut().push(parent.make_ptr())
+            self.ptrs.clean_parents.borrow_mut().push(parent_key)
         }
         if debug_parent_link_enabled() {
             // 调试输出：带上节点的 debug_info，便于定位父子是谁
@@ -893,17 +934,57 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
+    pub fn remove_clean_parent_ptr(&self, parent_ptr: NodePtr) {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 解除 child -> parent 的依赖者指针。
+        //
+        // 为什么要做：
+        // - clean_parents 的内容会在 mark_dirty() 时被 drain；
+        // - 但如果 parent 被 unrequest/free 且 child 长时间不 dirty，
+        //   旧 parent 指针会“卡住”，在 slotmap/free list 复用槽位后变成误伤。
+        ////////////////////////////////////////////////////////////////////////////////
+        if self
+            .ptrs
+            .clean_parent0
+            .get()
+            .is_some_and(|k| k.ptr == parent_ptr)
+        {
+            self.ptrs.clean_parent0.set(None);
+        }
+        let mut parents = self.ptrs.clean_parents.borrow_mut();
+        if !parents.is_empty() {
+            parents.retain(|p| p.ptr != parent_ptr);
+        }
+    }
+
+    #[inline]
+    fn live_parent_from_key(&self, parent_key: NodeKey) -> Option<NodeGuard<'a>> {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 关键：clean_parents 存的是 NodeKey（包含 token），必须校验 token 才能避免：
+        // - 节点 free 后进入 free list
+        // - 槽位被复用后 slot_token 增长
+        // - child 仍持有旧 parent 指针，导致 dirty 误投递到新节点
+        ////////////////////////////////////////////////////////////////////////////////
+        let parent = NodeGuard(unsafe { parent_key.ptr.lookup_unchecked() });
+        if parent.slot_token.get() != parent_key.token {
+            return None;
+        }
+        // anchor 已置空的节点不应再参与 dirty 传播/重算入队。
+        if unsafe { (*parent.anchor.get()).is_none() } {
+            return None;
+        }
+        Some(parent)
+    }
+
     pub fn clean_parents(&self) -> Vec<NodeGuard<'a>> {
         let mut out = Vec::new();
         if let Some(first) = self.ptrs.clean_parent0.get() {
-            out.push(NodeGuard(unsafe { first.lookup_unchecked() }));
+            if let Some(parent) = self.live_parent_from_key(first) {
+                out.push(parent);
+            }
         }
         let parents = self.ptrs.clean_parents.borrow();
-        out.extend(
-            parents
-                .iter()
-                .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() })),
-        );
+        out.extend(parents.iter().filter_map(|k| self.live_parent_from_key(*k)));
         if debug_parent_flow_enabled() {
             println!(
                 "CLEAN_PARENTS node={:?} count={}",
@@ -917,10 +998,14 @@ impl<'a> NodeGuard<'a> {
     /// 遍历父节点，不分配临时 Vec，在线性链路上更轻量。
     pub fn for_each_parent(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         if let Some(first) = self.ptrs.clean_parent0.get() {
-            f(NodeGuard(unsafe { first.lookup_unchecked() }));
+            if let Some(parent) = self.live_parent_from_key(first) {
+                f(parent);
+            }
         }
-        for ptr in self.ptrs.clean_parents.borrow().iter().copied() {
-            f(NodeGuard(unsafe { ptr.lookup_unchecked() }));
+        for key in self.ptrs.clean_parents.borrow().iter().copied() {
+            if let Some(parent) = self.live_parent_from_key(key) {
+                f(parent);
+            }
         }
     }
 
@@ -928,11 +1013,15 @@ impl<'a> NodeGuard<'a> {
     pub fn drain_parents(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         if let Some(first) = self.ptrs.clean_parent0.get() {
             self.ptrs.clean_parent0.set(None);
-            f(NodeGuard(unsafe { first.lookup_unchecked() }));
+            if let Some(parent) = self.live_parent_from_key(first) {
+                f(parent);
+            }
         }
         let mut parents = self.ptrs.clean_parents.borrow_mut();
-        for ptr in parents.drain(..) {
-            f(NodeGuard(unsafe { ptr.lookup_unchecked() }));
+        for key in parents.drain(..) {
+            if let Some(parent) = self.live_parent_from_key(key) {
+                f(parent);
+            }
         }
     }
 
@@ -970,7 +1059,12 @@ impl<'a> NodeGuard<'a> {
         let child_ptr = child.make_ptr();
         if let Ok(i) = necessary_children.binary_search(&child_ptr) {
             necessary_children.remove(i);
-            child.necessary_count.set(child.necessary_count.get() - 1)
+            child
+                .necessary_count
+                .set(child.necessary_count.get().saturating_sub(1));
+
+            // 同步解绑 child -> parent，避免产生“只删了一半边”的悬挂 parent 指针。
+            child.remove_clean_parent_ptr(self.make_ptr());
         }
     }
 
@@ -983,10 +1077,29 @@ impl<'a> NodeGuard<'a> {
     }
 
     pub fn drain_necessary_children(&self) -> Vec<NodeGuard<'a>> {
+        let parent_ptr = self.make_ptr();
         let mut children = self.ptrs.necessary_children.borrow_mut();
         for child in children.iter() {
-            let count = &unsafe { self.0.lookup_ptr(*child) }.necessary_count;
-            count.set(count.get().saturating_sub(1));
+            let child_node = unsafe { self.0.lookup_ptr(*child) };
+
+            // 维护必要性计数：与 add_necessary_child 对称。
+            child_node
+                .necessary_count
+                .set(child_node.necessary_count.get().saturating_sub(1));
+
+            // 关键：解绑 child -> parent，避免 free list 复用槽位后误 dirty。
+            if child_node
+                .ptrs
+                .clean_parent0
+                .get()
+                .is_some_and(|k| k.ptr == parent_ptr)
+            {
+                child_node.ptrs.clean_parent0.set(None);
+            }
+            let mut child_parents = child_node.ptrs.clean_parents.borrow_mut();
+            if !child_parents.is_empty() {
+                child_parents.retain(|p| p.ptr != parent_ptr);
+            }
         }
         let collected = children
             .iter()
@@ -2213,5 +2326,45 @@ mod test {
             assert_eq!(c_token, c.token());
             assert_eq!(d_token, d.token());
         }
+    }
+
+    #[test]
+    fn drop_parent_detaches_from_child_clean_parents() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 回归测试：避免 “free 后槽位复用 -> child 仍持有旧 parent NodePtr -> dirty 误投递”。
+        //
+        // 关键断言：
+        // - parent drop（触发 free/remove）后，child.clean_parents 不应再包含该 parent 指针。
+        ////////////////////////////////////////////////////////////////////////////////
+        use crate::expert::AnchorHandle;
+
+        let graph = Graph2::new(10);
+        let child_handle = graph.insert_testing();
+        let parent_handle = graph.insert_testing();
+
+        let child_token = child_handle.token();
+        let parent_token = parent_handle.token();
+
+        graph.with(|guard| {
+            let child = guard.get(child_token).expect("child 应当存在");
+            let parent = guard.get(parent_token).expect("parent 应当存在");
+
+            // 手工构造一条边：parent 依赖 child
+            // - child 记录 parent（用于 dirty 时通知依赖者）
+            // - parent 记录 child（用于生命周期/必要性跟踪）
+            child.add_clean_parent(parent);
+            parent.add_necessary_child(child);
+
+            assert_eq!(vec![parent], to_vec(child.clean_parents()));
+        });
+
+        // drop parent 触发 free/remove；修复前：child.clean_parents 会残留旧 parent 指针。
+        drop(parent_handle);
+
+        graph.with(|guard| {
+            let child = guard.get(child_token).expect("child 应当仍存在");
+            let empty: Vec<NodeGuard<'_>> = vec![];
+            assert_eq!(empty, to_vec(child.clean_parents()));
+        });
     }
 }
