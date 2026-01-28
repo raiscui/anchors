@@ -515,12 +515,18 @@ mod node_store {
                 return false;
             };
 
-            // 先拷贝一份 children 列表：后续会修改 children 本身（clear）。
-            let children_snapshot: Vec<NodePtr<super::Node>> = children.iter().copied().collect();
+            ////////////////////////////////////////////////////////////////////////////////
+            // 性能改良：避免为 children_snapshot 分配 Vec
+            //
+            // 说明：
+            // - 原实现会 `collect()` 一份 children_snapshot 用于两次遍历（预检/解绑）；
+            // - remove() 在 UI 高频增删时会被大量调用，这个额外分配会成为稳定常数开销；
+            // - 这里直接对 `children` 做两次迭代，避免额外分配。
+            ////////////////////////////////////////////////////////////////////////////////
 
             // 预检：确保所有 child 的 clean_parents 都可写，避免“解绑做到一半就失败”的不一致状态。
-            for child_ptr in &children_snapshot {
-                let child = unsafe { guard.0.lookup_ptr(*child_ptr) };
+            for child_ptr in children.iter().copied() {
+                let child = unsafe { guard.0.lookup_ptr(child_ptr) };
                 if child.ptrs.clean_parents.try_borrow_mut().is_err() {
                     graph.inc_gc_skipped();
                     return false;
@@ -528,8 +534,8 @@ mod node_store {
             }
 
             // 执行解绑：从每个 child.clean_parents 移除当前 parent 指针，并维护 necessary_count。
-            for child_ptr in &children_snapshot {
-                let child = unsafe { guard.0.lookup_ptr(*child_ptr) };
+            for child_ptr in children.iter().copied() {
+                let child = unsafe { guard.0.lookup_ptr(child_ptr) };
 
                 // fast path：若 parent 恰好在 clean_parent0，直接清空。
                 if child.ptrs.clean_parent0.get().is_some_and(|k| k.ptr == ptr) {
@@ -915,10 +921,35 @@ impl<'a> NodeGuard<'a> {
 
     pub fn add_clean_parent(self, parent: NodeGuard<'a>) {
         let parent_key = parent.key();
-        if self.ptrs.clean_parent0.get().is_none() {
-            self.ptrs.clean_parent0.set(Some(parent_key))
+        ////////////////////////////////////////////////////////////////////////////////
+        // 性能改良：去重 + 刷新 stale key
+        //
+        // 背景：
+        // - `clean_parent0/clean_parents` 会被 `set_min_height` / mark_dirty / remove 路径频繁遍历；
+        // - 若同一个 parent 被重复 push，会让上述路径的工作量线性放大，最终体现为单次 click 变慢。
+        //
+        // 规则：
+        // - 若已存在同 ptr 的 parent：
+        //   - token 相同：直接跳过（避免重复）；
+        //   - token 不同：说明槽位已复用，旧 key stale；用新 key 覆盖旧 key（保证依赖边正确）。
+        ////////////////////////////////////////////////////////////////////////////////
+        if let Some(first) = self.ptrs.clean_parent0.get() {
+            if first.ptr == parent_key.ptr {
+                if first.token != parent_key.token {
+                    self.ptrs.clean_parent0.set(Some(parent_key));
+                }
+            } else {
+                let mut parents = self.ptrs.clean_parents.borrow_mut();
+                if let Some(existing) = parents.iter_mut().find(|k| k.ptr == parent_key.ptr) {
+                    if existing.token != parent_key.token {
+                        *existing = parent_key;
+                    }
+                } else {
+                    parents.push(parent_key);
+                }
+            }
         } else {
-            self.ptrs.clean_parents.borrow_mut().push(parent_key)
+            self.ptrs.clean_parent0.set(Some(parent_key));
         }
         if debug_parent_link_enabled() {
             // 调试输出：带上节点的 debug_info，便于定位父子是谁
@@ -1829,35 +1860,61 @@ pub fn ensure_height_increases<'a>(
 }
 
 fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
-    // 剪枝：高度已满足，无需递归向上回填。
+    // 剪枝：高度已满足，无需向上回填。
     if height(node) >= min_height {
         return Ok(());
     }
-    if node.visited.get() {
-        return Err(());
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // 性能改良：把“递归 + 每层分配 Vec”改为“显式栈 DFS”
+    //
+    // 背景：
+    // - `ensure_height_increases` 会在 request 依赖时调用本函数；
+    // - 在深链/高频 request 场景里，递归 + 临时 Vec 分配会产生显著常数开销；
+    // - pprof 里 `set_min_height` 会占很高的 flat%。
+    //
+    // 做法：
+    // - 用一个 Vec 作为工作栈，一次分配复用整条传播；
+    // - 仍然沿用 `node.visited` 做环检测；
+    // - 发现环时不立刻 return（否则会遗留 visited=true），而是标记 did_err，
+    //   继续跑完栈以清理 visited，最后再返回 Err。
+    ////////////////////////////////////////////////////////////////////////////////
+    enum Step<'a> {
+        Enter(NodeGuard<'a>, usize),
+        Exit(NodeGuard<'a>),
     }
-    // 进入递归时先打上 visited 标记，退出前无论成功/失败都要清理，避免后续调用误判成环。
-    node.visited.set(true);
-    let res = (|| {
-        if height(node) < min_height {
-            node.ptrs.height.set(min_height);
-            let mut did_err = false;
-            // 迭代式堆栈，避免深链递归爆栈与重复 visited 标记。
-            let mut stack = Vec::with_capacity(4);
-            node.for_each_parent(|p| stack.push(p));
-            while let Some(parent) = stack.pop() {
-                if let Err(_loop_ids) = set_min_height(parent, min_height + 1) {
-                    did_err = true;
-                }
+
+    let mut stack: Vec<Step<'_>> = Vec::with_capacity(16);
+    stack.push(Step::Enter(node, min_height));
+
+    let mut did_err = false;
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Exit(n) => {
+                n.visited.set(false);
             }
-            if did_err {
-                return Err(());
+            Step::Enter(n, min_h) => {
+                // 剪枝：已有更大的高度，无需继续向上回填。
+                if height(n) >= min_h {
+                    continue;
+                }
+                // 环检测：只标记错误，继续清理 visited。
+                if n.visited.get() {
+                    did_err = true;
+                    continue;
+                }
+
+                n.visited.set(true);
+                n.ptrs.height.set(min_h);
+                stack.push(Step::Exit(n));
+
+                let parent_min_h = min_h + 1;
+                n.for_each_parent(|p| stack.push(Step::Enter(p, parent_min_h)));
             }
         }
-        Ok(())
-    })();
-    node.visited.set(false);
-    res
+    }
+
+    if did_err { Err(()) } else { Ok(()) }
 }
 
 /// 辅助：当节点已经 Pending 但需要“重新排队”时，先摘下旧位置再重新入队，避免 recalc_min_height 已越过导致饥饿。
