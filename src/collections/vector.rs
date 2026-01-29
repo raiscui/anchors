@@ -93,17 +93,44 @@ pub struct VectorCollect<T, E: Engine> {
     /// - 若每次 dirty 都 `Vec::with_capacity(len)`，会让 allocator 变成 Top 热点；
     /// - 这里用“结构体字段 + clear()”复用容量，尽量避免重复分配。
     polls_buf: Vec<Poll>,
+    /// 复用的 Vector pool：用于构造 `vals`（`Vector<T>`）时的 chunk 分配。
+    ///
+    /// 性能动机：
+    /// - `VectorCollect` 可能会被上层 `then(|v| ...)` 这类结构“反复重建”，导致每次重建都创建新的 RRBPool；
+    /// - RRBPool 的 chunk 分配/回收与全局 allocator 强相关，pprof 中常表现为 `alloc::alloc::alloc` Top；
+    /// - 把 pool 变成字段并允许外部注入（共享 pool），可让 chunk 在多次重建之间复用，从而显著降低分配开销。
+    vals_pool: vector::RRBPool<T>,
 }
 
 impl<T: 'static + Clone, E: Engine> VectorCollect<T, E> {
     #[track_caller]
     pub fn new_to_anchor(anchors: Vector<Anchor<T, E>>) -> Anchor<Vector<T>, E> {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 默认行为保持不变：pool 大小按 anchors.len() 初始化。
+        //
+        // - 这样小规模场景仍然有良好的局部性；
+        // - 若上层需要跨“重建”复用 chunk，可改用 `new_to_anchor_with_vals_pool` 注入共享 pool。
+        ////////////////////////////////////////////////////////////////////////////////
+        let vals_pool = vector::RRBPool::<T>::new(anchors.len());
+        Self::new_to_anchor_with_vals_pool(anchors, vals_pool)
+    }
+
+    /// 创建一个 `VectorCollect`，并显式指定用于 `vals` 的 RRBPool。
+    ///
+    /// 典型用法：在高频 `then` 重建链路中，把 pool 放到外层闭包里持久化并 clone 进来，
+    /// 让 `Vector<T>` 的 chunk 能在多次重建之间复用，减少 allocator 压力。
+    #[track_caller]
+    pub fn new_to_anchor_with_vals_pool(
+        anchors: Vector<Anchor<T, E>>,
+        vals_pool: vector::RRBPool<T>,
+    ) -> Anchor<Vector<T>, E> {
         E::mount(Self {
             anchors,
             vals: None,
             location: Location::caller(),
             dirty: true,
             polls_buf: Vec::new(),
+            vals_pool,
         })
     }
 }
@@ -164,7 +191,10 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
                     next_anchors.push_back(anchor.clone());
                 }
 
-                let pool = vector::RRBPool::<T>::new(next_anchors.len());
+                ////////////////////////////////////////////////////////////////////////////////
+                // 性能：invalid token 场景也复用同一个 vals_pool，避免重复创建 pool。
+                ////////////////////////////////////////////////////////////////////////////////
+                let pool = self.vals_pool.clone();
                 let mut vals = Vector::with_pool(&pool);
                 next_anchors
                     .iter()
@@ -195,7 +225,10 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
                     }
                 }
             } else {
-                let pool = vector::RRBPool::<T>::new(self.anchors.len());
+                ////////////////////////////////////////////////////////////////////////////////
+                // 性能：使用可复用的 pool 构造 vals，避免每次重建都创建新的 RRBPool。
+                ////////////////////////////////////////////////////////////////////////////////
+                let pool = self.vals_pool.clone();
                 let mut vals = Vector::with_pool(&pool);
                 self.anchors
                     .iter()
