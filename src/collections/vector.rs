@@ -86,6 +86,13 @@ pub struct VectorCollect<T, E: Engine> {
     vals: Option<Vector<T>>,
     location: &'static Location<'static>,
     dirty: bool,
+    /// 复用的临时缓冲区：用于记录每个 anchor 的 Poll（与 `self.anchors` 对齐）。
+    ///
+    /// 性能动机：
+    /// - `VectorCollect` 常出现在高频链路（例如 event_matching / scene 构建）；
+    /// - 若每次 dirty 都 `Vec::with_capacity(len)`，会让 allocator 变成 Top 热点；
+    /// - 这里用“结构体字段 + clear()”复用容量，尽量避免重复分配。
+    polls_buf: Vec<Poll>,
 }
 
 impl<T: 'static + Clone, E: Engine> VectorCollect<T, E> {
@@ -96,6 +103,7 @@ impl<T: 'static + Clone, E: Engine> VectorCollect<T, E> {
             vals: None,
             location: Location::caller(),
             dirty: true,
+            polls_buf: Vec::new(),
         })
     }
 }
@@ -117,30 +125,44 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
             // 策略：将失效 token 对应的 Anchor 从 anchors 列表中剔除，再重建输出。
             ////////////////////////////////////////////////////////////////////////////////
             let mut invalid_found = false;
-            let mut polls: Vec<(Poll, &Anchor<T, E>)> = Vec::with_capacity(self.anchors.len());
-            let mut next_anchors_vec: Vec<Anchor<T, E>> = Vec::with_capacity(self.anchors.len());
+            self.polls_buf.clear();
+            {
+                // 复用容量：只 reserve，不 shrink，避免反复分配。
+                let need = self.anchors.len().saturating_sub(self.polls_buf.capacity());
+                if need > 0 {
+                    self.polls_buf.reserve(need);
+                }
+            }
 
             for anchor in self.anchors.iter() {
-                let s = ctx.request(anchor, true);
-                if s.is_waiting() {
+                let poll = ctx.request(anchor, true);
+                if poll.is_waiting() {
+                    // NOTE:
+                    // - 仍保持 dirty=true；下次 poll 会继续尝试收敛。
                     return Poll::Pending;
                 }
-                match s {
-                    Poll::PendingInvalidToken => {
-                        invalid_found = true;
-                    }
-                    _ => {
-                        polls.push((s, anchor));
-                        next_anchors_vec.push(anchor.clone());
-                    }
+                if poll == Poll::PendingInvalidToken {
+                    invalid_found = true;
                 }
+                self.polls_buf.push(poll);
             }
             self.dirty = false;
 
             if invalid_found {
-                let pool = vector::RRBPool::<Anchor<T, E>>::new(next_anchors_vec.len());
+                let valid_len = self
+                    .polls_buf
+                    .iter()
+                    .filter(|p| *p != &Poll::PendingInvalidToken)
+                    .count();
+
+                let pool = vector::RRBPool::<Anchor<T, E>>::new(valid_len);
                 let mut next_anchors = Vector::with_pool(&pool);
-                next_anchors_vec.into_iter().collect_into(&mut next_anchors);
+                for (anchor, poll) in self.anchors.iter().zip(self.polls_buf.iter()) {
+                    if poll == &Poll::PendingInvalidToken {
+                        continue;
+                    }
+                    next_anchors.push_back(anchor.clone());
+                }
 
                 let pool = vector::RRBPool::<T>::new(next_anchors.len());
                 let mut vals = Vector::with_pool(&pool);
@@ -162,8 +184,12 @@ impl<T: 'static + Clone, E: Engine> AnchorInner<E> for VectorCollect<T, E> {
             // ─────────────────────────────────────────────────────
 
             if let Some(ref mut old_vals) = self.vals {
-                for (old_val, (poll, anchor)) in old_vals.iter_mut().zip(polls.iter()) {
-                    if &Poll::Updated == poll {
+                for ((old_val, poll), anchor) in old_vals
+                    .iter_mut()
+                    .zip(self.polls_buf.iter())
+                    .zip(self.anchors.iter())
+                {
+                    if poll == &Poll::Updated {
                         *old_val = ctx.get(anchor).clone();
                         changed = true;
                     }

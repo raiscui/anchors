@@ -2141,14 +2141,13 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
                         // - 仅当 parent 需要提升且已在当前路径 visited 时，才标记 did_err。
                         ////////////////////////////////////////////////////////////////////////////////
                         // NOTE:
-                        // - 把 token 校验与 height 读取前置：
-                        //   - 高度已满足的 parent，直接返回，避免额外的 anchor 指针读；
-                        // - 只有在“确实需要提升”的情况下，才检查 anchor 是否仍为 Some。
+                        // - 先读 height：高度已满足的 parent，直接返回，避免多余的 token/anchor 读取；
+                        // - 只有在“确实需要提升”的情况下，才做 token/anchor 校验与 visited 检测。
                         let parent = NodeGuard(unsafe { parent_key.ptr.lookup_unchecked() });
-                        if parent.slot_token.get() != parent_key.token {
+                        if height(parent) >= parent_min_h {
                             return;
                         }
-                        if height(parent) >= parent_min_h {
+                        if parent.slot_token.get() != parent_key.token {
                             return;
                         }
                         if unsafe { (*parent.anchor.get()).is_none() } {
