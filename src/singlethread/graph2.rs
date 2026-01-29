@@ -1126,6 +1126,24 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
+    /// 遍历父节点的 key（不做活性校验）。
+    ///
+    /// 适用场景：
+    /// - `set_min_height` 这类“稍后会在处理阶段再次做 token/anchor 校验”的路径；
+    /// - 这样可以避免在遍历阶段就做一次 `lookup_unchecked + token/anchor` 检查，
+    ///   进而减少重复校验造成的常数开销。
+    pub fn for_each_parent_key(&self, mut f: impl FnMut(NodeKey)) {
+        if let Some(p0) = self.ptrs.clean_parent0.get() {
+            f(p0);
+        }
+        if let Some(p1) = self.ptrs.clean_parent1.get() {
+            f(p1);
+        }
+        for key in self.ptrs.clean_parents.borrow().iter().copied() {
+            f(key);
+        }
+    }
+
     /// 取出并清空父节点列表，供 mark_dirty 等热路径复用。
     pub fn drain_parents(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         if let Some(p0) = self.ptrs.clean_parent0.get() {
@@ -2087,10 +2105,10 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
                     });
 
                     let parent_min_h = item.min_height + 1;
-                    n.for_each_parent(|p| {
+                    n.for_each_parent_key(|parent_key| {
                         stack.push(WorkItem {
                             kind: WorkKind::Enter,
-                            key: p.key(),
+                            key: parent_key,
                             min_height: parent_min_h,
                         });
                     });
