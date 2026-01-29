@@ -2015,7 +2015,12 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     ////////////////////////////////////////////////////////////////////////////////
     #[derive(Clone, Copy)]
     enum WorkKind {
-        Enter,
+        /// 已经在“入栈阶段”完成活性校验的 Enter（本轮 set_min_height 内可视为稳定）。
+        ///
+        /// 目的：
+        /// - 避免“入栈阶段校验一次 + 出栈阶段再校验一次”的重复常数；
+        /// - 在 parent 较多时，这个重复校验会在 pprof 里集中成 Top 热点。
+        EnterAssumedLive,
         Exit,
     }
 
@@ -2038,17 +2043,11 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     }
 
     // NOTE:
-    // - 通过 key(token) 做“活性校验”，避免在 free list 复用槽位后误操作新节点。
+    // - 仅用于本轮 `set_min_height` 内部（单线程、无 free/reuse 的前提下）；
+    // - 调用方必须确保该 key 在“入栈阶段”已通过 token+anchor 校验。
     #[inline]
-    fn live_node_from_key<'a>(key: NodeKey) -> Option<NodeGuard<'a>> {
-        let n = NodeGuard(unsafe { key.ptr.lookup_unchecked() });
-        if n.slot_token.get() != key.token {
-            return None;
-        }
-        if unsafe { (*n.anchor.get()).is_none() } {
-            return None;
-        }
-        Some(n)
+    unsafe fn node_from_key_unchecked<'a>(key: NodeKey) -> NodeGuard<'a> {
+        NodeGuard(unsafe { key.ptr.lookup_unchecked() })
     }
 
     STACK.with(|stack_cell| {
@@ -2066,7 +2065,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
         }
 
         stack.push(WorkItem {
-            kind: WorkKind::Enter,
+            kind: WorkKind::EnterAssumedLive,
             key: node.key(),
             min_height,
         });
@@ -2075,14 +2074,36 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
         while let Some(item) = stack.pop() {
             match item.kind {
                 WorkKind::Exit => {
-                    if let Some(n) = live_node_from_key(item.key) {
-                        n.visited.set(false);
+                    // Exit 一定来自本轮 Enter 成功后的 push，因此这里可以跳过重复活性校验。
+                    let n = unsafe { node_from_key_unchecked(item.key) };
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert_eq!(
+                            n.slot_token.get(),
+                            item.key.token,
+                            "set_min_height Exit: slot_token/token 不一致（疑似 key 非 live）"
+                        );
+                        debug_assert!(
+                            unsafe { (*n.anchor.get()).is_some() },
+                            "set_min_height Exit: anchor=None（疑似 key 非 live）"
+                        );
                     }
+                    n.visited.set(false);
                 }
-                WorkKind::Enter => {
-                    let Some(n) = live_node_from_key(item.key) else {
-                        continue;
-                    };
+                WorkKind::EnterAssumedLive => {
+                    let n = unsafe { node_from_key_unchecked(item.key) };
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert_eq!(
+                            n.slot_token.get(),
+                            item.key.token,
+                            "set_min_height EnterAssumedLive: slot_token/token 不一致（疑似 key 非 live）"
+                        );
+                        debug_assert!(
+                            unsafe { (*n.anchor.get()).is_some() },
+                            "set_min_height EnterAssumedLive: anchor=None（疑似 key 非 live）"
+                        );
+                    }
 
                     // 剪枝：已有更大的高度，无需继续向上回填。
                     if height(n) >= item.min_height {
@@ -2106,8 +2127,42 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
 
                     let parent_min_h = item.min_height + 1;
                     n.for_each_parent_key(|parent_key| {
+                        ////////////////////////////////////////////////////////////////////////////////
+                        // 性能：parent 遍历阶段做一次“早剪枝”，减少无效 WorkItem 入栈
+                        //
+                        // - 之前这里会把所有 parent 都 push 进栈，很多 parent 在后续 pop 时会因为：
+                        //   - token/anchor 失效（节点已被 GC/free）
+                        //   - height 已满足（无需提升）
+                        //   而立刻被剪枝。
+                        // - 这些“push + pop + 再剪枝”的纯常数会在 pprof 里集中到该行。
+                        // - 这里先做一次轻量判断：只有确实需要提升的 parent 才入栈。
+                        //
+                        // 注意：依赖环检测仍保持语义：
+                        // - 仅当 parent 需要提升且已在当前路径 visited 时，才标记 did_err。
+                        ////////////////////////////////////////////////////////////////////////////////
+                        // NOTE:
+                        // - 把 token 校验与 height 读取前置：
+                        //   - 高度已满足的 parent，直接返回，避免额外的 anchor 指针读；
+                        // - 只有在“确实需要提升”的情况下，才检查 anchor 是否仍为 Some。
+                        let parent = NodeGuard(unsafe { parent_key.ptr.lookup_unchecked() });
+                        if parent.slot_token.get() != parent_key.token {
+                            return;
+                        }
+                        if height(parent) >= parent_min_h {
+                            return;
+                        }
+                        if unsafe { (*parent.anchor.get()).is_none() } {
+                            return;
+                        }
+                        if parent.visited.get() {
+                            did_err = true;
+                            return;
+                        }
+
                         stack.push(WorkItem {
-                            kind: WorkKind::Enter,
+                            // parent 已通过 token+anchor 校验，这里标记为 AssumedLive，
+                            // 避免后续 pop 时再次做 token/anchor 校验。
+                            kind: WorkKind::EnterAssumedLive,
                             key: parent_key,
                             min_height: parent_min_h,
                         });
