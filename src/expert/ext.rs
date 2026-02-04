@@ -6,7 +6,6 @@ pub mod dirty_observer;
 pub mod either;
 pub mod map;
 pub mod map_mut;
-#[cfg(not(feature = "anchors_slotmap"))]
 pub mod refmap;
 pub mod then;
 pub mod update_observer;
@@ -51,7 +50,6 @@ pub trait MultiAnchor<E: Engine>: Sized {
         F: 'static,
         cutoff::Cutoff<Self::Target, F>: AnchorInner<E, Output = Out>;
 
-    #[cfg(not(feature = "anchors_slotmap"))]
     fn refmap<F, Out>(self, _f: F) -> Anchor<Out, E>
     where
         Out: 'static,
@@ -318,7 +316,6 @@ where
     /// assert_eq!(true, engine.get(&is_one));
     /// ```
     #[track_caller]
-    #[cfg(not(feature = "anchors_slotmap"))]
     pub fn refmap<F, Out>(&self, f: F) -> Anchor<Out, E>
     where
         Out: 'static,
@@ -548,7 +545,6 @@ macro_rules! impl_tuple_ext {
 
 
             #[track_caller]
-            #[cfg(not(feature = "anchors_slotmap"))]
             fn refmap<F, Out>(self, f: F) -> Anchor<Out, E>
             where
                 Out: 'static,

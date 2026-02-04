@@ -309,7 +309,6 @@ pub use ext::dirty_observer;
 pub use ext::either;
 pub use ext::map;
 pub use ext::map_mut;
-#[cfg(not(feature = "anchors_slotmap"))]
 pub use ext::refmap;
 pub use ext::then;
 pub use ext::update_observer;

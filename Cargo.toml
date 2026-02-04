@@ -14,12 +14,11 @@ repository = "https://github.com/lord/anchors"
 
 [features]
 # default = ["generic_size_voa"]
-default = ["generic_size_voa", "anchors_slotmap", "lock_strict"]
+default = ["generic_size_voa", "lock_strict"]
 # pool = ["im-rc/pool"]
 pool = []
 generic_size_voa = ["emg_common"]
-anchors_slotmap = ["libc"]
-anchors_pending_queue = ["anchors_slotmap"]
+anchors_pending_queue = []
 lock_strict = []
 
 
@@ -36,7 +35,7 @@ emg_common = { workspace = true, optional = true, features = [
 ] } #unified
 emg_hasher = { workspace = true } #unified
 indexmap = { workspace = true } #unified
-libc = { workspace = true, optional = true } #unified
+libc = { workspace = true } #unified
 slotmap = { workspace = true } #unified
 smallvec = { workspace = true } #unified
 

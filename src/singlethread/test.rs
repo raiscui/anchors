@@ -119,7 +119,6 @@ fn stabilize_consumes_dirty_marks_created_during_stabilize() {
     assert_eq!(engine.get(&out), 1);
 }
 
-#[cfg(feature = "anchors_slotmap")]
 #[test]
 fn peek_value_respects_ready() {
     let mut engine = Engine::new();
@@ -133,13 +132,15 @@ fn peek_value_respects_ready() {
     assert_eq!(engine.get(&derived), 2);
     assert_eq!(engine.peek_value(&derived), Some(2));
 
-    // set 后再次读取，peek 与 get 保持一致。
+    // set 后：在 stabilize 之前 peek 必须返回 None（避免读到过期缓存）。
     anchor_setter.set(5);
+    assert!(engine.peek_value(&derived).is_none());
+
+    // stabilize 后再次读取，peek 与 get 保持一致。
     assert_eq!(engine.get(&derived), 6);
     assert_eq!(engine.peek_value(&derived), Some(6));
 }
 
-#[cfg(feature = "anchors_slotmap")]
 #[test]
 fn is_token_alive_reflects_drop_and_remove() {
     ////////////////////////////////////////////////////////////////////////////////
@@ -224,7 +225,6 @@ fn test_cutoff_simple_unobserved() {
     assert_eq!(engine.get(&post_cutoff), 161);
 }
 
-#[cfg(not(feature = "anchors_slotmap"))]
 #[test]
 fn test_refmap_simple() {
     #[derive(PartialEq, Debug)]

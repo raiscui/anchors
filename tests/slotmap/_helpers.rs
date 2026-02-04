@@ -35,18 +35,8 @@ pub struct SlotmapCycleSnapshot {
 }
 
 /// ════════════════════════════════════════════════════════════════════════
-/// 断言 anchors_slotmap feature 已启用，若未启用则直接 panic，避免错误地跑到 arena_graph 分支。
-pub fn assert_slotmap_feature_enabled() {
-    #[cfg(not(feature = "anchors_slotmap"))]
-    {
-        panic!("tests require --features anchors_slotmap");
-    }
-}
-
-/// ════════════════════════════════════════════════════════════════════════
-/// 创建带 slotmap feature 的 Engine，后续测试可直接调用。
+/// 创建 Engine（anchors 已强制 slotmap-only）。
 pub fn new_slotmap_engine() -> Engine {
-    assert_slotmap_feature_enabled();
     Engine::new()
 }
 
@@ -89,7 +79,6 @@ pub fn run_creation_drop_cycles(
     engine: &mut Engine,
     cfg: SlotmapStressConfig,
 ) -> Vec<SlotmapCycleSnapshot> {
-    assert_slotmap_feature_enabled();
     let mut snapshots = Vec::with_capacity(cfg.rounds);
     for round in 0..cfg.rounds {
         let (vars, anchors) = spawn_counter_batch(cfg.nodes_per_cycle, cfg.base_value + round);

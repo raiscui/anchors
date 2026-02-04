@@ -1,28 +1,25 @@
 //! US1: 节点能被回收，alloc/free 成对出现并维持 free list 非空。
 //! 运行方式：
-//!   cargo nextest run -p anchors --features anchors_slotmap --test slotmap_drop_reclaims_nodes --profile anchors-slotmap
+//!   cargo nextest run -p anchors --test slotmap_drop_reclaims_nodes --profile anchors-slotmap
 
 mod slotmap;
 
-#[cfg(all(feature = "anchors_slotmap", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use libc::_SC_PAGESIZE;
-#[cfg(all(feature = "anchors_slotmap", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[allow(deprecated)]
 use libc::{
     KERN_SUCCESS, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_msg_type_number_t,
     mach_task_basic_info_data_t, mach_task_self, task_info,
 };
-#[cfg(all(
-    feature = "anchors_slotmap",
-    not(any(target_os = "linux", target_os = "macos"))
-))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use libc::{RUSAGE_SELF, getrusage, rusage};
 use slotmap::_helpers::{SlotmapStressConfig, new_slotmap_engine, run_creation_drop_cycles};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
-#[cfg(all(feature = "anchors_slotmap", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn current_rss_bytes() -> u64 {
     // Linux: 直接读取 /proc/self/statm 的第 2 项（驻留页数），乘以页面大小得到当前 RSS。
     if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
@@ -36,7 +33,7 @@ fn current_rss_bytes() -> u64 {
     0
 }
 
-#[cfg(all(feature = "anchors_slotmap", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[allow(deprecated)]
 fn current_rss_bytes() -> u64 {
     // macOS: 使用 mach task_info 拿到实时 resident_size，避免 ru_maxrss 只记录「历史最大值」造成误判。
@@ -57,10 +54,7 @@ fn current_rss_bytes() -> u64 {
     }
 }
 
-#[cfg(all(
-    feature = "anchors_slotmap",
-    not(any(target_os = "linux", target_os = "macos"))
-))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn current_rss_bytes() -> u64 {
     // 兜底实现：仍然使用 getrusage 的 ru_maxrss；部分平台可能只支持最大值而非瞬时值。
     let mut usage: rusage = unsafe { std::mem::zeroed() };
@@ -76,7 +70,6 @@ fn current_rss_bytes() -> u64 {
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
 fn write_rss_artifacts(before: u64, after: u64) {
     let base: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/perf");
     let _ = std::fs::create_dir_all(&base);
@@ -159,43 +152,40 @@ fn slotmap_drop_reclaims_nodes() {
 /// RSS 漂移不得超过 5%，并输出 docs/perf/rss_slotmap.{csv,png}
 #[test]
 fn slotmap_rss_drift_within_budget() {
-    #[cfg(feature = "anchors_slotmap")]
-    {
-        use std::time::Duration;
-        let mut engine = new_slotmap_engine();
-        // 预热一次，拉高基础 RSS，避免「初始值过低 → 相对漂移被放大」。
-        let warm_cfg = SlotmapStressConfig {
-            nodes_per_cycle: 512,
-            rounds: 1,
-            base_value: 0,
-        };
-        let _ = run_creation_drop_cycles(&mut engine, warm_cfg);
-        engine.stabilize();
+    use std::time::Duration;
+    let mut engine = new_slotmap_engine();
+    // 预热一次，拉高基础 RSS，避免「初始值过低 → 相对漂移被放大」。
+    let warm_cfg = SlotmapStressConfig {
+        nodes_per_cycle: 512,
+        rounds: 1,
+        base_value: 0,
+    };
+    let _ = run_creation_drop_cycles(&mut engine, warm_cfg);
+    engine.stabilize();
 
-        let before = current_rss_bytes();
-        // 降低样本规模，减少波动，防止 CI 环境占用抖动。
-        let cfg = SlotmapStressConfig {
-            nodes_per_cycle: 2_000,
-            rounds: 6,
-            base_value: 1,
-        };
-        let _ = run_creation_drop_cycles(&mut engine, cfg);
-        std::thread::sleep(Duration::from_millis(150));
-        let after = current_rss_bytes();
-        let drift = if before == 0 {
-            0.0
-        } else {
-            (after as f64 - before as f64) / before as f64
-        };
-        let delta_bytes = after.abs_diff(before);
-        write_rss_artifacts(before, after);
-        assert!(
-            drift.abs() <= 0.20 || delta_bytes <= 8 * 1024 * 1024,
-            "RSS 漂移超过允许范围 (±20% 或 ≤8MiB) (before={} after={} drift={:.2}% delta={} bytes)",
-            before,
-            after,
-            drift * 100.0,
-            delta_bytes
-        );
-    }
+    let before = current_rss_bytes();
+    // 降低样本规模，减少波动，防止 CI 环境占用抖动。
+    let cfg = SlotmapStressConfig {
+        nodes_per_cycle: 2_000,
+        rounds: 6,
+        base_value: 1,
+    };
+    let _ = run_creation_drop_cycles(&mut engine, cfg);
+    std::thread::sleep(Duration::from_millis(150));
+    let after = current_rss_bytes();
+    let drift = if before == 0 {
+        0.0
+    } else {
+        (after as f64 - before as f64) / before as f64
+    };
+    let delta_bytes = after.abs_diff(before);
+    write_rss_artifacts(before, after);
+    assert!(
+        drift.abs() <= 0.20 || delta_bytes <= 8 * 1024 * 1024,
+        "RSS 漂移超过允许范围 (±20% 或 ≤8MiB) (before={} after={} drift={:.2}% delta={} bytes)",
+        before,
+        after,
+        drift * 100.0,
+        delta_bytes
+    );
 }

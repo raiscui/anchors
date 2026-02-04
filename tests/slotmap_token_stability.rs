@@ -1,5 +1,3 @@
-#![cfg(feature = "anchors_slotmap")]
-
 use indexmap::IndexSet;
 
 mod slotmap;

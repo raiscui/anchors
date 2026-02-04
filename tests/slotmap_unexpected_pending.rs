@@ -1,5 +1,3 @@
-#![cfg(feature = "anchors_slotmap")]
-
 use anchors::expert::{
     AnchorHandle, AnchorInner, Engine as AnchorEngine, OutputContext, Poll, UpdateContext,
 };

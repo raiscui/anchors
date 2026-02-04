@@ -6,6 +6,7 @@
 //! Air, likely somewhat more if single node has a significant number of parents or children. Hopefully
 //! this will significantly improve over the coming months.
 
+mod anchor_pool;
 mod generation;
 mod graph2;
 
@@ -16,14 +17,13 @@ use graph2::{Graph2, Graph2Guard, NodeGuard, NodeKey, RecalcState};
 #[cfg(debug_assertions)]
 use tracing::trace;
 
+pub use anchor_pool::AnchorPoolStatsSnapshot;
 pub use graph2::AnchorHandle;
-#[cfg(feature = "anchors_slotmap")]
 pub use graph2::EpochGuard;
-#[cfg(feature = "anchors_slotmap")]
 pub use graph2::GcStatsSnapshot;
 pub use graph2::NodeKey as AnchorToken;
 
-#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+#[cfg(feature = "anchors_pending_queue")]
 #[derive(Default)]
 struct PendingStatsInner {
     total_enqueued_raw: Cell<u64>,
@@ -41,13 +41,11 @@ struct PendingStatsInner {
 // - 只在 anchors_slotmap 下启用（token 单调 + free list 复用更常见）。
 // - 以 child raw_token 作为 key 做去重与计数；同一个 token 一旦开始刷屏，通常就是同一根因。
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(feature = "anchors_slotmap")]
 #[derive(Default)]
 struct InvalidTokenLogInner {
     counts: HashMap<u64, u32>,
 }
 
-#[cfg(feature = "anchors_slotmap")]
 impl InvalidTokenLogInner {
     fn bump(&mut self, raw_token: u64) -> u32 {
         let entry = self.counts.entry(raw_token).or_insert(0);
@@ -66,13 +64,11 @@ impl InvalidTokenLogInner {
 // 但在真实项目里，我们宁愿“冻结旧输出并记录告警”，也不希望 GUI 直接崩溃。
 // 这里用 raw_token 做去重计数，避免同一节点反复刷屏。
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(feature = "anchors_slotmap")]
 #[derive(Default)]
 struct UnexpectedPendingLogInner {
     counts: HashMap<u64, u32>,
 }
 
-#[cfg(feature = "anchors_slotmap")]
 impl UnexpectedPendingLogInner {
     fn bump(&mut self, raw_token: u64) -> u32 {
         let entry = self.counts.entry(raw_token).or_insert(0);
@@ -129,18 +125,14 @@ use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 use emg_hasher::std::HashMap;
 use generation::Generation;
 use indexmap::{IndexMap, IndexSet};
-#[cfg(feature = "anchors_slotmap")]
-use libc::RUSAGE_SELF;
-#[cfg(feature = "anchors_slotmap")]
-use libc::getrusage;
-#[cfg(feature = "anchors_slotmap")]
-use libc::rusage;
+#[cfg(not(target_arch = "wasm32"))]
+use libc::{RUSAGE_SELF, getrusage, rusage};
 use std::any::Any;
 use std::backtrace::Backtrace;
-#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+#[cfg(feature = "anchors_pending_queue")]
 use std::cell::Cell;
 use std::cell::RefCell;
-#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+#[cfg(feature = "anchors_pending_queue")]
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -196,13 +188,13 @@ impl PendingPriority {
         }
     }
 
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     fn as_u8(self) -> u8 {
         self as u8
     }
 }
 
-#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+#[cfg(feature = "anchors_pending_queue")]
 #[derive(Clone, Copy, Debug)]
 struct PendingRequest {
     parent: NodeKey,
@@ -211,20 +203,20 @@ struct PendingRequest {
     priority: PendingPriority,
 }
 
-#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+#[cfg(feature = "anchors_pending_queue")]
 #[derive(Default)]
 struct PendingQueue {
     buckets: BTreeMap<PendingPriority, IndexMap<NodeKey, PendingRequest>>,
     index: HashMap<NodeKey, PendingPriority>,
 }
 
-#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+#[cfg(feature = "anchors_pending_queue")]
 enum PendingEnqueueOutcome {
     Inserted,
     Replaced,
 }
 
-#[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+#[cfg(feature = "anchors_pending_queue")]
 impl PendingQueue {
     fn len(&self) -> usize {
         self.index.len()
@@ -308,13 +300,11 @@ pub struct Engine {
 
     // tracks the current stabilization generation; incremented on every stabilize
     generation: Generation,
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     pending_requests: Rc<RefCell<PendingQueue>>,
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     pending_stats: Rc<PendingStatsInner>,
-    #[cfg(feature = "anchors_slotmap")]
     invalid_token_log: Rc<RefCell<InvalidTokenLogInner>>,
-    #[cfg(feature = "anchors_slotmap")]
     unexpected_pending_log: Rc<RefCell<UnexpectedPendingLogInner>>,
 }
 
@@ -345,7 +335,7 @@ impl crate::expert::Engine for Engine {
                 .as_mut()
                 .expect("no engine was initialized. did you call `Engine::new()`?");
             let debug_info = inner.debug_info();
-            let handle = this.graph.insert(Box::new(inner), debug_info);
+            let handle = this.graph.insert(inner, debug_info);
             Anchor::new_from_expert(handle)
         })
     }
@@ -378,18 +368,19 @@ impl crate::expert::Engine for Engine {
 }
 
 impl Engine {
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     fn debug_pending_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEBUG_PENDING"))
     }
 
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     fn defer_disabled() -> bool {
         static DISABLED: OnceLock<bool> = OnceLock::new();
         *DISABLED.get_or_init(|| emg_debug_env::bool_lenient("ANCHORS_DEFER_DISABLED"))
     }
-    #[cfg(feature = "anchors_slotmap")]
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn current_rss_bytes() -> u64 {
         // getrusage 在 macOS 返回 bytes，Linux 返回 KB；这里统一转换成字节后再比较。
         let mut usage: rusage = unsafe { std::mem::zeroed() };
@@ -404,6 +395,11 @@ impl Engine {
         } else {
             raw
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn current_rss_bytes() -> u64 {
+        0
     }
 
     /// Creates a new Engine with maximum height 256.
@@ -424,13 +420,11 @@ impl Engine {
             graph,
             dirty_marks,
             generation: Generation::new(),
-            #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+            #[cfg(feature = "anchors_pending_queue")]
             pending_requests: Rc::new(RefCell::new(PendingQueue::default())),
-            #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+            #[cfg(feature = "anchors_pending_queue")]
             pending_stats: Rc::new(PendingStatsInner::default()),
-            #[cfg(feature = "anchors_slotmap")]
             invalid_token_log: Rc::new(RefCell::new(InvalidTokenLogInner::default())),
-            #[cfg(feature = "anchors_slotmap")]
             unexpected_pending_log: Rc::new(RefCell::new(UnexpectedPendingLogInner::default())),
         }
     }
@@ -456,7 +450,7 @@ impl Engine {
     /// 输出 pending 队列的聚合指标，便于在 demo/集成测试后记录基线。
     #[must_use]
     pub fn pending_stats_snapshot(&self) -> AnchorsPendingStats {
-        #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+        #[cfg(feature = "anchors_pending_queue")]
         {
             let stats = &self.pending_stats;
             return AnchorsPendingStats {
@@ -471,7 +465,7 @@ impl Engine {
             };
         }
 
-        #[cfg(not(all(feature = "anchors_slotmap", feature = "anchors_pending_queue")))]
+        #[cfg(not(feature = "anchors_pending_queue"))]
         {
             AnchorsPendingStats::default()
         }
@@ -480,27 +474,24 @@ impl Engine {
     /// 输出 active_nodes 与 RSS，便于 GUI 与日志实时显示。
     #[must_use]
     pub fn metrics_snapshot(&self) -> AnchorsMetrics {
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            let active = self.graph.with(|graph| graph.active_nodes());
-            let rss = Self::current_rss_bytes();
-            return AnchorsMetrics {
-                active_nodes: active,
-                rss_bytes: rss,
-            };
-        }
-
-        #[cfg(not(feature = "anchors_slotmap"))]
-        {
-            AnchorsMetrics::default()
+        let active = self.graph.with(|graph| graph.active_nodes());
+        let rss = Self::current_rss_bytes();
+        AnchorsMetrics {
+            active_nodes: active,
+            rss_bytes: rss,
         }
     }
 
     /// 读取 slotmap GC 计数（gc_skipped / free_skip / pending_free）。
-    #[cfg(feature = "anchors_slotmap")]
     #[must_use]
     pub fn slotmap_gc_stats(&self) -> GcStatsSnapshot {
         self.graph.gc_stats_snapshot()
+    }
+
+    /// 读取 Anchor 存储池统计（alloc hit/miss/recycle + high watermark）。
+    #[must_use]
+    pub fn anchor_pool_stats(&self) -> AnchorPoolStatsSnapshot {
+        self.graph.anchor_pool_stats_snapshot()
     }
 
     /// 进入 anchors epoch（读窗口）。
@@ -510,7 +501,6 @@ impl Engine {
     /// - 只允许把待回收节点 retire 入队，等到 epoch end 再统一 reclaim。
     ///
     /// 典型用法：由事件循环在 “事件派发 + stabilize + render” 外层持有该 guard。
-    #[cfg(feature = "anchors_slotmap")]
     #[must_use]
     pub fn enter_epoch(&self) -> EpochGuard {
         EpochGuard::new(self.graph.clone())
@@ -519,47 +509,25 @@ impl Engine {
     /// 读取 token 计数与最近删除记录，便于验证“单调且不复用”。
     #[must_use]
     pub fn token_audit_snapshot(&self) -> TokenAudit {
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            let next = self.graph.token_counter();
-            let last_deleted = self.graph.last_deleted_token();
-            return TokenAudit {
-                next_token: next,
-                last_deleted_token: last_deleted,
-            };
-        }
-
-        #[cfg(not(feature = "anchors_slotmap"))]
-        {
-            TokenAudit::default()
+        let next = self.graph.token_counter();
+        let last_deleted = self.graph.last_deleted_token();
+        TokenAudit {
+            next_token: next,
+            last_deleted_token: last_deleted,
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 失效 token 观测与去重
 
-    #[cfg(feature = "anchors_slotmap")]
     fn invalid_token_backtrace_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| emg_debug_env::bool_strict("ANCHORS_INVALID_TOKEN_BACKTRACE"))
     }
 
-    #[cfg(not(feature = "anchors_slotmap"))]
-    #[inline]
-    fn invalid_token_backtrace_enabled() -> bool {
-        false
-    }
-
-    #[cfg(feature = "anchors_slotmap")]
     fn bump_invalid_token_count(&self, raw_token: u64) -> u32 {
         let mut slot = self.invalid_token_log.borrow_mut();
         slot.bump(raw_token)
-    }
-
-    #[cfg(not(feature = "anchors_slotmap"))]
-    #[inline]
-    fn bump_invalid_token_count(&self, _raw_token: u64) -> u32 {
-        1
     }
 
     #[inline]
@@ -570,16 +538,9 @@ impl Engine {
     // ─────────────────────────────────────────────────────────────────────────
     // “意外 Pending”观测与去重
 
-    #[cfg(feature = "anchors_slotmap")]
     fn bump_unexpected_pending_count(&self, raw_token: u64) -> u32 {
         let mut slot = self.unexpected_pending_log.borrow_mut();
         slot.bump(raw_token)
-    }
-
-    #[cfg(not(feature = "anchors_slotmap"))]
-    #[inline]
-    fn bump_unexpected_pending_count(&self, _raw_token: u64) -> u32 {
-        1
     }
 
     #[inline]
@@ -628,7 +589,7 @@ impl Engine {
         })
     }
 
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     fn enqueue_pending_keys(
         &self,
         parent: NodeKey,
@@ -692,7 +653,7 @@ impl Engine {
         true
     }
 
-    #[cfg(not(all(feature = "anchors_slotmap", feature = "anchors_pending_queue")))]
+    #[cfg(not(feature = "anchors_pending_queue"))]
     #[inline]
     fn enqueue_pending_keys(
         &self,
@@ -715,7 +676,6 @@ impl Engine {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     fn fast_path_ready_value<O: Clone + 'static>(&self, anchor: &Anchor<O>) -> Option<O> {
         if !self.dirty_marks.borrow().is_empty() {
@@ -775,14 +735,14 @@ impl Engine {
         node: graph2::NodeGuard<'_>,
         context: &str,
     ) -> O {
-        let target_anchor = unsafe { &*node.anchor.get() };
-        let inner = target_anchor.as_ref().unwrap_or_else(|| {
+        let inner_ptr = unsafe { *node.anchor.get() }.unwrap_or_else(|| {
             panic!(
                 "slotmap: 节点已被删除或 token 失效，无法执行操作：{}，token={:?}",
                 context,
                 node.key()
             )
         });
+        let inner = unsafe { inner_ptr.as_ref() };
         inner
             .output(&mut EngineContext { engine: self })
             .downcast_ref::<O>()
@@ -804,16 +764,13 @@ impl Engine {
         if !self.dirty_marks.borrow().is_empty() {
             return true;
         }
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            let graph_pending = self
-                .graph
-                .with(|graph| graph.has_recalc_pending() || graph.has_pending_free());
-            if graph_pending {
-                return true;
-            }
+        let graph_pending = self
+            .graph
+            .with(|graph| graph.has_recalc_pending() || graph.has_pending_free());
+        if graph_pending {
+            return true;
         }
-        #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+        #[cfg(feature = "anchors_pending_queue")]
         {
             if !self.pending_requests.borrow().is_empty() {
                 return true;
@@ -823,7 +780,6 @@ impl Engine {
     }
 
     pub fn get<O: Clone + 'static>(&mut self, anchor: &Anchor<O>) -> O {
-        #[cfg(feature = "anchors_slotmap")]
         if let Some(val) = self.fast_path_ready_value(anchor) {
             return val;
         }
@@ -879,10 +835,9 @@ impl Engine {
             let out = self.graph.with(|graph| {
                 let target_node =
                     self.ready_node(&graph, anchor.token(), "get_with 读取 anchor/output");
-                let borrowed = unsafe { &*target_node.anchor.get() };
-                let o = borrowed
-                    .as_ref()
-                    .unwrap()
+                let inner_ptr =
+                    unsafe { *target_node.anchor.get() }.expect("get_with: anchor 缺失");
+                let o = unsafe { inner_ptr.as_ref() }
                     .output(&mut EngineContext { engine: self })
                     .downcast_ref::<O>()
                     .unwrap();
@@ -906,9 +861,17 @@ impl Engine {
         }
     }
 
-    /// 读取已 Ready 节点的输出副本，不触发重算，仅在 anchors_slotmap 下可用。
-    #[cfg(feature = "anchors_slotmap")]
+    /// 读取已 Ready 节点的输出副本，不触发重算。
     pub fn peek_value<O: Clone + 'static>(&self, anchor: &Anchor<O>) -> Option<O> {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 关键语义：
+        // - peek_value 只能在“引擎没有待处理工作”时返回缓存值；
+        // - 否则（例如 Var::set 产生 dirty_marks，但尚未 stabilize）缓存值可能是“已过期”的旧值；
+        // - 为了避免上层误读脏缓存，这里选择保守：只要引擎不 idle 就返回 None。
+        ////////////////////////////////////////////////////////////////////////////////
+        if self.has_pending_work() {
+            return None;
+        }
         self.graph.with(|graph| {
             let anchor_node = self.expect_node(&graph, anchor.token(), "peek_value 读取节点");
             if anchor_node.anchor_locked.get() {
@@ -945,7 +908,6 @@ impl Engine {
                     // 确保自身也进入重算队列，避免特殊情况下 dirty 未触发队列（例如必要关系缺失）。
                     graph.queue_recalc(node);
                 } else {
-                    #[cfg(feature = "anchors_slotmap")]
                     tracing::warn!(
                         target: "anchors",
                         "update_dirty_marks: token 已失效或节点已删除，跳过处理 {:?}",
@@ -1037,27 +999,17 @@ impl Engine {
                 if let Some(v) = emg_debug_env::str_allow_empty("ANCHORS_DEBUG_SPIN_LIMIT") {
                     v.trim().parse::<usize>().unwrap_or(0)
                 } else {
-                    #[cfg(feature = "anchors_slotmap")]
-                    {
-                        // 启动阶段/依赖扩展时，合法的高度调整次数可能远超 active_nodes；
-                        // 这里使用更保守的倍数，减少误报。
-                        let active_nodes = graph.active_nodes();
-                        std::cmp::max(5_000, active_nodes.saturating_mul(64))
-                    }
-                    #[cfg(not(feature = "anchors_slotmap"))]
-                    {
-                        5_000
-                    }
+                    // 启动阶段/依赖扩展时，合法的高度调整次数可能远超 active_nodes；
+                    // 这里使用更保守的倍数，减少误报。
+                    let active_nodes = graph.active_nodes();
+                    std::cmp::max(5_000, active_nodes.saturating_mul(64))
                 }
             } else {
                 0
             };
 
             let mut spin_last: VecDeque<(usize, u64, String)> = VecDeque::with_capacity(32);
-            #[cfg(feature = "anchors_slotmap")]
-            {
-                graph.retry_pending_free();
-            }
+            graph.retry_pending_free();
             while let Some((height, node)) = graph.recalc_pop_next() {
                 if spin_debug {
                     spin_counter = spin_counter.saturating_add(1);
@@ -1076,11 +1028,8 @@ impl Engine {
                             &mut msg,
                             "stabilize0 spin detected: 重算次数超过上限 {spin_limit} (count={spin_counter})"
                         );
-                        #[cfg(feature = "anchors_slotmap")]
-                        {
-                            let active_nodes = graph.active_nodes();
-                            let _ = writeln!(&mut msg, "active_nodes={active_nodes}");
-                        }
+                        let active_nodes = graph.active_nodes();
+                        let _ = writeln!(&mut msg, "active_nodes={active_nodes}");
                         let _ = writeln!(&mut msg, "recent_recalc (oldest -> newest):");
                         for (i, (h, tok, info)) in spin_last.iter().enumerate() {
                             let _ = writeln!(
@@ -1107,43 +1056,40 @@ impl Engine {
                     graph.queue_recalc(node);
                 }
             }
-            #[cfg(feature = "anchors_slotmap")]
-            {
-                graph.retry_pending_free();
-                if emg_debug_env::bool_lenient("ANCHORS_ACTIVE_NODES_LOG") {
-                    let rss = Self::current_rss_bytes();
-                    let active = graph.active_nodes();
-                    let gc_stats = graph.gc_stats();
-                    let loss_ppm = gc_stats.loss_ppm();
-                    let loss_pct = loss_ppm as f64 / 10.0;
-                    let skip_total = gc_stats
-                        .gc_skipped
-                        .saturating_add(gc_stats.free_skip)
-                        .saturating_add(gc_stats.pending_free as u64);
-                    tracing::info!(
-                        target: "anchors",
-                        active_nodes = active,
-                        rss_bytes = rss,
-                        gc_skipped = gc_stats.gc_skipped,
-                        free_skip = gc_stats.free_skip,
-                        free_attempts = gc_stats.free_attempts,
-                        free_succeeded = gc_stats.free_succeeded,
-                        pending_free = gc_stats.pending_free,
-                        gc_loss_ppm = loss_ppm,
-                        gc_loss_pct = loss_pct,
-                        gc_loss_n = skip_total,
-                        "anchors.active_nodes snapshot"
-                    );
-                }
+            graph.retry_pending_free();
+            if emg_debug_env::bool_lenient("ANCHORS_ACTIVE_NODES_LOG") {
+                let rss = Self::current_rss_bytes();
+                let active = graph.active_nodes();
+                let gc_stats = graph.gc_stats();
+                let loss_ppm = gc_stats.loss_ppm();
+                let loss_pct = loss_ppm as f64 / 10.0;
+                let skip_total = gc_stats
+                    .gc_skipped
+                    .saturating_add(gc_stats.free_skip)
+                    .saturating_add(gc_stats.pending_free as u64);
+                tracing::info!(
+                    target: "anchors",
+                    active_nodes = active,
+                    rss_bytes = rss,
+                    gc_skipped = gc_stats.gc_skipped,
+                    free_skip = gc_stats.free_skip,
+                    free_attempts = gc_stats.free_attempts,
+                    free_succeeded = gc_stats.free_succeeded,
+                    pending_free = gc_stats.pending_free,
+                    gc_loss_ppm = loss_ppm,
+                    gc_loss_pct = loss_pct,
+                    gc_loss_n = skip_total,
+                    "anchors.active_nodes snapshot"
+                );
             }
         });
-        #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+        #[cfg(feature = "anchors_pending_queue")]
         self.process_pending_requests();
         #[cfg(debug_assertions)]
         trace!("...stabilize0");
     }
 
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     fn process_pending_requests(&self) {
         if Self::defer_disabled() {
             let mut queue = self.pending_requests.borrow_mut();
@@ -1281,7 +1227,7 @@ impl Engine {
         }
     }
 
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     fn describe_tokens(&self, tokens: &[NodeKey]) -> Vec<String> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1299,7 +1245,7 @@ impl Engine {
         })
     }
 
-    #[cfg(all(feature = "anchors_slotmap", feature = "anchors_pending_queue"))]
+    #[cfg(feature = "anchors_pending_queue")]
     fn debug_pending_queue_sample_enabled() -> bool {
         use std::sync::OnceLock;
 
@@ -1495,7 +1441,7 @@ impl Engine {
         // │ 兜底保护：节点可能在入队后被回收（handle_count 归零），       │
         // │ 此时 anchor 已被置空，继续重算只会 panic；直接跳过即可。       │
         // └─────────────────────────────────────────────────────────────┘
-        if unsafe { (*this_anchor.get()).is_none() } {
+        let Some(mut anchor_ptr) = (unsafe { *this_anchor.get() }) else {
             if cfg!(debug_assertions) {
                 // 若 anchor 为空但持有者计数大于 0，说明释放链路异常，应当尽快排查。
                 debug_assert!(
@@ -1506,13 +1452,12 @@ impl Engine {
                 );
             }
             return true;
-        }
-
-        let anchor_ref = unsafe {
-            (*this_anchor.get())
-                .as_mut()
-                .expect("anchor 已被移除，无法重算")
         };
+
+        // SAFETY:
+        // - 该引用只在本次 recalculate 调用栈内使用；
+        // - anchor_locked=true 约束了重入路径，避免同时存在多个可变引用。
+        let anchor_ref: &mut dyn GenericAnchor = unsafe { anchor_ptr.as_mut() };
         {
             // 把之前因借用冲突积累的 dirty 消息在这里一次性补偿。
             let mut pending = node.pending_dirty.borrow_mut();
@@ -1736,18 +1681,15 @@ impl Engine {
         out.push_str("digraph Anchors {\n");
         out.push_str("  rankdir=LR;\n");
         out.push_str("  node [shape=box, fontsize=10];\n");
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            let audit = self.token_audit_snapshot();
-            let last = audit
-                .last_deleted_token
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "None".to_string());
-            out.push_str(&format!(
-                "  labelloc=\"t\";\n  label=\"token_next={} | last_deleted={}\";\n",
-                audit.next_token, last
-            ));
-        }
+        let audit = self.token_audit_snapshot();
+        let last = audit
+            .last_deleted_token
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "None".to_string());
+        out.push_str(&format!(
+            "  labelloc=\"t\";\n  label=\"token_next={} | last_deleted={}\";\n",
+            audit.next_token, last
+        ));
 
         // 打印节点
         for (tok, label) in labels.iter() {
@@ -2035,8 +1977,8 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
             }
 
             // 常规路径：父节点未锁定时，直接下发 dirty，避免写入 pending_dirty 再补偿。
-            if let Some(anchor_impl) = unsafe { (*parent.anchor.get()).as_mut() } {
-                anchor_impl.dirty(&child);
+            if let Some(mut anchor_ptr) = unsafe { *parent.anchor.get() } {
+                unsafe { anchor_ptr.as_mut().dirty(&child) };
             }
 
             graph.queue_recalc(parent);
@@ -2094,8 +2036,8 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
             }
 
             // 常规路径：直接下发 dirty，避免写入 pending_dirty 再补偿。
-            if let Some(anchor_impl) = unsafe { (*parent.anchor.get()).as_mut() } {
-                anchor_impl.dirty(&id);
+            if let Some(mut anchor_ptr) = unsafe { *parent.anchor.get() } {
+                unsafe { anchor_ptr.as_mut().dirty(&id) };
             }
 
             graph.queue_recalc(parent);
@@ -2142,7 +2084,9 @@ impl<'eng> OutputContext<'eng> for EngineContext<'eng> {
             if graph2::recalc_state(node) != RecalcState::Ready {
                 panic!("attempted to get node that was not previously requested")
             }
-            let anchor_impl = unsafe { (*node.anchor.get()).as_ref().unwrap() };
+            let anchor_ptr =
+                unsafe { *node.anchor.get() }.expect("EngineContext::get: anchor 缺失");
+            let anchor_impl = unsafe { anchor_ptr.as_ref() };
             let output: &O = anchor_impl
                 .output(&mut EngineContext {
                     engine: self.engine,
@@ -2169,7 +2113,9 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                 panic!("attempted to get node that was not previously requested")
             }
 
-            let anchor_impl = unsafe { (*node.anchor.get()).as_ref().unwrap() };
+            let anchor_ptr =
+                unsafe { *node.anchor.get() }.expect("EngineContextMut::get: anchor 缺失");
+            let anchor_impl = unsafe { anchor_ptr.as_ref() };
             let output: &O = anchor_impl
                 .output(&mut EngineContext {
                     engine: self.engine,

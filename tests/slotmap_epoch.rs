@@ -1,5 +1,3 @@
-#![cfg(feature = "anchors_slotmap")]
-
 mod slotmap;
 
 use anchors::singlethread::Var;

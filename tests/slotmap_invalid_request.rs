@@ -1,5 +1,3 @@
-#![cfg(feature = "anchors_slotmap")]
-
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;

@@ -1,11 +1,10 @@
+use super::anchor_pool::{AnchorMemPool, AnchorPoolStatsSnapshot};
 use super::{AnchorDebugInfo, Generation, GenericAnchor};
-#[cfg(feature = "anchors_slotmap")]
 use super::{Engine, EngineContext};
-#[cfg(feature = "anchors_slotmap")]
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::ptr::NonNull;
 use std::rc::Rc;
-#[cfg(any(debug_assertions, feature = "anchors_slotmap"))]
 use std::sync::OnceLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +60,6 @@ fn debug_queue_enabled() -> bool {
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
 #[derive(Debug)]
 struct FreeTraceConfig {
     enabled: bool,
@@ -70,7 +68,6 @@ struct FreeTraceConfig {
     backtrace: bool,
 }
 
-#[cfg(feature = "anchors_slotmap")]
 #[derive(Debug)]
 struct TokenTraceConfig {
     enabled: bool,
@@ -79,7 +76,6 @@ struct TokenTraceConfig {
     backtrace: bool,
 }
 
-#[cfg(feature = "anchors_slotmap")]
 impl FreeTraceConfig {
     fn from_env() -> Self {
         ////////////////////////////////////////////////////////////////////////////////
@@ -123,13 +119,11 @@ impl FreeTraceConfig {
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
 fn free_trace_cfg() -> &'static FreeTraceConfig {
     static CFG: OnceLock<FreeTraceConfig> = OnceLock::new();
     CFG.get_or_init(FreeTraceConfig::from_env)
 }
 
-#[cfg(feature = "anchors_slotmap")]
 impl TokenTraceConfig {
     fn from_env(prefix: &str) -> Self {
         let enabled = emg_debug_env::bool_strict(prefix);
@@ -170,19 +164,16 @@ impl TokenTraceConfig {
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
 fn remove_trace_cfg() -> &'static TokenTraceConfig {
     static CFG: OnceLock<TokenTraceConfig> = OnceLock::new();
     CFG.get_or_init(|| TokenTraceConfig::from_env("ANCHORS_TRACE_REMOVE"))
 }
 
-#[cfg(feature = "anchors_slotmap")]
 fn reuse_trace_cfg() -> &'static TokenTraceConfig {
     static CFG: OnceLock<TokenTraceConfig> = OnceLock::new();
     CFG.get_or_init(|| TokenTraceConfig::from_env("ANCHORS_TRACE_REUSE"))
 }
 
-#[cfg(feature = "anchors_slotmap")]
 mod node_store {
     use slotmap::{DefaultKey, SlotMap};
     use std::cell::UnsafeCell;
@@ -429,7 +420,6 @@ mod node_store {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     impl NodeStore<super::Node> {
         /// 移除指定节点：解绑队列/父子指针并回收到 free list。
         ///
@@ -606,7 +596,8 @@ mod node_store {
             ////////////////////////////////////////////////////////////////////////////////
             let old_anchor = unsafe { (&mut *guard.anchor.get()).take() };
             if let Some(old_anchor) = old_anchor {
-                drop(old_anchor);
+                // 先析构，再回收 raw block（pool），减少 alloc/free 常数开销。
+                graph.drop_and_recycle_anchor_ptr(old_anchor);
             } else {
                 return true;
             }
@@ -641,11 +632,7 @@ mod node_store {
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
 use node_store as ag;
-
-#[cfg(not(feature = "anchors_slotmap"))]
-use arena_graph::raw as ag;
 
 use std::fmt;
 use std::iter::Iterator;
@@ -654,7 +641,6 @@ use std::iter::Iterator;
 pub struct NodeGuard<'gg>(ag::NodeGuard<'gg, Node>);
 
 /// slotmap GC 计数快照，用于日志与观测。
-#[cfg(feature = "anchors_slotmap")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GcStatsSnapshot {
     pub gc_skipped: u64,
@@ -668,7 +654,6 @@ pub struct GcStatsSnapshot {
     pub retired_free: usize,
 }
 
-#[cfg(feature = "anchors_slotmap")]
 impl GcStatsSnapshot {
     /// 计算 gc_skipped/free_skip 与 pending_free 的总占比，单位千分比。
     #[inline]
@@ -693,10 +678,7 @@ impl<'gg> fmt::Debug for NodeGuard<'gg> {
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
 type AgGuard<'gg> = ag::NodeStoreGuard<'gg, Node>;
-#[cfg(not(feature = "anchors_slotmap"))]
-type AgGuard<'gg> = ag::GraphGuard<'gg, Node>;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RecalcState {
@@ -706,18 +688,15 @@ pub enum RecalcState {
     Ready,
 }
 
-thread_local! {
-    pub static NEXT_TOKEN: Cell<u32> = Cell::new(0);
-}
-
 pub struct Graph2 {
-    #[cfg(feature = "anchors_slotmap")]
     nodes: ag::NodeStore<Node>,
-    #[cfg(not(feature = "anchors_slotmap"))]
-    nodes: ag::Graph<Node>,
-    #[cfg(feature = "anchors_slotmap")]
+    ////////////////////////////////////////////////////////////////////////////////
+    // Anchor 存储池（raw memory blocks）：
+    // - mount 时 alloc 一块 Layout 匹配的内存，并原地构造 anchor impl；
+    // - reclaim 时 drop_in_place + recycle 内存块，避免每次都走系统分配器。
+    ////////////////////////////////////////////////////////////////////////////////
+    anchor_pool: AnchorMemPool,
     active_nodes: Cell<usize>,
-    #[cfg(feature = "anchors_slotmap")]
     pending_free: RefCell<Vec<NodePtr>>,
     ////////////////////////////////////////////////////////////////////////////////
     // Epoch（读窗口）：
@@ -727,25 +706,14 @@ pub struct Graph2 {
     // 这样可以覆盖 “事件派发 + stabilize + render” 的读窗口，避免 TOCTOU：
     // 派发前半段拿到的 token，在派发后半段继续 get 时被回收导致 hard panic。
     ////////////////////////////////////////////////////////////////////////////////
-    #[cfg(feature = "anchors_slotmap")]
     epoch_depth: Cell<usize>,
-    #[cfg(feature = "anchors_slotmap")]
     retired_free: RefCell<Vec<NodePtr>>,
-    #[cfg(feature = "anchors_slotmap")]
     epoch_flushes: Cell<u64>,
-    #[cfg(feature = "anchors_slotmap")]
     gc_skipped: Cell<u64>,
-    #[cfg(feature = "anchors_slotmap")]
     free_skip: Cell<u64>,
-    #[cfg(feature = "anchors_slotmap")]
     free_attempts: Cell<u64>,
-    #[cfg(feature = "anchors_slotmap")]
     free_succeeded: Cell<u64>,
-    #[cfg(not(feature = "anchors_slotmap"))]
-    graph_token: u32,
-    #[cfg(feature = "anchors_slotmap")]
     token_counter: Cell<u64>,
-    #[cfg(feature = "anchors_slotmap")]
     last_deleted_token: Cell<Option<u64>>,
 
     still_alive: Rc<Cell<bool>>,
@@ -762,12 +730,10 @@ pub struct Graph2 {
 /// epoch 的 RAII 守卫：
 /// - 创建时：epoch_depth += 1
 /// - Drop 时：epoch_depth -= 1；当归零时触发 flush_retired（真正回收/复用 token）
-#[cfg(feature = "anchors_slotmap")]
 pub struct EpochGuard {
     graph: Rc<Graph2>,
 }
 
-#[cfg(feature = "anchors_slotmap")]
 impl EpochGuard {
     #[must_use]
     pub(crate) fn new(graph: Rc<Graph2>) -> Self {
@@ -776,7 +742,6 @@ impl EpochGuard {
     }
 }
 
-#[cfg(feature = "anchors_slotmap")]
 impl Drop for EpochGuard {
     fn drop(&mut self) {
         self.graph.leave_epoch();
@@ -814,11 +779,36 @@ pub struct Node {
     pub pending_recalc: Cell<bool>,
 
     /// Some() if this node is still active, None otherwise
-    pub anchor: UnsafeCell<Option<Box<dyn GenericAnchor>>>,
+    ///
+    /// 说明：
+    /// - 不再用 `Box<dyn GenericAnchor>` 触发每次 mount 的堆分配；
+    /// - 改为保存 pool 分配的 raw block（作为 trait object 指针）；
+    /// - reclaim 时由 Graph2 负责 drop_in_place + recycle（对齐 epoch 边界）。
+    pub anchor: UnsafeCell<Option<NonNull<dyn GenericAnchor>>>,
     /// 标记当前 anchor 是否正被 poll，避免重入。
     pub anchor_locked: Cell<bool>,
 
     pub ptrs: NodePtrs,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        ////////////////////////////////////////////////////////////////////////////////
+        // Graph2 drop 阶段兜底清理：
+        // - 运行期常规回收在 NodeStore::remove（reclaim）里完成；
+        // - 但若 Engine/Graph2 被提前 Drop（例如测试提前退出），仍需释放仍然存活的 anchor 存储；
+        // - 否则 raw pointer 形态会泄漏（旧的 Box 形态由字段 drop 自动回收）。
+        ////////////////////////////////////////////////////////////////////////////////
+        let Some(anchor) = self.anchor.get_mut().take() else {
+            return;
+        };
+
+        // SAFETY:
+        // - NodePtrs.graph 指向创建该节点的 Graph2，生命周期覆盖到 Graph2::drop 结束；
+        // - Graph2::drop 会先把 still_alive 置 false，避免析构链路再触发回收逻辑访问 graph。
+        let graph = unsafe { &*self.ptrs.graph };
+        graph.drop_and_recycle_anchor_ptr(anchor);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
@@ -948,14 +938,7 @@ impl<'a> std::ops::Deref for NodeGuard<'a> {
 impl<'a> NodeGuard<'a> {
     #[inline]
     fn make_ptr(&self) -> NodePtr {
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            self.0.make_ptr()
-        }
-        #[cfg(not(feature = "anchors_slotmap"))]
-        {
-            unsafe { self.0.make_ptr() }
-        }
+        self.0.make_ptr()
     }
 
     pub fn key(self) -> NodeKey {
@@ -1268,17 +1251,14 @@ impl<'a> NodeGuard<'a> {
 }
 
 impl<'gg> Graph2Guard<'gg> {
-    #[cfg(feature = "anchors_slotmap")]
     pub fn active_nodes(&self) -> usize {
         self.graph.active_nodes.get()
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     pub fn gc_stats(&self) -> GcStatsSnapshot {
         self.graph.gc_stats_snapshot()
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     pub fn has_recalc_pending(&self) -> bool {
         let queues = self.graph.recalc_queues.borrow();
@@ -1297,13 +1277,11 @@ impl<'gg> Graph2Guard<'gg> {
         false
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     pub fn has_pending_free(&self) -> bool {
         !self.graph.pending_free.borrow().is_empty()
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     pub fn retry_pending_free(&self) {
         self.graph.retry_pending_free();
     }
@@ -1541,14 +1519,17 @@ impl<'gg> Graph2Guard<'gg> {
         self.queue_recalc(node);
     }
 
-    /// 读取已 Ready 节点的输出副本，不触发额外 request，仅限 anchors_slotmap。
-    #[cfg(feature = "anchors_slotmap")]
+    /// 读取已 Ready 节点的输出副本，不触发额外 request。
     pub fn output_cached<O: Clone + 'static>(&self, engine: &Engine, node: NodeGuard<'gg>) -> O {
-        let anchor_impl = unsafe {
-            (*node.anchor.get())
-                .as_ref()
-                .expect("slotmap: anchor 缺失，无法读取缓存输出")
+        let anchor_ptr = unsafe {
+            (*node.anchor.get()).unwrap_or_else(|| {
+                panic!(
+                    "slotmap: anchor 缺失，无法读取缓存输出 token={:?}",
+                    node.key()
+                )
+            })
         };
+        let anchor_impl = unsafe { anchor_ptr.as_ref() };
         anchor_impl
             .output(&mut EngineContext { engine })
             .downcast_ref::<O>()
@@ -1558,50 +1539,42 @@ impl<'gg> Graph2Guard<'gg> {
 }
 
 impl Graph2 {
-    #[cfg(feature = "anchors_slotmap")]
     fn next_slot_token(&self) -> u64 {
         let current = self.token_counter.get();
         self.token_counter.set(current + 1);
         current
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     pub fn token_counter(&self) -> u64 {
         self.token_counter.get()
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     pub fn last_deleted_token(&self) -> Option<u64> {
         self.last_deleted_token.get()
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     fn inc_gc_skipped(&self) {
         self.gc_skipped.set(self.gc_skipped.get().saturating_add(1));
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     fn inc_free_skip(&self) {
         self.free_skip.set(self.free_skip.get().saturating_add(1));
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     fn inc_free_attempt(&self) {
         self.free_attempts
             .set(self.free_attempts.get().saturating_add(1));
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     #[inline]
     fn inc_free_succeeded(&self) {
         self.free_succeeded
             .set(self.free_succeeded.get().saturating_add(1));
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     pub fn gc_stats_snapshot(&self) -> GcStatsSnapshot {
         GcStatsSnapshot {
             gc_skipped: self.gc_skipped.get(),
@@ -1614,7 +1587,11 @@ impl Graph2 {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
+    #[must_use]
+    pub fn anchor_pool_stats_snapshot(&self) -> AnchorPoolStatsSnapshot {
+        self.anchor_pool.stats_snapshot()
+    }
+
     fn enqueue_free_retry(&self, ptr: NodePtr) {
         let mut pending = self.pending_free.borrow_mut();
         if !pending.iter().any(|p| *p == ptr) {
@@ -1622,7 +1599,6 @@ impl Graph2 {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     fn retry_pending_free(&self) {
         ////////////////////////////////////////////////////////////////////////////////
         // epoch 内禁止 token 物理回收/复用：
@@ -1657,13 +1633,11 @@ impl Graph2 {
     ////////////////////////////////////////////////////////////////////////////////
     // Epoch（读窗口）实现
     ////////////////////////////////////////////////////////////////////////////////
-    #[cfg(feature = "anchors_slotmap")]
     fn epoch_trace_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| emg_debug_env::bool_strict("ANCHORS_EPOCH_TRACE"))
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     fn enter_epoch(&self) {
         let prev = self.epoch_depth.get();
         let next = prev.saturating_add(1);
@@ -1679,7 +1653,6 @@ impl Graph2 {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     fn leave_epoch(&self) {
         let prev = self.epoch_depth.get();
         debug_assert!(prev > 0, "slotmap: leave_epoch depth 不应为 0");
@@ -1703,7 +1676,6 @@ impl Graph2 {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     fn retire_free(&self, ptr: NodePtr) {
         let mut retired = self.retired_free.borrow_mut();
         if retired.iter().any(|p| *p == ptr) {
@@ -1720,7 +1692,6 @@ impl Graph2 {
         }
     }
 
-    #[cfg(feature = "anchors_slotmap")]
     fn flush_retired(&self) {
         debug_assert_eq!(
             self.epoch_depth.get(),
@@ -1760,44 +1731,20 @@ impl Graph2 {
         self.retry_pending_free();
     }
 
-    #[cfg(not(feature = "anchors_slotmap"))]
-    fn next_slot_token(&self) -> u64 {
-        self.graph_token as u64
-    }
-
     pub fn new(max_height: usize) -> Self {
         Self {
-            #[cfg(feature = "anchors_slotmap")]
             nodes: ag::NodeStore::new(),
-            #[cfg(not(feature = "anchors_slotmap"))]
-            nodes: ag::Graph::new(),
-            #[cfg(not(feature = "anchors_slotmap"))]
-            graph_token: NEXT_TOKEN.with(|token| {
-                let n = token.get();
-                token.set(n + 1);
-                n
-            }),
-            #[cfg(feature = "anchors_slotmap")]
+            anchor_pool: AnchorMemPool::new(),
             token_counter: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             active_nodes: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             pending_free: RefCell::new(vec![]),
-            #[cfg(feature = "anchors_slotmap")]
             epoch_depth: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             retired_free: RefCell::new(vec![]),
-            #[cfg(feature = "anchors_slotmap")]
             epoch_flushes: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             gc_skipped: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             free_skip: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             free_attempts: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             free_succeeded: Cell::new(0),
-            #[cfg(feature = "anchors_slotmap")]
             last_deleted_token: Cell::new(None),
             recalc_queues: RefCell::new(vec![None; max_height]),
             recalc_min_height: Cell::new(max_height),
@@ -1815,10 +1762,54 @@ impl Graph2 {
         })
     }
 
+    ////////////////////////////////////////////////////////////////////////////////
+    // Anchor storage: pool alloc + 原地构造/析构
+    ////////////////////////////////////////////////////////////////////////////////
+
+    #[inline]
+    fn alloc_anchor_ptr<I>(&self, inner: I) -> NonNull<dyn GenericAnchor>
+    where
+        I: GenericAnchor + 'static,
+    {
+        let layout = std::alloc::Layout::new::<I>();
+        let raw = self.anchor_pool.alloc(layout);
+        let typed: NonNull<I> = raw.cast();
+        unsafe {
+            // 原地构造：避免 `Box::new` 的堆分配热点。
+            typed.as_ptr().write(inner);
+        }
+
+        // 说明：
+        // - raw pointer 赋值支持 unsize coercion：*mut I -> *mut dyn GenericAnchor
+        // - NonNull 要求非空；pool.alloc 已保证返回非空指针（含 ZST 虚指针）。
+        let trait_ptr: *mut dyn GenericAnchor = typed.as_ptr();
+        unsafe { NonNull::new_unchecked(trait_ptr) }
+    }
+
+    #[inline]
+    fn drop_and_recycle_anchor_ptr(&self, anchor: NonNull<dyn GenericAnchor>) {
+        unsafe {
+            // dyn trait object：size/align 由 vtable 元数据决定。
+            let anchor_ref: &dyn GenericAnchor = anchor.as_ref();
+            let size = std::mem::size_of_val(anchor_ref);
+            let align = std::mem::align_of_val(anchor_ref);
+            let layout = std::alloc::Layout::from_size_align(size, align)
+                .expect("anchor pool: size/align 应构成合法 Layout");
+
+            // 先析构对象，再回收 raw block。
+            std::ptr::drop_in_place(anchor.as_ptr());
+
+            // 将 fat pointer 降为 data pointer（thin），交给 pool 复用。
+            let data_ptr = anchor.as_ptr() as *mut () as *mut u8;
+            let data = NonNull::new_unchecked(data_ptr);
+            self.anchor_pool.recycle(data, layout);
+        }
+    }
+
     #[cfg(test)]
     pub fn insert_testing(&self) -> AnchorHandle {
         self.insert(
-            Box::new(crate::expert::constant::Constant::new_raw_testing(123)),
+            crate::expert::constant::Constant::new_raw_testing(123),
             AnchorDebugInfo {
                 location: None,
                 type_info: "testing dummy anchor",
@@ -1826,11 +1817,11 @@ impl Graph2 {
         )
     }
 
-    pub(super) fn insert(
-        &'_ self,
-        anchor: Box<dyn GenericAnchor>,
-        debug_info: AnchorDebugInfo,
-    ) -> AnchorHandle {
+    pub(super) fn insert<I>(&'_ self, inner: I, debug_info: AnchorDebugInfo) -> AnchorHandle
+    where
+        I: GenericAnchor + 'static,
+    {
+        let anchor = self.alloc_anchor_ptr(inner);
         self.nodes.with(|nodes| {
             let guard = if let Some(free_head) = self.free_head.get() {
                 let guard = NodeGuard(unsafe { free_head.lookup_unchecked() });
@@ -1838,20 +1829,11 @@ impl Graph2 {
                 //
                 // anchors_slotmap 下：free list 使用专用指针字段（free_next/free_prev），
                 // 避免和 recalc 队列（next/prev）互相污染导致“活节点被误复用”。
-                #[cfg(feature = "anchors_slotmap")]
                 {
                     self.free_head.set(guard.ptrs.free_next.get());
                     if let Some(next_ptr) = guard.ptrs.free_next.get() {
                         let next_node = unsafe { nodes.lookup_ptr(next_ptr) };
                         next_node.ptrs.free_prev.set(None);
-                    }
-                }
-                #[cfg(not(feature = "anchors_slotmap"))]
-                {
-                    self.free_head.set(guard.ptrs.next.get());
-                    if let Some(next_ptr) = guard.ptrs.next.get() {
-                        let next_node = unsafe { nodes.lookup_ptr(next_ptr) };
-                        next_node.ptrs.prev.set(None);
                     }
                 }
                 guard.observed.set(false);
@@ -1866,7 +1848,6 @@ impl Graph2 {
                 // - ANCHORS_TRACE_REUSE=1 ANCHORS_TRACE_REUSE_TOKEN=1012 ANCHORS_TRACE_REUSE_BACKTRACE=1
                 // - ANCHORS_TRACE_REUSE=1 ANCHORS_TRACE_REUSE_MATCH=node_builder.rs
                 ////////////////////////////////////////////////////////////////////////////////
-                #[cfg(feature = "anchors_slotmap")]
                 {
                     let cfg = reuse_trace_cfg();
                     if cfg.enabled {
@@ -1901,10 +1882,6 @@ impl Graph2 {
                     } else {
                         guard.slot_token.set(self.next_slot_token());
                     }
-                }
-                #[cfg(not(feature = "anchors_slotmap"))]
-                {
-                    guard.slot_token.set(self.next_slot_token());
                 }
                 guard.ptrs.clean_parent0.set(None);
                 guard.ptrs.clean_parent1.set(None);
@@ -1962,7 +1939,6 @@ impl Graph2 {
                 NodeGuard(nodes.insert(node))
             };
             let num = guard.key();
-            #[cfg(feature = "anchors_slotmap")]
             self.active_nodes
                 .set(self.active_nodes.get().saturating_add(1));
             AnchorHandle {
@@ -2326,7 +2302,6 @@ fn dequeue_calc_by_ptr(graph: &Graph2, target_ptr: NodePtr) -> bool {
     false
 }
 
-#[cfg(feature = "anchors_slotmap")]
 unsafe fn free(ptr: NodePtr) {
     let guard = unsafe { ptr.lookup_unchecked() };
     let graph: &Graph2 = unsafe { &*guard.ptrs.graph };
@@ -2363,31 +2338,6 @@ unsafe fn free(ptr: NodePtr) {
     if unsafe { !graph.nodes.remove(ptr) } {
         graph.enqueue_free_retry(ptr);
     }
-}
-
-#[cfg(not(feature = "anchors_slotmap"))]
-unsafe fn free(ptr: NodePtr) {
-    let guard = NodeGuard(unsafe { ptr.lookup_unchecked() });
-    let anchor_slot = unsafe { &mut *guard.anchor.get() };
-    if anchor_slot.is_none() {
-        return;
-    }
-    let _ = guard.drain_necessary_children();
-    let _ = guard.drain_clean_parents();
-    // unsafe: graph 指针来自节点内部，保持同生命周期。
-    let graph = unsafe { &*guard.ptrs.graph };
-    dequeue_calc(graph, guard);
-    let free_head = &graph.free_head;
-    let old_free = free_head.get();
-    if let Some(old_free) = old_free {
-        unsafe {
-            guard.0.lookup_ptr(old_free).ptrs.prev.set(Some(ptr));
-        }
-    }
-    guard.ptrs.next.set(old_free);
-    free_head.set(Some(ptr));
-    *anchor_slot = None;
-    guard.anchor_locked.set(false);
 }
 
 pub fn height(node: NodeGuard<'_>) -> usize {
@@ -2662,18 +2612,9 @@ mod test {
         let a = graph.insert_testing();
         let d = graph.insert_testing();
 
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            assert!(a.token().token > a_token.token);
-            assert!(b.token().token > b_token.token);
-            assert!(c.token().token > c_token.token);
-        }
-        #[cfg(not(feature = "anchors_slotmap"))]
-        {
-            assert_eq!(a_token, a.token());
-            assert_eq!(b_token, b.token());
-            assert_eq!(c_token, c.token());
-        }
+        assert!(a.token().token > a_token.token);
+        assert!(b.token().token > b_token.token);
+        assert!(c.token().token > c_token.token);
         let d_token = d.token();
 
         std::mem::drop(c);
@@ -2686,20 +2627,10 @@ mod test {
         let a = graph.insert_testing();
         let c = graph.insert_testing();
 
-        #[cfg(feature = "anchors_slotmap")]
-        {
-            assert!(a.token().token > a_token.token);
-            assert!(b.token().token > b_token.token);
-            assert!(c.token().token > c_token.token);
-            assert!(d.token().token > d_token.token);
-        }
-        #[cfg(not(feature = "anchors_slotmap"))]
-        {
-            assert_eq!(a_token, a.token());
-            assert_eq!(b_token, b.token());
-            assert_eq!(c_token, c.token());
-            assert_eq!(d_token, d.token());
-        }
+        assert!(a.token().token > a_token.token);
+        assert!(b.token().token > b_token.token);
+        assert!(c.token().token > c_token.token);
+        assert!(d.token().token > d_token.token);
     }
 
     #[test]
