@@ -1,4 +1,5 @@
 mod collect;
+pub mod dynamic_keyed_vector_collect;
 pub mod ord_map_collect;
 pub mod ord_map_methods;
 pub mod ord_map_voa_collect;
