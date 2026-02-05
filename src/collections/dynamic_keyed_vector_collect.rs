@@ -568,6 +568,78 @@ mod tests {
     }
 
     #[test]
+    fn append_only_creates_child_anchor_for_new_key() {
+        let order = order_anchor(DummyToken(1));
+
+        let created_count = std::rc::Rc::new(Cell::new(0u32));
+        let created_count_for_closure = std::rc::Rc::clone(&created_count);
+
+        let make_anchor = move |key: &u32| {
+            created_count_for_closure.set(created_count_for_closure.get() + 1);
+            // token 与 key 绑定，便于在 DummyCtx 中预先塞入值
+            value_anchor(DummyToken(400 + u64::from(*key)))
+        };
+
+        let vals_pool = vector::RRBPool::<u32>::new(16);
+        let mut inner = DynamicKeyedVectorCollect::<u32, u32, DummyEngine> {
+            order: order.clone(),
+            make_anchor: std::rc::Rc::new(make_anchor),
+            location: Location::caller(),
+            dirty: true,
+            invalid_keys: Default::default(),
+            cache: Default::default(),
+            order_keys: Vec::new(),
+            order_anchors: Vec::new(),
+            vals: None,
+            polls_buf: Vec::new(),
+            vals_pool,
+        };
+
+        let mut ctx = DummyCtx::new();
+        // 初始 order = [1,2]
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals.insert(DummyToken(1), Box::new(vector![1u32, 2]));
+
+        // child anchors 预置为 Ready + 给值（与 token 绑定）
+        ctx.polls.insert(DummyToken(401), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(401), Box::new(10u32));
+        ctx.polls.insert(DummyToken(402), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(402), Box::new(20u32));
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        assert_eq!(created_count.get(), 2, "首次应只创建 2 个 child anchors");
+        assert_eq!(inner.vals.clone().unwrap(), vector![10u32, 20]);
+        assert!(ctx.unrequested.is_empty(), "append 之前不应 unrequest");
+
+        // append：order = [1,2,3]
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
+        ctx.polls.insert(DummyToken(403), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(403), Box::new(30u32));
+
+        ctx.unrequested.clear();
+        inner.dirty = true;
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        assert_eq!(
+            created_count.get(),
+            3,
+            "append 只应为新增 key 创建 1 个 child anchor"
+        );
+        assert_eq!(inner.vals.clone().unwrap(), vector![10u32, 20, 30]);
+        assert!(
+            ctx.unrequested.is_empty(),
+            "append 不应 unrequest 旧 child anchors"
+        );
+    }
+
+    #[test]
     fn invalid_child_token_is_removed_and_unrequested_and_not_requested_again() {
         let order = order_anchor(DummyToken(1));
         let make_anchor = move |key: &u32| value_anchor(DummyToken(300 + u64::from(*key)));
