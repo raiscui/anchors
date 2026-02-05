@@ -329,7 +329,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::DynamicKeyedVectorCollect;
-    use crate::expert::{Anchor as ExpertAnchor, AnchorHandle, AnchorInner, Engine as EngineTrait, Poll, UpdateContext};
+    use crate::expert::{
+        Anchor as ExpertAnchor, AnchorHandle, AnchorInner, Engine as EngineTrait, Poll,
+        UpdateContext,
+    };
     use crate::im_rc::Vector;
     use crate::im_rc::vector;
     use emg_hasher::std::HashMap;
@@ -470,7 +473,8 @@ mod tests {
         let mut ctx = DummyCtx::new();
         // 初始 order = [1,2,3]
         ctx.polls.insert(DummyToken(1), Poll::Updated);
-        ctx.vals.insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
 
         // child anchors 预置为 Ready + 给值（与 token 绑定）
         ctx.polls.insert(DummyToken(101), Poll::Unchanged);
@@ -481,17 +485,24 @@ mod tests {
         ctx.vals.insert(DummyToken(103), Box::new(30u32));
 
         // poll：应创建 3 个 child，并生成 output
-        assert_eq!(AnchorInner::poll_updated(&mut inner, &mut ctx), Poll::Updated);
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
         assert_eq!(created_count.get(), 3, "首次应只创建 3 个 child anchors");
         assert_eq!(inner.vals.clone().unwrap(), vector![10u32, 20, 30]);
 
         // reorder：order = [3,2,1]
         ctx.polls.insert(DummyToken(1), Poll::Updated);
-        ctx.vals.insert(DummyToken(1), Box::new(vector![3u32, 2, 1]));
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![3u32, 2, 1]));
         inner.dirty = true;
 
         // 注意：reorder 不应再次调用 make_anchor（即不应创建新 child）
-        assert_eq!(AnchorInner::poll_updated(&mut inner, &mut ctx), Poll::Updated);
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
         assert_eq!(
             created_count.get(),
             3,
@@ -525,7 +536,8 @@ mod tests {
         let mut ctx = DummyCtx::new();
         // order = [1,2,3]
         ctx.polls.insert(DummyToken(1), Poll::Updated);
-        ctx.vals.insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
         // child anchors 预置为 Ready + 给值
         ctx.polls.insert(DummyToken(201), Poll::Unchanged);
         ctx.vals.insert(DummyToken(201), Box::new(10u32));
@@ -534,7 +546,10 @@ mod tests {
         ctx.polls.insert(DummyToken(203), Poll::Unchanged);
         ctx.vals.insert(DummyToken(203), Box::new(30u32));
 
-        assert_eq!(AnchorInner::poll_updated(&mut inner, &mut ctx), Poll::Updated);
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
         assert!(ctx.unrequested.is_empty(), "未移除 key 前不应 unrequest");
 
         // pop：order = [1,2]
@@ -542,7 +557,10 @@ mod tests {
         ctx.polls.insert(DummyToken(1), Poll::Updated);
         ctx.vals.insert(DummyToken(1), Box::new(vector![1u32, 2]));
         inner.dirty = true;
-        assert_eq!(AnchorInner::poll_updated(&mut inner, &mut ctx), Poll::Updated);
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
         assert!(
             ctx.unrequested.contains(&removed_anchor_token),
             "移除 key 必须 unrequest 对应子 Anchor"
@@ -578,7 +596,10 @@ mod tests {
         ctx.vals.insert(DummyToken(301), Box::new(10u32));
         ctx.polls.insert(DummyToken(302), Poll::PendingInvalidToken);
 
-        assert_eq!(AnchorInner::poll_updated(&mut inner, &mut ctx), Poll::Updated);
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
 
         // 输出只剩 a1
         assert_eq!(inner.vals.clone().unwrap(), vector![10u32]);
@@ -591,7 +612,10 @@ mod tests {
         ctx.requested.clear();
         inner.dirty = true;
         ctx.polls.insert(DummyToken(1), Poll::Unchanged);
-        assert_eq!(AnchorInner::poll_updated(&mut inner, &mut ctx), Poll::Unchanged);
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Unchanged
+        );
         assert!(
             !ctx.requested.contains(&DummyToken(302)),
             "invalid key 必须被跳过，不应再 request 其子 Anchor"
