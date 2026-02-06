@@ -1,7 +1,7 @@
+use emg_hasher::std::HashMap;
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::RefCell,
-    collections::HashMap,
     ptr::NonNull,
 };
 
@@ -70,7 +70,7 @@ struct AnchorMemPoolInner {
 impl Default for AnchorMemPoolInner {
     fn default() -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: HashMap::default(),
             alloc_calls: 0,
             alloc_hits: 0,
             alloc_misses: 0,

@@ -132,8 +132,6 @@ use std::backtrace::Backtrace;
 #[cfg(feature = "anchors_pending_queue")]
 use std::cell::Cell;
 use std::cell::RefCell;
-#[cfg(feature = "anchors_pending_queue")]
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::panic::Location;
@@ -206,7 +204,16 @@ struct PendingRequest {
 #[cfg(feature = "anchors_pending_queue")]
 #[derive(Default)]
 struct PendingQueue {
-    buckets: BTreeMap<PendingPriority, IndexMap<NodeKey, PendingRequest>>,
+    ////////////////////////////////////////////////////////////////////////////////
+    // buckets: PendingPriority -> IndexMap(child -> request)
+    //
+    // 说明:
+    // - PendingPriority 只有 4 档(0..=3),用固定数组即可;
+    // - 相比 BTreeMap:
+    //   - 避免 BTree 节点分配与指针追踪;
+    //   - drain 时可以直接按优先级顺序清空 bucket,并保留 bucket 的内部容量以复用。
+    ////////////////////////////////////////////////////////////////////////////////
+    buckets: [IndexMap<NodeKey, PendingRequest>; 4],
     index: HashMap<NodeKey, PendingPriority>,
 }
 
@@ -218,6 +225,33 @@ enum PendingEnqueueOutcome {
 
 #[cfg(feature = "anchors_pending_queue")]
 impl PendingQueue {
+    const PRIORITIES_DESC: [PendingPriority; 4] = [
+        PendingPriority::RenderCritical,
+        PendingPriority::LayoutHigh,
+        PendingPriority::StateNormal,
+        PendingPriority::BackgroundLow,
+    ];
+
+    #[inline]
+    fn bucket_index(priority: PendingPriority) -> usize {
+        debug_assert!(
+            matches!(
+                priority,
+                PendingPriority::BackgroundLow
+                    | PendingPriority::StateNormal
+                    | PendingPriority::LayoutHigh
+                    | PendingPriority::RenderCritical
+            ),
+            "pending_queue: priority 超出预期范围"
+        );
+        priority as usize
+    }
+
+    #[inline]
+    fn bucket_mut(&mut self, priority: PendingPriority) -> &mut IndexMap<NodeKey, PendingRequest> {
+        &mut self.buckets[Self::bucket_index(priority)]
+    }
+
     fn len(&self) -> usize {
         self.index.len()
     }
@@ -228,67 +262,42 @@ impl PendingQueue {
 
     fn insert(&mut self, entry: PendingRequest) -> PendingEnqueueOutcome {
         if let Some(old_priority) = self.index.get(&entry.child).copied() {
-            let (mut existing, empty_after_remove) = {
-                let bucket = self
-                    .buckets
-                    .get_mut(&old_priority)
-                    .expect("priority bucket missing");
-                let existing = bucket
-                    .shift_remove(&entry.child)
-                    .expect("pending entry missing");
-                (existing, bucket.is_empty())
-            };
-            if empty_after_remove {
-                self.buckets.remove(&old_priority);
-            }
+            let mut existing = self
+                .bucket_mut(old_priority)
+                .shift_remove(&entry.child)
+                .expect("pending entry missing");
             let target_priority = old_priority.max(entry.priority);
             existing.parent = entry.parent;
             existing.necessary |= entry.necessary;
             existing.priority = target_priority;
-            self.buckets
-                .entry(target_priority)
-                .or_insert_with(IndexMap::new)
+            self.bucket_mut(target_priority)
                 .insert(entry.child, existing);
             self.index.insert(entry.child, target_priority);
             PendingEnqueueOutcome::Replaced
         } else {
             self.index.insert(entry.child, entry.priority);
-            self.buckets
-                .entry(entry.priority)
-                .or_insert_with(IndexMap::new)
-                .insert(entry.child, entry);
+            self.bucket_mut(entry.priority).insert(entry.child, entry);
             PendingEnqueueOutcome::Inserted
         }
     }
 
-    fn pop_front(&mut self) -> Option<PendingRequest> {
-        let mut empty_priorities = Vec::new();
-        let mut result = None;
-        for (&priority, bucket) in self.buckets.iter_mut().rev() {
-            if let Some(token) = bucket.keys().next().copied() {
-                let entry = bucket.shift_remove(&token).expect("pending entry missing");
-                self.index.remove(&token);
-                result = Some(entry);
-            }
-            if bucket.is_empty() {
-                empty_priorities.push(priority);
-            }
-            if result.is_some() {
-                break;
-            }
+    fn drain_all_into(&mut self, out: &mut Vec<PendingRequest>) {
+        out.clear();
+        let expected = self.len();
+        if out.capacity() < expected {
+            out.reserve(expected - out.capacity());
         }
-        for priority in empty_priorities {
-            self.buckets.remove(&priority);
-        }
-        result
-    }
 
-    fn drain_all(&mut self) -> Vec<PendingRequest> {
-        let mut drained = Vec::with_capacity(self.len());
-        while let Some(entry) = self.pop_front() {
-            drained.push(entry);
+        // 按优先级从高到低 drain,同时保留每个 bucket 的内部容量以复用。
+        for priority in Self::PRIORITIES_DESC {
+            let bucket = self.bucket_mut(priority);
+            for (_, entry) in bucket.drain(..) {
+                out.push(entry);
+            }
         }
-        drained
+
+        // index 是去重索引,与 buckets 保持同步清空。
+        self.index.clear();
     }
 }
 
@@ -297,6 +306,20 @@ pub struct Engine {
     // TODO store Nodes on heap directly?? maybe try for Rc<RefCell<SlotMap>> now
     graph: Rc<Graph2>,
     dirty_marks: Rc<RefCell<Vec<NodeKey>>>,
+    ////////////////////////////////////////////////////////////////////////////////
+    // dirty_marks_scratch: 复用 update_dirty_marks 的临时 Vec
+    //
+    // 背景:
+    // - 旧实现用 `mem::take(dirty_marks)`:
+    //   - dirty_marks 会被替换成全新 Vec(容量=0),
+    //   - 本轮/下一轮再 push 时会反复触发 grow + alloc/free;
+    // - 在“动态 anchor churn”场景下,这会放大为 `RawVecInner::finish_grow` 热点。
+    //
+    // 这里改为:
+    // - 把本轮待处理 token drain 到 scratch(保留两边容量),
+    // - 处理期间 dirty_marks 仍可继续接收新的 push(用于 stabilize 内部 set)。
+    ////////////////////////////////////////////////////////////////////////////////
+    dirty_marks_scratch: RefCell<Vec<NodeKey>>,
 
     // tracks the current stabilization generation; incremented on every stabilize
     generation: Generation,
@@ -304,6 +327,8 @@ pub struct Engine {
     pending_requests: Rc<RefCell<PendingQueue>>,
     #[cfg(feature = "anchors_pending_queue")]
     pending_stats: Rc<PendingStatsInner>,
+    #[cfg(feature = "anchors_pending_queue")]
+    pending_drained_scratch: RefCell<Vec<PendingRequest>>,
     invalid_token_log: Rc<RefCell<InvalidTokenLogInner>>,
     unexpected_pending_log: Rc<RefCell<UnexpectedPendingLogInner>>,
 }
@@ -419,11 +444,14 @@ impl Engine {
         Self {
             graph,
             dirty_marks,
+            dirty_marks_scratch: RefCell::new(Vec::with_capacity(256)),
             generation: Generation::new(),
             #[cfg(feature = "anchors_pending_queue")]
             pending_requests: Rc::new(RefCell::new(PendingQueue::default())),
             #[cfg(feature = "anchors_pending_queue")]
             pending_stats: Rc::new(PendingStatsInner::default()),
+            #[cfg(feature = "anchors_pending_queue")]
+            pending_drained_scratch: RefCell::new(Vec::with_capacity(256)),
             invalid_token_log: Rc::new(RefCell::new(InvalidTokenLogInner::default())),
             unexpected_pending_log: Rc::new(RefCell::new(UnexpectedPendingLogInner::default())),
         }
@@ -901,8 +929,32 @@ impl Engine {
         #[cfg(debug_assertions)]
         trace!("update_dirty_marks");
         self.graph.with(|graph| {
-            let dirty_marks = std::mem::take(&mut *self.dirty_marks.borrow_mut());
-            for dirty in dirty_marks {
+            ////////////////////////////////////////////////////////////////////////////////
+            // 关键优化：dirty_marks 用 scratch 复用容量,避免 `mem::take` 造成的分配/回收风暴
+            //
+            // 语义要求：
+            // - 我们必须在处理本轮 dirty_marks 时释放对 dirty_marks 的借用,
+            //   以允许 stabilize 期间的 `Var::set` 继续 push 新 token；
+            // - 同时,dirty_marks 自身最好保留容量,否则 push 会频繁触发 grow/alloc。
+            //
+            // 做法：
+            // - 把当前 batch drain 到 `dirty_marks_scratch`；
+            // - dirty_marks 变为空 Vec(但容量保留)；
+            // - 处理 scratch,期间新 push 会进入 dirty_marks,留待下一轮/额外轮次收敛。
+            ////////////////////////////////////////////////////////////////////////////////
+            let mut scratch = self.dirty_marks_scratch.borrow_mut();
+            scratch.clear();
+            {
+                let mut dirty_marks = self.dirty_marks.borrow_mut();
+                let need = dirty_marks.len();
+                let cap = scratch.capacity();
+                if cap < need {
+                    scratch.reserve(need - cap);
+                }
+                scratch.extend(dirty_marks.drain(..));
+            }
+
+            for dirty in scratch.drain(..) {
                 if let Some(node) = graph.get(dirty) {
                     mark_dirty(graph, node, false);
                     // 确保自身也进入重算队列，避免特殊情况下 dirty 未触发队列（例如必要关系缺失）。
@@ -1093,20 +1145,31 @@ impl Engine {
     fn process_pending_requests(&self) {
         if Self::defer_disabled() {
             let mut queue = self.pending_requests.borrow_mut();
-            queue.buckets.clear();
+            for bucket in queue.buckets.iter_mut() {
+                bucket.clear();
+            }
             queue.index.clear();
             return;
         }
 
-        let outcome = {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 关键优化：pending queue drain 复用 scratch,避免每轮 stabilize 都分配新的 Vec
+        //
+        // 背景：
+        // - pending_queue 开启时,`request_node` 可能把大量请求延迟入队；
+        // - stabilize 末尾 drain -> retry -> reinsert 的循环若频繁分配短命 Vec,
+        //   会在 pprof 里放大为 `finish_grow/alloc` 热点。
+        ////////////////////////////////////////////////////////////////////////////////
+        let total_to_retry = {
+            let mut drained = self.pending_drained_scratch.borrow_mut();
+            drained.clear();
             let mut queue = self.pending_requests.borrow_mut();
             if queue.is_empty() {
                 return;
             }
-            queue.drain_all()
+            queue.drain_all_into(&mut drained);
+            drained.len()
         };
-        let drained = outcome;
-        let total_to_retry = drained.len();
         if total_to_retry > 0 {
             self.pending_stats.total_drained.set(
                 self.pending_stats
@@ -1117,7 +1180,8 @@ impl Engine {
             self.pending_stats.last_drain_drained.set(total_to_retry);
         }
 
-        for req in drained {
+        let mut drained = self.pending_drained_scratch.borrow_mut();
+        for req in drained.drain(..) {
             if Self::debug_pending_enabled() {
                 tracing::debug!(
                     target: "anchors",
@@ -1191,7 +1255,8 @@ impl Engine {
                     let queue = self.pending_requests.borrow();
                     queue
                         .buckets
-                        .values()
+                        .iter()
+                        .rev()
                         .flat_map(|bucket| bucket.values())
                         .take(8)
                         .copied()

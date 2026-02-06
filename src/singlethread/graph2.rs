@@ -1885,12 +1885,35 @@ impl Graph2 {
                 }
                 guard.ptrs.clean_parent0.set(None);
                 guard.ptrs.clean_parent1.set(None);
-                guard.ptrs.clean_parents.replace(vec![]);
+                ////////////////////////////////////////////////////////////////////////////////
+                // 复用 Vec 容量,降低动态 churn 下的分配/回收风暴
+                //
+                // 背景：
+                // - 该节点来自 free list,这些 Vec 往往在上一轮生命周期里已经扩容过；
+                // - 若这里用 `replace(Vec::new())`,会立刻释放旧 buffer,后续又在 request/match 中重新扩容,
+                //   pprof 里常体现为 `RawVecInner::finish_grow` 热点。
+                //
+                // 风险控制：
+                // - 为避免极端情况下 free list “长期持有超大 Vec buffer”导致 RSS 不可控,
+                //   对少数超大容量做阈值回收(直接丢弃 buffer)。
+                ////////////////////////////////////////////////////////////////////////////////
+                {
+                    let mut parents = guard.ptrs.clean_parents.borrow_mut();
+                    parents.clear();
+                    // clean_parents 通常很小,默认不做 shrink,尽量保留容量复用。
+                }
                 guard.ptrs.recalc_bucket.set(None);
                 guard.ptrs.recalc_state.set(RecalcState::Needed);
                 guard.ptrs.free_next.set(None);
                 guard.ptrs.free_prev.set(None);
-                guard.ptrs.necessary_children.replace(vec![]);
+                {
+                    const MAX_KEEP_CAPACITY: usize = 256;
+                    let mut children = guard.ptrs.necessary_children.borrow_mut();
+                    children.clear();
+                    if children.capacity() > MAX_KEEP_CAPACITY {
+                        *children = Vec::new();
+                    }
+                }
                 guard.ptrs.height.set(0);
                 guard.ptrs.handle_count.set(1);
                 guard.ptrs.prev.set(None);
@@ -1899,7 +1922,14 @@ impl Graph2 {
                 guard.last_ready.set(None);
                 guard.last_update.set(None);
                 guard.recalc_retry.set(0);
-                guard.pending_dirty.replace(vec![]);
+                {
+                    const MAX_KEEP_CAPACITY: usize = 64;
+                    let mut pending = guard.pending_dirty.borrow_mut();
+                    pending.clear();
+                    if pending.capacity() > MAX_KEEP_CAPACITY {
+                        *pending = Vec::new();
+                    }
+                }
                 guard.pending_recalc.set(false);
                 unsafe {
                     *guard.anchor.get() = Some(anchor);

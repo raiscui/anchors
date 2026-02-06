@@ -75,6 +75,48 @@ fn test_mark_observed() {
 }
 
 #[test]
+fn update_dirty_marks_should_not_drop_vec_capacity() {
+    ////////////////////////////////////////////////////////////////////////////////
+    // 回归测试：锁定 dirty_marks 的 scratch 复用策略
+    //
+    // 背景：
+    // - 旧实现使用 `mem::take(&mut dirty_marks)` 会把 dirty_marks 替换成全新 Vec(容量=0)；
+    // - 在高频 set/dirty 场景下,这会导致 dirty_marks 每轮都重新扩容,在 pprof 中放大为
+    //   `alloc::raw_vec::RawVecInner::finish_grow` 热点。
+    //
+    // 期望：
+    // - `update_dirty_marks()` 消费队列后,dirty_marks 的 capacity 应保留,避免下一轮 push 再分配。
+    ////////////////////////////////////////////////////////////////////////////////
+    let mut engine = Engine::new();
+
+    // 用一个稳定 token 反复填充 dirty_marks,只为了撑大 capacity。
+    let v = Var::new(1u32);
+    let watch = v.watch();
+    let token = watch.token();
+
+    {
+        // 先把容量拉大,确保能观察到“是否被重置为 0”。
+        let mut marks = engine.dirty_marks.borrow_mut();
+        marks.reserve(1024);
+        let cap_before = marks.capacity();
+        marks.extend(std::iter::repeat(token).take(512));
+        drop(marks);
+
+        // 只跑 update_dirty_marks: 它会 drain 本轮 dirty_marks,并把节点入队,但不会 stabilize。
+        engine.update_dirty_marks();
+
+        // dirty_marks 作为“可继续 push 的共享队列”,应当保持容量,不能退化回 0。
+        let marks_after = engine.dirty_marks.borrow();
+        assert_eq!(marks_after.len(), 0);
+        assert!(
+            marks_after.capacity() >= cap_before,
+            "dirty_marks capacity 被意外丢弃: before={cap_before} after={}",
+            marks_after.capacity()
+        );
+    }
+}
+
+#[test]
 fn stabilize_consumes_dirty_marks_created_during_stabilize() {
     ////////////////////////////////////////////////////////////////////////////////
     // 回归测试：锁定“方案A”的关键语义
