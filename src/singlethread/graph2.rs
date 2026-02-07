@@ -541,11 +541,21 @@ mod node_store {
                     let child = unsafe { guard.0.lookup_ptr(child_ptr) };
 
                     // fast path：若 parent 恰好在 clean_parent0，直接清空。
-                    if child.ptrs.clean_parent0.get().is_some_and(|k| k.ptr == ptr) {
+                    if child
+                        .ptrs
+                        .clean_parent0
+                        .get()
+                        .is_some_and(|link| link.key.ptr == ptr)
+                    {
                         child.ptrs.clean_parent0.set(None);
                     }
                     // fast path：若 parent 恰好在 clean_parent1，直接清空。
-                    if child.ptrs.clean_parent1.get().is_some_and(|k| k.ptr == ptr) {
+                    if child
+                        .ptrs
+                        .clean_parent1
+                        .get()
+                        .is_some_and(|link| link.key.ptr == ptr)
+                    {
                         child.ptrs.clean_parent1.set(None);
                     }
 
@@ -556,7 +566,7 @@ mod node_store {
                         return false;
                     };
                     if !child_parents.is_empty() {
-                        child_parents.retain(|p| p.ptr != ptr);
+                        child_parents.retain(|link| link.key.ptr != ptr);
                     }
 
                     child
@@ -764,6 +774,10 @@ pub struct Node {
     pub necessary_count: Cell<usize>,
 
     pub slot_token: Cell<u64>,
+    /// parent 依赖 epoch：
+    /// - 用于“逻辑失效”旧 parent link，而不是每次 dirty 都物理清空容器；
+    /// - 当前 epoch 的 link 视为 active，旧 epoch 自动视为 stale。
+    pub parent_epoch: Cell<u64>,
 
     pub debug_info: Cell<AnchorDebugInfo>,
 
@@ -827,13 +841,19 @@ impl NodeKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParentLink {
+    key: NodeKey,
+    epoch: u64,
+}
+
 pub struct NodePtrs {
     /// 依赖者（parent）列表：
     /// - 优先用两个 inline 槽位承载最常见的 <=2 个 parent，避免频繁 Vec 分配/扩容；
     /// - 当 parent > 2 时，再落到 `clean_parents` Vec（无序，可能重复，但 add_clean_parent 会去重）。
-    clean_parent0: Cell<Option<NodeKey>>,
-    clean_parent1: Cell<Option<NodeKey>>,
-    clean_parents: RefCell<Vec<NodeKey>>,
+    clean_parent0: Cell<Option<ParentLink>>,
+    clean_parent1: Cell<Option<ParentLink>>,
+    clean_parents: RefCell<Vec<ParentLink>>,
 
     graph: *const Graph2,
 
@@ -948,52 +968,97 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
+    #[inline]
+    fn current_parent_epoch(&self) -> u64 {
+        self.parent_epoch.get()
+    }
+
+    #[inline]
+    fn bump_parent_epoch(&self) -> u64 {
+        let current = self.current_parent_epoch();
+        let mut next = current.wrapping_add(1);
+        if next == 0 {
+            next = 1;
+        }
+        self.parent_epoch.set(next);
+        current
+    }
+
+    #[inline]
+    fn is_reusable_parent_link(&self, link: ParentLink, current_epoch: u64) -> bool {
+        ////////////////////////////////////////////////////////////////////////////////
+        // epoch 失效策略：
+        // - link.epoch != current_epoch: 说明是上一轮 dirty 之前的旧依赖，可直接复用槽位；
+        // - live 校验失败：说明 parent 已失活（token 代际变化/anchor 为空），也可复用。
+        ////////////////////////////////////////////////////////////////////////////////
+        link.epoch != current_epoch || self.live_parent_from_key(link.key).is_none()
+    }
+
     pub fn add_clean_parent(self, parent: NodeGuard<'a>) {
         let parent_key = parent.key();
+        let current_epoch = self.current_parent_epoch();
+        let new_link = ParentLink {
+            key: parent_key,
+            epoch: current_epoch,
+        };
         ////////////////////////////////////////////////////////////////////////////////
-        // 性能改良：去重 + 刷新 stale key
-        //
-        // 背景：
-        // - `clean_parent0/clean_parent1/clean_parents` 会被 `set_min_height` / mark_dirty / remove 路径频繁遍历；
-        // - 若同一个 parent 被重复 push，会让上述路径的工作量线性放大，最终体现为单次 click 变慢。
+        // 架构调整：parent link 不再通过“drain 物理删除”失效，而是通过 epoch 逻辑失效。
         //
         // 规则：
-        // - 若已存在同 ptr 的 parent：
-        //   - token 相同：直接跳过（避免重复）；
-        //   - token 不同：说明槽位已复用，旧 key stale；用新 key 覆盖旧 key（保证依赖边正确）。
+        // - 同 ptr 命中：只刷新 token/epoch，不做容器改动；
+        // - 槽位可复用（旧 epoch 或失活）时直接覆盖；
+        // - Vec 慢路径也优先复用 stale 槽位，避免 churn 下无限膨胀。
         ////////////////////////////////////////////////////////////////////////////////
-        // 快路径：两个 inline 槽位命中同 ptr，则仅做 token 刷新并返回。
-        if let Some(p0) = self.ptrs.clean_parent0.get() {
-            if p0.ptr == parent_key.ptr {
-                if p0.token != parent_key.token {
-                    self.ptrs.clean_parent0.set(Some(parent_key));
+        if let Some(mut p0) = self.ptrs.clean_parent0.get() {
+            if p0.key.ptr == parent_key.ptr {
+                if p0.key.token != parent_key.token || p0.epoch != current_epoch {
+                    p0.key = parent_key;
+                    p0.epoch = current_epoch;
+                    self.ptrs.clean_parent0.set(Some(p0));
                 }
                 return;
             }
         }
-        if let Some(p1) = self.ptrs.clean_parent1.get() {
-            if p1.ptr == parent_key.ptr {
-                if p1.token != parent_key.token {
-                    self.ptrs.clean_parent1.set(Some(parent_key));
+        if let Some(mut p1) = self.ptrs.clean_parent1.get() {
+            if p1.key.ptr == parent_key.ptr {
+                if p1.key.token != parent_key.token || p1.epoch != current_epoch {
+                    p1.key = parent_key;
+                    p1.epoch = current_epoch;
+                    self.ptrs.clean_parent1.set(Some(p1));
                 }
                 return;
             }
         }
 
-        // 填充空槽位：优先 0，再 1。
-        if self.ptrs.clean_parent0.get().is_none() {
-            self.ptrs.clean_parent0.set(Some(parent_key));
-        } else if self.ptrs.clean_parent1.get().is_none() {
-            self.ptrs.clean_parent1.set(Some(parent_key));
+        let slot0 = self.ptrs.clean_parent0.get();
+        if slot0.is_none()
+            || slot0.is_some_and(|link| self.is_reusable_parent_link(link, current_epoch))
+        {
+            self.ptrs.clean_parent0.set(Some(new_link));
         } else {
-            // 慢路径：>2 个 parent 才会走 Vec，避免不必要的分配。
-            let mut parents = self.ptrs.clean_parents.borrow_mut();
-            if let Some(existing) = parents.iter_mut().find(|k| k.ptr == parent_key.ptr) {
-                if existing.token != parent_key.token {
-                    *existing = parent_key;
-                }
+            let slot1 = self.ptrs.clean_parent1.get();
+            if slot1.is_none()
+                || slot1.is_some_and(|link| self.is_reusable_parent_link(link, current_epoch))
+            {
+                self.ptrs.clean_parent1.set(Some(new_link));
             } else {
-                parents.push(parent_key);
+                // 慢路径：>2 个 parent 才会走 Vec，且尽量复用 stale 槽位。
+                let mut parents = self.ptrs.clean_parents.borrow_mut();
+                if let Some(existing) = parents
+                    .iter_mut()
+                    .find(|link| link.key.ptr == parent_key.ptr)
+                {
+                    if existing.key.token != parent_key.token || existing.epoch != current_epoch {
+                        *existing = new_link;
+                    }
+                } else if let Some(reuse_idx) = parents
+                    .iter()
+                    .position(|link| self.is_reusable_parent_link(*link, current_epoch))
+                {
+                    parents[reuse_idx] = new_link;
+                } else {
+                    parents.push(new_link);
+                }
             }
         }
         if debug_parent_link_enabled() {
@@ -1001,11 +1066,12 @@ impl<'a> NodeGuard<'a> {
             let child_dbg = self.debug_info.get()._to_string();
             let parent_dbg = parent.debug_info.get()._to_string();
             println!(
-                "add_clean_parent child={:?} ({}) parent={:?} ({})",
+                "add_clean_parent child={:?} ({}) parent={:?} ({}) epoch={}",
                 self.key().raw_token(),
                 child_dbg,
                 parent.key().raw_token(),
-                parent_dbg
+                parent_dbg,
+                current_epoch,
             );
         }
     }
@@ -1027,10 +1093,10 @@ impl<'a> NodeGuard<'a> {
         let mut slot0 = self.ptrs.clean_parent0.get();
         let mut slot1 = self.ptrs.clean_parent1.get();
 
-        if slot0.is_some_and(|k| k.ptr == parent_ptr) {
+        if slot0.is_some_and(|link| link.key.ptr == parent_ptr) {
             slot0 = None;
         }
-        if slot1.is_some_and(|k| k.ptr == parent_ptr) {
+        if slot1.is_some_and(|link| link.key.ptr == parent_ptr) {
             slot1 = None;
         }
         if slot0.is_none() {
@@ -1043,7 +1109,7 @@ impl<'a> NodeGuard<'a> {
 
         let mut parents = self.ptrs.clean_parents.borrow_mut();
         if !parents.is_empty() {
-            parents.retain(|p| p.ptr != parent_ptr);
+            parents.retain(|link| link.key.ptr != parent_ptr);
         }
     }
 
@@ -1067,19 +1133,29 @@ impl<'a> NodeGuard<'a> {
     }
 
     pub fn clean_parents(&self) -> Vec<NodeGuard<'a>> {
+        let current_epoch = self.current_parent_epoch();
         let mut out = Vec::new();
         if let Some(p0) = self.ptrs.clean_parent0.get() {
-            if let Some(parent) = self.live_parent_from_key(p0) {
+            if p0.epoch == current_epoch
+                && let Some(parent) = self.live_parent_from_key(p0.key)
+            {
                 out.push(parent);
             }
         }
         if let Some(p1) = self.ptrs.clean_parent1.get() {
-            if let Some(parent) = self.live_parent_from_key(p1) {
+            if p1.epoch == current_epoch
+                && let Some(parent) = self.live_parent_from_key(p1.key)
+            {
                 out.push(parent);
             }
         }
         let parents = self.ptrs.clean_parents.borrow();
-        out.extend(parents.iter().filter_map(|k| self.live_parent_from_key(*k)));
+        out.extend(parents.iter().filter_map(|link| {
+            if link.epoch != current_epoch {
+                return None;
+            }
+            self.live_parent_from_key(link.key)
+        }));
         if debug_parent_flow_enabled() {
             println!(
                 "CLEAN_PARENTS node={:?} count={}",
@@ -1092,58 +1168,78 @@ impl<'a> NodeGuard<'a> {
 
     /// 遍历父节点，不分配临时 Vec，在线性链路上更轻量。
     pub fn for_each_parent(&self, mut f: impl FnMut(NodeGuard<'a>)) {
+        let current_epoch = self.current_parent_epoch();
         if let Some(p0) = self.ptrs.clean_parent0.get() {
-            if let Some(parent) = self.live_parent_from_key(p0) {
+            if p0.epoch == current_epoch
+                && let Some(parent) = self.live_parent_from_key(p0.key)
+            {
                 f(parent);
             }
         }
         if let Some(p1) = self.ptrs.clean_parent1.get() {
-            if let Some(parent) = self.live_parent_from_key(p1) {
+            if p1.epoch == current_epoch
+                && let Some(parent) = self.live_parent_from_key(p1.key)
+            {
                 f(parent);
             }
         }
-        for key in self.ptrs.clean_parents.borrow().iter().copied() {
-            if let Some(parent) = self.live_parent_from_key(key) {
+        for link in self.ptrs.clean_parents.borrow().iter().copied() {
+            if link.epoch != current_epoch {
+                continue;
+            }
+            if let Some(parent) = self.live_parent_from_key(link.key) {
                 f(parent);
             }
         }
     }
 
-    /// 遍历父节点的 key（不做活性校验）。
+    /// 遍历“当前 epoch 下”的父节点 key（不做活性校验）。
     ///
     /// 适用场景：
     /// - `set_min_height` 这类“稍后会在处理阶段再次做 token/anchor 校验”的路径；
     /// - 这样可以避免在遍历阶段就做一次 `lookup_unchecked + token/anchor` 检查，
     ///   进而减少重复校验造成的常数开销。
     pub fn for_each_parent_key(&self, mut f: impl FnMut(NodeKey)) {
+        let current_epoch = self.current_parent_epoch();
         if let Some(p0) = self.ptrs.clean_parent0.get() {
-            f(p0);
+            if p0.epoch == current_epoch {
+                f(p0.key);
+            }
         }
         if let Some(p1) = self.ptrs.clean_parent1.get() {
-            f(p1);
+            if p1.epoch == current_epoch {
+                f(p1.key);
+            }
         }
-        for key in self.ptrs.clean_parents.borrow().iter().copied() {
-            f(key);
+        for link in self.ptrs.clean_parents.borrow().iter().copied() {
+            if link.epoch == current_epoch {
+                f(link.key);
+            }
         }
     }
 
-    /// 取出并清空父节点列表，供 mark_dirty 等热路径复用。
+    /// 取出并“逻辑失效”当前父节点列表，供 mark_dirty 等热路径复用。
     pub fn drain_parents(&self, mut f: impl FnMut(NodeGuard<'a>)) {
+        let draining_epoch = self.bump_parent_epoch();
         if let Some(p0) = self.ptrs.clean_parent0.get() {
-            self.ptrs.clean_parent0.set(None);
-            if let Some(parent) = self.live_parent_from_key(p0) {
+            if p0.epoch == draining_epoch
+                && let Some(parent) = self.live_parent_from_key(p0.key)
+            {
                 f(parent);
             }
         }
         if let Some(p1) = self.ptrs.clean_parent1.get() {
-            self.ptrs.clean_parent1.set(None);
-            if let Some(parent) = self.live_parent_from_key(p1) {
+            if p1.epoch == draining_epoch
+                && let Some(parent) = self.live_parent_from_key(p1.key)
+            {
                 f(parent);
             }
         }
-        let mut parents = self.ptrs.clean_parents.borrow_mut();
-        for key in parents.drain(..) {
-            if let Some(parent) = self.live_parent_from_key(key) {
+        for link in self.ptrs.clean_parents.borrow().iter().copied() {
+            if link.epoch != draining_epoch {
+                continue;
+            }
+            if let Some(parent) = self.live_parent_from_key(link.key) {
                 f(parent);
             }
         }
@@ -1151,17 +1247,32 @@ impl<'a> NodeGuard<'a> {
 
     /// 父节点数量，用于日志统计，避免 Vec 分配。
     pub fn parents_len(&self) -> usize {
-        let extra = self.ptrs.clean_parents.borrow().len();
+        let current_epoch = self.current_parent_epoch();
+        let extra = self
+            .ptrs
+            .clean_parents
+            .borrow()
+            .iter()
+            .filter(|link| link.epoch == current_epoch)
+            .count();
         extra
-            + usize::from(self.ptrs.clean_parent0.get().is_some())
-            + usize::from(self.ptrs.clean_parent1.get().is_some())
+            + usize::from(
+                self.ptrs
+                    .clean_parent0
+                    .get()
+                    .is_some_and(|link| link.epoch == current_epoch),
+            )
+            + usize::from(
+                self.ptrs
+                    .clean_parent1
+                    .get()
+                    .is_some_and(|link| link.epoch == current_epoch),
+            )
     }
 
     pub fn drain_clean_parents(&self) -> Vec<NodeGuard<'a>> {
         let res = self.clean_parents();
-        self.ptrs.clean_parent0.set(None);
-        self.ptrs.clean_parent1.set(None);
-        self.ptrs.clean_parents.borrow_mut().clear();
+        let _ = self.bump_parent_epoch();
         if debug_parent_flow_enabled() {
             println!(
                 "DRAIN_CLEAN_PARENTS node={:?} drained={}",
@@ -1219,7 +1330,7 @@ impl<'a> NodeGuard<'a> {
                 .ptrs
                 .clean_parent0
                 .get()
-                .is_some_and(|k| k.ptr == parent_ptr)
+                .is_some_and(|link| link.key.ptr == parent_ptr)
             {
                 child_node.ptrs.clean_parent0.set(None);
             }
@@ -1227,13 +1338,13 @@ impl<'a> NodeGuard<'a> {
                 .ptrs
                 .clean_parent1
                 .get()
-                .is_some_and(|k| k.ptr == parent_ptr)
+                .is_some_and(|link| link.key.ptr == parent_ptr)
             {
                 child_node.ptrs.clean_parent1.set(None);
             }
             let mut child_parents = child_node.ptrs.clean_parents.borrow_mut();
             if !child_parents.is_empty() {
-                child_parents.retain(|p| p.ptr != parent_ptr);
+                child_parents.retain(|link| link.key.ptr != parent_ptr);
             }
         }
         let collected = children
@@ -1902,6 +2013,7 @@ impl Graph2 {
                     parents.clear();
                     // clean_parents 通常很小,默认不做 shrink,尽量保留容量复用。
                 }
+                guard.parent_epoch.set(1);
                 guard.ptrs.recalc_bucket.set(None);
                 guard.ptrs.recalc_state.set(RecalcState::Needed);
                 guard.ptrs.free_next.set(None);
@@ -1942,6 +2054,7 @@ impl Graph2 {
                     visited: Cell::new(false),
                     necessary_count: Cell::new(0),
                     slot_token: Cell::new(self.next_slot_token()),
+                    parent_epoch: Cell::new(1),
                     ptrs: NodePtrs {
                         clean_parent0: Cell::new(None),
                         clean_parent1: Cell::new(None),

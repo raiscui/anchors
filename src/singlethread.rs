@@ -785,7 +785,8 @@ impl Engine {
     // - pending_requests: slotmap+pending_queue 下的延迟请求
     //
     // 作用：
-    // - get/get_with 在读取输出后判断是否需要补一轮 stabilize
+    // - stabilize 做“固定点收敛”时判断是否需要继续下一轮
+    // - get/get_with/peek_value 判定当前输出是否可视为稳定
     ////////////////////////////////////////////////////////////////////////////////
     #[inline]
     fn has_pending_work(&self) -> bool {
@@ -813,13 +814,13 @@ impl Engine {
         }
 
         ////////////////////////////////////////////////////////////////////////////////
-        // 方案A: get 内部稳定化重试
+        // 调度层架构调整后，stabilize 已负责 dirty/recalc/pending 的主循环收敛。
         //
-        // 目标:
-        // - 当 output 阶段产生新的 dirty_marks 时, 在同一次 get 内再 stabilize 一轮
-        // - 避免 "先算 0 -> set 宽高 -> dirty 排队到下一帧" 的中间态被返回
+        // 但仍保留一个“读后补轮”：
+        // - 某些 output() 路径会在读取阶段触发 set（写回状态）；
+        // - 这些 dirty 发生在 stabilize 之后，必须在同一次 get 内补吃掉，避免中间态外泄。
         ////////////////////////////////////////////////////////////////////////////////
-        const MAX_STABLE_GET_ROUNDS: usize = 4;
+        const MAX_POST_READ_ROUNDS: usize = 4;
         let mut rounds: usize = 0;
         loop {
             self.stabilize();
@@ -829,12 +830,12 @@ impl Engine {
             });
 
             let pending = self.has_pending_work();
-            if !pending || rounds >= MAX_STABLE_GET_ROUNDS {
-                if pending && rounds >= MAX_STABLE_GET_ROUNDS {
+            if !pending || rounds >= MAX_POST_READ_ROUNDS {
+                if pending && rounds >= MAX_POST_READ_ROUNDS {
                     tracing::warn!(
                         target: "anchors",
                         rounds,
-                        "get::<O> stabilize 重试达到上限, 仍存在待处理工作"
+                        "get::<O> 读后补轮达到上限, 仍存在待处理工作"
                     );
                 }
                 return out;
@@ -849,13 +850,12 @@ impl Engine {
         func: F,
     ) -> R {
         ////////////////////////////////////////////////////////////////////////////////
-        // 方案A: get_with 内部稳定化重试
+        // 与 get 一致：保留“读后补轮”来吸收 output() 期间产生的新增 dirty。
         //
-        // 约束:
-        // - FnOnce 只能执行一次,因此必须在稳定后再调用
-        // - 若 output 阶段触发 dirty_marks,先重试,最后一次才执行 func
+        // 约束：
+        // - FnOnce 只能在最终稳定轮执行一次。
         ////////////////////////////////////////////////////////////////////////////////
-        const MAX_STABLE_GET_ROUNDS: usize = 4;
+        const MAX_POST_READ_ROUNDS: usize = 4;
         let mut rounds: usize = 0;
         let mut func = Some(func);
         loop {
@@ -873,12 +873,12 @@ impl Engine {
             });
 
             let pending = self.has_pending_work();
-            if !pending || rounds >= MAX_STABLE_GET_ROUNDS {
-                if pending && rounds >= MAX_STABLE_GET_ROUNDS {
+            if !pending || rounds >= MAX_POST_READ_ROUNDS {
+                if pending && rounds >= MAX_POST_READ_ROUNDS {
                     tracing::warn!(
                         target: "anchors",
                         rounds,
-                        "get_with stabilize 重试达到上限, 仍存在待处理工作"
+                        "get_with 读后补轮达到上限, 仍存在待处理工作"
                     );
                 }
                 let f = func.take().expect("get_with: func 已被消费");
@@ -975,46 +975,42 @@ impl Engine {
     pub fn stabilize(&mut self) {
         #[cfg(debug_assertions)]
         trace!("stabilize");
-        self.update_dirty_marks();
         self.generation.increment();
-        self.stabilize_with_pending_queue();
+        self.update_dirty_marks();
 
         ////////////////////////////////////////////////////////////////////////////////
-        // 方案A(彻底正确)：让一次 `Engine::get()` 内部的 stabilize 具备“收敛性”
+        // 调度层架构重构：在 stabilize 内部做“工作集固定点收敛”
         //
         // 背景：
-        // - 在当前架构里，某些节点在 poll_updated 期间会触发 `StateVOA/StateVar::set`，
-        //   这些 set 只会把 token 追加到 `dirty_marks`；
-        // - 但 `Engine::get()` 只在开头调用一次 stabilize；
-        // - 因此同一帧内会出现“先用旧值算出 0 → 再写入宽高 → dirty 需要下一轮 get 才生效”的窗口，
-        //   最终导致 present 采样到 size=0 的中间态（表现为新增条目不显示/位置不对）。
+        // - 过去 `stabilize` 主要处理 dirty_marks，`get/get_with` 再做外层重试；
+        // - 这会把收敛职责拆散到两层，导致重复进入调度循环，放大 `request_node` 热点。
         //
-        // 解决：
-        // - 在本次 stabilize 结束后，若发现 stabilize 期间又产生了新的 dirty_marks，
-        //   则继续补一轮 update_dirty_marks + stabilize_with_pending_queue，直到收敛。
-        // - 这样 `scene_ctx_sa.get()` 返回的是“本次 get 期间可达的收敛结果”，避免中间态进入 present。
+        // 现在：
+        // - 统一由 `stabilize` 负责 dirty/recalc/pending 的闭包收敛；
+        // - `get/get_with` 只需调用一次 stabilize 并读取结果。
         //
         // 安全阀：
-        // - 额外轮次做上限，避免异常情况下 dirty_marks 被持续写入导致事件循环卡死。
+        // - 固定点轮次有上限，避免非收敛依赖导致事件循环长时间卡住。
         ////////////////////////////////////////////////////////////////////////////////
-        const MAX_EXTRA_ROUNDS: usize = 8;
-        let mut extra_rounds: usize = 0;
-        while !self.dirty_marks.borrow().is_empty() && extra_rounds < MAX_EXTRA_ROUNDS {
-            extra_rounds = extra_rounds.saturating_add(1);
+        const MAX_STABILIZE_ROUNDS: usize = 8;
+        let mut rounds: usize = 0;
+        let mut pending_work = true;
+        while pending_work && rounds < MAX_STABILIZE_ROUNDS {
+            rounds = rounds.saturating_add(1);
             #[cfg(debug_assertions)]
-            trace!(
-                "stabilize: extra_rounds={} reason=dirty_marks_not_empty",
-                extra_rounds
-            );
-            self.update_dirty_marks();
+            trace!("stabilize: round={} pending_work={}", rounds, pending_work);
             self.stabilize_with_pending_queue();
+            pending_work = self.has_pending_work();
+            if pending_work && !self.dirty_marks.borrow().is_empty() {
+                self.update_dirty_marks();
+            }
         }
 
-        if !self.dirty_marks.borrow().is_empty() {
+        if pending_work {
             tracing::warn!(
                 target: "anchors",
-                extra_rounds,
-                "stabilize: dirty_marks 仍未收敛（已达额外轮次上限），本轮将返回可能的中间态；建议排查是否存在 stabilize 期间反复 set 的非收敛依赖"
+                rounds = MAX_STABILIZE_ROUNDS,
+                "stabilize: 调度工作集在上限轮次后仍未收敛（dirty/recalc/pending 仍存在），建议排查循环依赖或长期 PendingDefer 链路"
             );
         }
         #[cfg(debug_assertions)]
