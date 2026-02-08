@@ -1056,7 +1056,18 @@ impl Engine {
                 0
             };
 
-            let mut spin_last: VecDeque<(usize, u64, String)> = VecDeque::with_capacity(32);
+            ////////////////////////////////////////////////////////////////////////////////
+            // 常数优化: 默认关闭 spin_debug 时不分配 VecDeque。
+            //
+            // 背景:
+            // - `stabilize_with_pending_queue` 是高频路径(每次 click/flush 都会进来)；
+            // - 过去即使没开 `ANCHORS_DEBUG_SPIN`,也会 `with_capacity(32)` 触发一次堆分配；
+            // - 在 list perf 场景下(数百次点击),这会放大 allocator/drop 噪声。
+            ////////////////////////////////////////////////////////////////////////////////
+            let mut spin_last: VecDeque<(usize, u64, String)> = VecDeque::new();
+            if spin_debug {
+                spin_last = VecDeque::with_capacity(32);
+            }
             graph.retry_pending_free();
             while let Some((height, node)) = graph.recalc_pop_next() {
                 if spin_debug {
