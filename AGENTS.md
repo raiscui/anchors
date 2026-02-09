@@ -51,6 +51,16 @@ PR 描述应包含动机、影响面与运行命令.
 若涉及 UI 或性能变化, 提供截图或指标.
 关联 Issue 并列出期待的评审人.
 
+## 四文件上下文（anchors 子目录）
+
+- 对于多步骤任务（>=3 步）:
+  - 使用 `anchors/task_plan.md` 跟踪阶段与决策.
+  - 使用 `anchors/notes.md` 记录调研与结论.
+  - 使用 `anchors/WORKLOG.md` 记录最终执行事实.
+  - 使用 `anchors/ERRORFIX.md` 记录问题/根因/修复/验证.
+- 上述文件采用追加写入策略,避免中间插入造成追溯困难.
+- 若出现历史版本（如 `task_plan_*.md`）,连续学习结束后移动到 `anchors/archive/`.
+
 ## 安全与配置提示
 `lock_strict` 默认启用, `ANCHORS_LOCK_STRICT` 非 0 时阻断重入缺陷.
 `Engine::export_dot_from_tokens` 仅在可信环境调用, 避免泄露图谱.
