@@ -122,9 +122,9 @@ pub use crate::expert::MultiAnchor;
 
 use crate::expert::{AnchorInner, OutputContext, Poll, UpdateContext};
 
+use emg_hasher::indexmap::{IndexMap, IndexSet};
 use emg_hasher::std::HashMap;
 use generation::Generation;
-use indexmap::{IndexMap, IndexSet};
 #[cfg(not(target_arch = "wasm32"))]
 use libc::{RUSAGE_SELF, getrusage, rusage};
 use std::any::Any;
@@ -1689,7 +1689,7 @@ impl Engine {
     /// ```
     pub fn export_dot_from_tokens(&self, roots: &[AnchorToken]) -> String {
         // 使用 BFS 遍历从 roots 可达的子图
-        let mut visited: IndexSet<AnchorToken> = IndexSet::new();
+        let mut visited: IndexSet<AnchorToken> = IndexSet::default();
         let mut queue: VecDeque<AnchorToken> = VecDeque::new();
 
         for &r in roots {
@@ -1706,7 +1706,7 @@ impl Engine {
         }
 
         let mut edges: Vec<(AnchorToken, AnchorToken, EdgeKind)> = Vec::new();
-        let mut labels: IndexMap<AnchorToken, String> = IndexMap::new();
+        let mut labels: IndexMap<AnchorToken, String> = IndexMap::default();
 
         self.graph.with(|graph| {
             while let Some(tok) = queue.pop_front() {
@@ -1795,7 +1795,7 @@ impl Engine {
         roots: &[AnchorToken],
         names: &IndexMap<AnchorToken, String>,
     ) -> String {
-        let mut visited: IndexSet<AnchorToken> = IndexSet::new();
+        let mut visited: IndexSet<AnchorToken> = IndexSet::default();
         let mut queue: VecDeque<AnchorToken> = VecDeque::new();
         for &r in roots {
             if visited.insert(r) {
@@ -1810,7 +1810,7 @@ impl Engine {
         }
 
         let mut edges: Vec<(AnchorToken, AnchorToken, EdgeKind)> = Vec::new();
-        let mut labels: IndexMap<AnchorToken, String> = IndexMap::new();
+        let mut labels: IndexMap<AnchorToken, String> = IndexMap::default();
 
         self.graph.with(|graph| {
             while let Some(tok) = queue.pop_front() {
