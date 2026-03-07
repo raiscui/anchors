@@ -2,6 +2,7 @@ use tracing::{error, trace};
 
 use super::{
     Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext,
+    bind_or_verify_dirty_handle,
 };
 use std::{any::Any, cell::RefCell, fmt::Debug};
 use std::{fmt::Display, rc::Rc};
@@ -22,6 +23,7 @@ struct VarAnchor<T, E: Engine> {
 #[derive(Clone)]
 struct VarShared<T, E: Engine> {
     dirty_handle: Option<E::DirtyHandle>,
+    dirty_handle_owner_id: Option<usize>,
     val: Rc<T>,
     value_changed: bool,
     ////////////////////////////////////////////////////////////////////////////////
@@ -44,6 +46,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VarShared")
             .field("dirty_handle", &self.dirty_handle)
+            .field("dirty_handle_owner_id", &self.dirty_handle_owner_id)
             .field("val", &self.val)
             .field("value_changed", &self.value_changed)
             .field("pending_dirty", &self.pending_dirty)
@@ -80,6 +83,25 @@ mod test {
         println!("2.{a:#?}");
         a.set(2);
         println!("3.{a:#?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "dirty_handle 绑定的 engine 发生切换")]
+    fn var_should_panic_when_polled_by_another_engine() {
+        // ─────────────────────────────────────────────────────────────
+        // 场景:
+        // - source 在 engine-A 创建时,会预绑定一个 dirty_handle。
+        // - mapped 与第一次 `.get()` 发生在 engine-B。
+        // - 现在我们明确要求 dirty_handle owner 不可漂移:
+        //   一旦被另一个 engine 轮询,应立即 panic,而不是热路径持续重绑。
+        // ─────────────────────────────────────────────────────────────
+        let _engine_a = Engine::new();
+        let source = Var::new(1u32);
+
+        let mut engine_b = Engine::new();
+        let mapped = source.watch().map(|value| *value + 1);
+
+        let _ = engine_b.get(&mapped);
     }
 }
 impl<T, E: Engine> Eq for Var<T, E> {}
@@ -120,6 +142,7 @@ impl<T: 'static, E: Engine> Var<T, E> {
         let val = Rc::new(val);
         let inner = Rc::new(RefCell::new(VarShared {
             dirty_handle: None,
+            dirty_handle_owner_id: None,
             val: val.clone(),
             value_changed: true,
             pending_dirty: false,
@@ -134,7 +157,9 @@ impl<T: 'static, E: Engine> Var<T, E> {
         // - 若引擎不支持兜底句柄，保持 None。
         ////////////////////////////////////////////////////////////////////////////////
         if let Some(handle) = <E as Engine>::fallback_dirty_handle(anchor.token()) {
-            inner.borrow_mut().dirty_handle = Some(handle);
+            let mut inner_mut = inner.borrow_mut();
+            inner_mut.dirty_handle_owner_id = handle.owner_id();
+            inner_mut.dirty_handle = Some(handle);
         }
         Var { inner, anchor }
     }
@@ -171,6 +196,7 @@ impl<T: 'static, E: Engine> Var<T, E> {
         if inner.dirty_handle.is_none() {
             let token = self.anchor.token();
             if let Some(handle) = <E as Engine>::fallback_dirty_handle(token) {
+                inner.dirty_handle_owner_id = handle.owner_id();
                 inner.dirty_handle = Some(handle);
             }
         }
@@ -247,18 +273,29 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         trace!("poll_updated");
         let mut inner = self.inner.borrow_mut();
-        let first_update = inner.dirty_handle.is_none();
-        if first_update {
-            inner.dirty_handle = Some(ctx.dirty_handle());
-            ////////////////////////////////////////////////////////////////////////////////
-            // 补偿：若之前 set 未能入队，首次建立 dirty_handle 后立刻补一次 mark_dirty。
-            ////////////////////////////////////////////////////////////////////////////////
-            if inner.pending_dirty {
-                if let Some(waker) = &inner.dirty_handle {
-                    waker.mark_dirty();
-                }
-                inner.pending_dirty = false;
+        ////////////////////////////////////////////////////////////////////////////////
+        // 收口语义:
+        // - dirty_handle 只在首次 poll 时绑定到当前 engine；
+        // - 若后续 poll 发生在另一份 engine 上,直接 panic；
+        // - 不再为“跨 engine 漂移”付出每次 poll 都重绑的常态成本。
+        ////////////////////////////////////////////////////////////////////////////////
+        let VarShared {
+            dirty_handle,
+            dirty_handle_owner_id,
+            ..
+        } = &mut *inner;
+        bind_or_verify_dirty_handle::<E, G>(
+            dirty_handle,
+            dirty_handle_owner_id,
+            ctx,
+            "Var",
+            std::any::type_name::<T>(),
+        );
+        if inner.pending_dirty {
+            if let Some(waker) = &inner.dirty_handle {
+                waker.mark_dirty();
             }
+            inner.pending_dirty = false;
         }
         if inner.value_changed {
             inner.value_changed = false;

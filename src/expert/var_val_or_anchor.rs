@@ -9,7 +9,8 @@ mod external_impl;
 use tracing::{debug, error, trace};
 
 use super::{
-    Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext, Var,
+    Anchor, AnchorHandle, AnchorInner, DirtyHandle, Engine, OutputContext, Poll, UpdateContext,
+    Var, bind_or_verify_dirty_handle,
 };
 
 use std::{cell::RefCell, fmt::Debug};
@@ -24,6 +25,7 @@ struct VarEitherAnchor<T, E: Engine> {
 #[derive(Clone)]
 struct VarEAShared<T, E: Engine> {
     dirty_handle: Option<E::DirtyHandle>,
+    dirty_handle_owner_id: Option<usize>,
     val: Rc<ValOrAnchor<T, E>>,
     output_stale: bool,
     ////////////////////////////////////////////////////////////////////////////////
@@ -40,6 +42,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VarShared")
             .field("dirty_handle", &self.dirty_handle)
+            .field("dirty_handle_owner_id", &self.dirty_handle_owner_id)
             .field("val", &self.val)
             .field("value_changed", &self.output_stale)
             .field("pending_dirty", &self.pending_dirty)
@@ -454,6 +457,7 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
         let val: Rc<ValOrAnchor<T, E>> = Rc::new(val.into());
         let inner = Rc::new(RefCell::new(VarEAShared {
             dirty_handle: None,
+            dirty_handle_owner_id: None,
             val: val.clone(),
             output_stale: true,
             pending_dirty: false,
@@ -468,7 +472,9 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
         // - 若当前 Engine 不支持兜底句柄，仍保持 None，不改变原有语义。
         ////////////////////////////////////////////////////////////////////////////////
         if let Some(handle) = <E as Engine>::fallback_dirty_handle(anchor.token()) {
-            inner.borrow_mut().dirty_handle = Some(handle);
+            let mut inner_mut = inner.borrow_mut();
+            inner_mut.dirty_handle_owner_id = handle.owner_id();
+            inner_mut.dirty_handle = Some(handle);
         }
         VarVOA { inner, anchor }
     }
@@ -489,6 +495,7 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
         if inner.dirty_handle.is_none() {
             let token = self.anchor.token();
             if let Some(handle) = <E as Engine>::fallback_dirty_handle(token) {
+                inner.dirty_handle_owner_id = handle.owner_id();
                 inner.dirty_handle = Some(handle);
             }
         }
@@ -576,18 +583,29 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
         let mut inner = self.inner.borrow_mut();
 
         if inner.output_stale {
-            let first = inner.dirty_handle.is_none();
-            if first {
-                inner.dirty_handle = Some(ctx.dirty_handle());
-                ////////////////////////////////////////////////////////////////////////////////
-                // 补偿：若之前 set 未能入队，首次建立 dirty_handle 后立刻补一次 mark_dirty。
-                ////////////////////////////////////////////////////////////////////////////////
-                if inner.pending_dirty {
-                    if let Some(waker) = &inner.dirty_handle {
-                        waker.mark_dirty();
-                    }
-                    inner.pending_dirty = false;
+            ////////////////////////////////////////////////////////////////////////////////
+            // 收口语义:
+            // - dirty_handle 只在首次 poll 时绑定到当前 engine；
+            // - 若后续 poll 发生在另一份 engine 上,直接 panic；
+            // - 不再为“跨 engine 漂移”付出每次 poll 都重绑的常态成本。
+            ////////////////////////////////////////////////////////////////////////////////
+            let VarEAShared {
+                dirty_handle,
+                dirty_handle_owner_id,
+                ..
+            } = &mut *inner;
+            bind_or_verify_dirty_handle::<E, G>(
+                dirty_handle,
+                dirty_handle_owner_id,
+                ctx,
+                "VarVOA",
+                std::any::type_name::<T>(),
+            );
+            if inner.pending_dirty {
+                if let Some(waker) = &inner.dirty_handle {
+                    waker.mark_dirty();
                 }
+                inner.pending_dirty = false;
             }
             debug!("a0");
             let mut force_unchanged_no_clone = false;
@@ -728,6 +746,25 @@ mod tests {
         },
         singlethread::{Engine, Var},
     };
+
+    #[test]
+    #[should_panic(expected = "dirty_handle 绑定的 engine 发生切换")]
+    fn var_voa_should_panic_when_polled_by_another_engine() {
+        // ─────────────────────────────────────────────────────────────
+        // 场景:
+        // - VarVOA 在 engine-A 创建时,可能先缓存了一个旧 dirty_handle。
+        // - 真正把它 request/get 的却是 engine-B。
+        // - 现在改为显式约束:
+        //   一旦跨 engine 轮询,立即 panic,不再自动重绑。
+        // ─────────────────────────────────────────────────────────────
+        let _engine_a = Engine::new();
+        let source = VarVOA::<u32, Engine>::new(1u32);
+
+        let mut engine_b = Engine::new();
+        let mapped = source.watch().map(|value: &u32| *value + 1);
+
+        let _ = engine_b.get(&mapped);
+    }
     // #[test]
     // fn test_var_mem() {
     //     let mut engine = Engine::new();
@@ -918,6 +955,7 @@ mod tests {
 
         let inner = Rc::new(RefCell::new(super::VarEAShared::<u32, PendingEngine> {
             dirty_handle: None,
+            dirty_handle_owner_id: None,
             val: Rc::new(ValOrAnchor::Val(1u32)),
             output_stale: false,
             pending_dirty: false,
@@ -1056,6 +1094,7 @@ mod tests {
 
         let shared = Rc::new(RefCell::new(super::VarEAShared::<u32, DummyEngine> {
             dirty_handle: None,
+            dirty_handle_owner_id: None,
             val: Rc::new(ValOrAnchor::Anchor(bad_anchor)),
             output_stale: true,
             pending_dirty: false,
@@ -1185,6 +1224,7 @@ mod tests {
 
         let shared = Rc::new(RefCell::new(super::VarEAShared::<u32, DummyEngine> {
             dirty_handle: None,
+            dirty_handle_owner_id: None,
             val: bad_rc.clone(),
             output_stale: false,
             pending_dirty: false,

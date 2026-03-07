@@ -223,6 +223,18 @@ pub trait DirtyHandle {
     /// Indicates that the Anchor associated with this `DirtyHandle` may have a changed its output, and should
     /// be repolled.
     fn mark_dirty(&self);
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 返回当前 dirty_handle 绑定的 engine owner id。
+    ///
+    /// 说明：
+    /// - 默认返回 None，表示该引擎未提供可比较的 owner 身份；
+    /// - 用于把“同一个 Var 被不同 engine 轮询”从隐式错行为变成显式 panic；
+    /// - 仅用于约束校验，不参与业务逻辑。
+    /// ////////////////////////////////////////////////////////////////////////////
+    fn owner_id(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The context passed to an `AnchorInner` when its `output` method is called.
@@ -265,6 +277,62 @@ pub trait UpdateContext {
     /// non incremental means. For instance, perhaps this `AnchorInner`s value represents the current time, or
     /// it's a `Var` that has a setter function.
     fn dirty_handle(&mut self) -> <Self::Engine as Engine>::DirtyHandle;
+
+    /// ////////////////////////////////////////////////////////////////////////////
+    /// 返回当前 poll 上下文所属的 engine owner id。
+    ///
+    /// 说明：
+    /// - 默认通过 `dirty_handle().owner_id()` 推导；
+    /// - 引擎可以覆盖该方法，避免为了拿 owner id 而临时构造 dirty_handle。
+    /// ////////////////////////////////////////////////////////////////////////////
+    fn dirty_handle_owner_id(&mut self) -> Option<usize> {
+        self.dirty_handle().owner_id()
+    }
+}
+
+/// ////////////////////////////////////////////////////////////////////////////
+/// 将 dirty_handle 绑定到首次 poll 的 engine，并在后续 poll 中校验 owner 不漂移。
+///
+/// 语义：
+/// - 若尚未绑定 dirty_handle，则在当前 poll 里建立一次；
+/// - 若已绑定且引擎提供 owner id，则要求 owner 必须稳定一致；
+/// - 一旦切换 engine，立即 panic，避免继续在热路径上默默“自动适配”。
+/// ////////////////////////////////////////////////////////////////////////////
+#[inline]
+pub(crate) fn bind_or_verify_dirty_handle<E, G>(
+    dirty_handle: &mut Option<E::DirtyHandle>,
+    dirty_handle_owner_id: &mut Option<usize>,
+    ctx: &mut G,
+    owner_label: &str,
+    output_type: &'static str,
+) where
+    E: Engine + ?Sized,
+    G: UpdateContext<Engine = E>,
+{
+    if dirty_handle.is_none() {
+        let handle = ctx.dirty_handle();
+        *dirty_handle_owner_id = handle.owner_id();
+        *dirty_handle = Some(handle);
+        return;
+    }
+
+    if dirty_handle_owner_id.is_none() {
+        *dirty_handle_owner_id = dirty_handle
+            .as_ref()
+            .and_then(crate::expert::DirtyHandle::owner_id);
+    }
+
+    let Some(bound_owner) = *dirty_handle_owner_id else {
+        return;
+    };
+    let Some(current_owner) = ctx.dirty_handle_owner_id() else {
+        return;
+    };
+
+    assert_eq!(
+        bound_owner, current_owner,
+        "{owner_label} dirty_handle 绑定的 engine 发生切换: type={output_type} bound_owner={bound_owner:#x} current_owner={current_owner:#x}"
+    );
 }
 
 /// The engine-agnostic implementation of each type of Anchor. You likely don't need to implement your own

@@ -2128,6 +2128,10 @@ impl crate::expert::DirtyHandle for DirtyHandle {
     fn mark_dirty(&self) {
         self.dirty_marks.borrow_mut().push(self.num);
     }
+
+    fn owner_id(&self) -> Option<usize> {
+        Some(Rc::as_ptr(&self.dirty_marks) as usize)
+    }
 }
 
 pub struct EngineContext<'eng> {
@@ -2336,6 +2340,10 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
             num: self.node.key(),
             dirty_marks: self.engine.dirty_marks.clone(),
         }
+    }
+
+    fn dirty_handle_owner_id(&mut self) -> Option<usize> {
+        Some(Rc::as_ptr(&self.engine.dirty_marks) as usize)
     }
 }
 
