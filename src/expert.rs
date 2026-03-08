@@ -295,6 +295,18 @@ pub trait AnchorInner<E: Engine + ?Sized> {
     where
         'slf: 'out;
 
+    /// 当一个节点从 `Unnecessary` 再次变成 `Observed/Necessary` 时调用。
+    ///
+    /// 背景:
+    /// - 某些 Anchor 会在内部缓存“是否需要重新 request 输入”的标志位；
+    /// - 若节点在 unobserve 期间与输入断开,这些标志位可能一直保持 clean；
+    /// - 重新进入必要链后,如果不主动把自己标回 stale,就会直接返回旧缓存输出。
+    ///
+    /// 默认实现是 no-op:
+    /// - 简单 Anchor 若没有内部 stale 缓存,无需特殊处理；
+    /// - 有内部 stale/dirty 标志的实现应在 override 里把自己切回“需要重新 request 输入”的状态。
+    fn reconnect_on_observed(&mut self) {}
+
     /// An optional function to report the track_caller-derived callsite where
     /// this Anchor was created. Useful for debugging purposes.
     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {

@@ -427,6 +427,24 @@ impl Engine {
         0
     }
 
+    #[inline]
+    fn reconnect_node_after_observed_transition<'gg>(
+        &self,
+        graph: Graph2Guard<'gg>,
+        node: NodeGuard<'gg>,
+    ) {
+        ////////////////////////////////////////////////////////////////////////////////
+        // observed/necessary 链重新接回时,需要同时做两件事:
+        // 1. 通知 AnchorInner 把自己的 stale/dirty 标志重新打开
+        // 2. 把节点重新送入 recalc 队列,让它按当前输入重建依赖关系
+        ////////////////////////////////////////////////////////////////////////////////
+        if let Some(mut anchor_ptr) = unsafe { *node.anchor.get() } {
+            unsafe { anchor_ptr.as_mut().reconnect_on_observed() };
+        }
+        graph2::needs_recalc(node);
+        graph.queue_recalc(node);
+    }
+
     /// Creates a new Engine with maximum height 256.
     pub fn new() -> Self {
         Self::new_with_max_height(256)
@@ -599,7 +617,27 @@ impl Engine {
     pub fn mark_observed<O: 'static>(&mut self, anchor: &Anchor<O>) {
         self.graph.with(|graph| {
             let node = self.expect_node(&graph, anchor.token(), "mark_observed");
+            let was_observed_state = Self::check_observed_raw(node);
             node.observed.set(true);
+            ////////////////////////////////////////////////////////////////////////////////
+            // 关键修复:
+            // - 节点从 `Unnecessary -> Observed` 时,即使当前 `recalc_state == Ready`,
+            //   也必须补一次 recalc；
+            // - 否则它可能继续抱着“上次被观察时”的旧依赖链和旧缓存输出。
+            //
+            // 典型现象:
+            // - `then` / 动态子树在 unobserve 期间切换了输入分支；
+            // - 重新 observe 后若直接 fast-path 读缓存,就会继续吐旧输出。
+            //
+            // 因此这里的判定不是“只有非 Ready 才入队”,而是:
+            // - 非 Ready: 当然需要入队
+            // - 之前是 Unnecessary: 也要强制补一轮,把必要链重新接回
+            ////////////////////////////////////////////////////////////////////////////////
+            if was_observed_state == ObservedState::Unnecessary {
+                self.reconnect_node_after_observed_transition(graph, node);
+                return;
+            }
+
             if graph2::recalc_state(node) != RecalcState::Ready {
                 graph.queue_recalc(node);
             }
@@ -1533,6 +1571,28 @@ impl Engine {
         {
             // 把之前因借用冲突积累的 dirty 消息在这里一次性补偿。
             let mut pending = node.pending_dirty.borrow_mut();
+            #[cfg(debug_assertions)]
+            if !pending.is_empty() {
+                let node_debug = node.debug_info.get()._to_string();
+                if pending_dirty_match(node_debug.as_str()) {
+                    let children: Vec<String> = pending
+                        .iter()
+                        .map(|child| {
+                            format!(
+                                "{}:{}",
+                                child.raw_token(),
+                                unsafe { child.ptr.lookup_unchecked() }
+                                    .debug_info
+                                    .get()
+                                    ._to_string()
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "[anchors][pending_dirty_replay] node={node_debug} pending_children={children:?}"
+                    );
+                }
+            }
             for child in pending.drain(..) {
                 anchor_ref.dirty(&child);
             }
@@ -1938,6 +1998,31 @@ fn debug_dirty_flow_enabled() -> bool {
 }
 
 #[inline]
+fn pending_dirty_match(debug: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        let Some(filter) = emg_debug_env::str_allow_empty("ANCHORS_DEBUG_PENDING_DIRTY_MATCH")
+        else {
+            return false;
+        };
+        let filter = filter.trim();
+        if filter.is_empty() {
+            return false;
+        }
+        filter
+            .split(',')
+            .map(str::trim)
+            .any(|needle| !needle.is_empty() && debug.contains(needle))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = debug;
+        false
+    }
+}
+
+#[inline]
 fn debug_request_enabled() -> bool {
     #[cfg(debug_assertions)]
     {
@@ -2065,6 +2150,23 @@ fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
     let mut pending = parent.pending_dirty.borrow_mut();
     if !pending.contains(&child) {
         pending.push(child);
+        #[cfg(debug_assertions)]
+        {
+            let parent_debug = parent.debug_info.get()._to_string();
+            let child_debug = unsafe { child.ptr.lookup_unchecked() }
+                .debug_info
+                .get()
+                ._to_string();
+            if pending_dirty_match(parent_debug.as_str()) || pending_dirty_match(child_debug.as_str())
+            {
+                eprintln!(
+                    "[anchors][pending_dirty_push] child={} ({child_debug}) -> parent={} ({parent_debug}) size={}",
+                    child.raw_token(),
+                    parent.key().raw_token(),
+                    pending.len(),
+                );
+            }
+        }
         if debug_dirty_flow_enabled() {
             println!(
                 "PENDING_DIRTY child={:?} ({}) -> parent={:?} ({})",
@@ -2367,6 +2469,8 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
         }
 
         let self_is_necessary = Engine::check_observed_raw(self.node) != ObservedState::Unnecessary;
+        let child_was_unnecessary =
+            necessary && self_is_necessary && Engine::check_observed_raw(child) == ObservedState::Unnecessary;
 
         if graph2::recalc_state(child) != RecalcState::Ready {
             child.add_clean_parent(self.node);
@@ -2394,6 +2498,12 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             child.add_clean_parent(self.node);
             if necessary && self_is_necessary {
                 self.node.add_necessary_child(child);
+            }
+            if child_was_unnecessary {
+                self.pending_on_anchor_get = true;
+                self.engine
+                    .reconnect_node_after_observed_transition(self.graph, child);
+                return self.defer_or_pending(child, necessary, self_is_necessary);
             }
             match (child.last_update.get(), self.node.last_ready.get()) {
                 (Some(a), Some(b)) if a < b => Poll::Unchanged,
@@ -2431,6 +2541,7 @@ pub trait GenericAnchor {
     fn output<'slf, 'out>(&'slf self, ctx: &mut EngineContext<'out>) -> &'out dyn Any
     where
         'slf: 'out;
+    fn reconnect_on_observed(&mut self);
     fn debug_info(&self) -> AnchorDebugInfo;
 }
 impl<I: AnchorInner<Engine> + 'static> GenericAnchor for I {
@@ -2445,6 +2556,9 @@ impl<I: AnchorInner<Engine> + 'static> GenericAnchor for I {
         'slf: 'out,
     {
         AnchorInner::output(self, ctx)
+    }
+    fn reconnect_on_observed(&mut self) {
+        AnchorInner::reconnect_on_observed(self)
     }
     fn debug_info(&self) -> AnchorDebugInfo {
         let ad = AnchorDebugInfo {

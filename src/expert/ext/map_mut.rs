@@ -47,21 +47,49 @@ macro_rules! impl_tuple_map_mut {
                 &mut self,
                 ctx: &mut G,
             ) -> Poll {
+                #[cfg(debug_assertions)]
+                let debug_map_mut = emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP_MUT")
+                    && (self.location.file().ends_with("node_builder.rs")
+                        || self.location.file().ends_with("event_snapshot.rs"));
+
                 // 已进入降级冻结：保持旧输出，避免重复 request 失效 token。
                 if self.degraded_on_invalid {
+                    #[cfg(debug_assertions)]
+                    if debug_map_mut {
+                        let mut tokens: Vec<<<E as Engine>::AnchorHandle as AnchorHandle>::Token> =
+                            Vec::new();
+                        $(
+                            tokens.push(self.anchors.$num.token());
+                        )+
+                        eprintln!(
+                            "[anchors][map_mut] degraded_skip loc={:?} out_type={} tokens={tokens:?}",
+                            self.location,
+                            std::any::type_name::<Out>(),
+                        );
+                    }
                     self.output_stale = false;
                     return Poll::Unchanged;
                 }
                 if !self.output_stale {
+                    #[cfg(debug_assertions)]
+                    if debug_map_mut {
+                        let mut tokens: Vec<<<E as Engine>::AnchorHandle as AnchorHandle>::Token> =
+                            Vec::new();
+                        $(
+                            tokens.push(self.anchors.$num.token());
+                        )+
+                        eprintln!(
+                            "[anchors][map_mut] clean_skip loc={:?} out_type={} tokens={tokens:?}",
+                            self.location,
+                            std::any::type_name::<Out>(),
+                        );
+                    }
                     return Poll::Unchanged;
                 }
 
                 let mut found_pending = false;
                 let mut found_invalid = false;
                 let mut found_updated = false;
-                #[cfg(debug_assertions)]
-                let debug_map_mut = emg_debug_env::bool_lenient("ANCHORS_DEBUG_MAP_MUT")
-                    && self.location.file().ends_with("node_builder.rs");
                 #[cfg(debug_assertions)]
                 let debug_degrade =
                     emg_debug_env::bool_lenient("ANCHORS_DEBUG_DEGRADE_ON_INVALID");
@@ -73,6 +101,20 @@ macro_rules! impl_tuple_map_mut {
                 } else {
                     None
                 };
+
+                #[cfg(debug_assertions)]
+                if debug_map_mut {
+                    let mut tokens: Vec<<<E as Engine>::AnchorHandle as AnchorHandle>::Token> =
+                        Vec::new();
+                    $(
+                        tokens.push(self.anchors.$num.token());
+                    )+
+                    eprintln!(
+                        "[anchors][map_mut] poll_stale loc={:?} out_type={} tokens={tokens:?}",
+                        self.location,
+                        std::any::type_name::<Out>(),
+                    );
+                }
 
                 $(
                     let poll = ctx.request(&self.anchors.$num, true);
@@ -148,6 +190,10 @@ macro_rules! impl_tuple_map_mut {
                 'slf: 'out,
             {
                 &self.output
+            }
+
+            fn reconnect_on_observed(&mut self) {
+                self.output_stale = true;
             }
 
             fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {

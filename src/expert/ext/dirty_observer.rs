@@ -137,6 +137,10 @@ macro_rules! impl_tuple_dirty_observer {
                 &self.version
             }
 
+            fn reconnect_on_observed(&mut self) {
+                self.output_stale = true;
+            }
+
             fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
                 Some(("dirty_observer", self.location))
             }

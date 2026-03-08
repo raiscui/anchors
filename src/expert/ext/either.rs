@@ -217,6 +217,10 @@ macro_rules! impl_tuple_either {
                 }
             }
 
+            fn reconnect_on_observed(&mut self) {
+                self.output_stale = true;
+            }
+
             fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
                 Some(("either", self.location))
             }
@@ -569,5 +573,50 @@ mod tests {
         let poll = AnchorInner::poll_updated(&mut either, &mut ctx);
         assert_eq!(Poll::PendingInvalidToken, poll);
         assert!(!either.degraded_on_invalid);
+    }
+
+    #[test]
+    fn either_downstream_should_refresh_when_selected_output_anchor_changes_without_parent_get() {
+        let mut engine = Engine::new();
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // 场景:
+        // - `either` 固定选择 `src.watch()`
+        // - 后续只读取它的下游 `map`
+        // - 中间不直接 `get(either)`
+        //
+        // 这个形态和当前 combobox 的 `view_gel_state().map(...)` 很接近:
+        // - 上游动态输出 anchor 的 token 不变
+        // - 选中的 output anchor 内部值变了
+        // - 观察点只在更下游
+        ////////////////////////////////////////////////////////////////////////////////
+        let choose_src = Var::new(true);
+        let src = Var::new(10);
+        let fallback = Var::new(-1);
+
+        let src_for_either = src.clone();
+        let fallback_for_either = fallback.clone();
+        let either: crate::expert::Anchor<i32, Engine> =
+            choose_src.watch().either(move |selected| -> crate::expert::ValOrAnchor<i32, Engine> {
+            if *selected {
+                src_for_either.watch().into()
+            } else {
+                fallback_for_either.watch().into()
+            }
+        });
+
+        let downstream = either.map(|value: &i32| value + 1);
+
+        assert_eq!(engine.get(&downstream), 11);
+
+        // 只更新当前被选中的 output anchor。
+        // 关键点: 这里故意不先 `get(&either)`，直接读取更下游。
+        src.set(20);
+
+        assert_eq!(
+            engine.get(&downstream),
+            21,
+            "selected output anchor 已变化时, 只读取 downstream 也必须看到新值"
+        );
     }
 }

@@ -169,6 +169,10 @@ macro_rules! impl_tuple_then {
                 ctx.get(self.f_anchor.as_ref().unwrap())
             }
 
+            fn reconnect_on_observed(&mut self) {
+                self.output_stale = true;
+            }
+
             fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
                 Some(("then", self.location))
             }
@@ -207,7 +211,8 @@ where
 
     fn dirty(&mut self, edge: &<E::AnchorHandle as AnchorHandle>::Token) {
         let debug_then = emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN")
-            && self.location.file().ends_with("node_item_rc_sv.rs");
+            && (self.location.file().ends_with("node_item_rc_sv.rs")
+                || self.location.file().ends_with("event_snapshot.rs"));
         if edge == &self.anchor.data.token() {
             self.degraded_on_invalid = false;
             self.output_stale = true;
@@ -247,7 +252,8 @@ where
 
     fn poll_updated<G: UpdateContext<Engine = E>>(&mut self, ctx: &mut G) -> Poll {
         let debug_then = emg_debug_env::bool_lenient("ANCHORS_DEBUG_THEN")
-            && self.location.file().ends_with("node_item_rc_sv.rs");
+            && (self.location.file().ends_with("node_item_rc_sv.rs")
+                || self.location.file().ends_with("event_snapshot.rs"));
         if debug_then {
             let input_token = self.anchor.token();
             let output_token = self.f_anchor.as_ref().map(|anchor| anchor.token());
@@ -428,6 +434,10 @@ where
         &self.cached_output
     }
 
+    fn reconnect_on_observed(&mut self) {
+        self.output_stale = true;
+    }
+
     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
         Some(("then_clone1", self.location))
     }
@@ -506,6 +516,10 @@ where
         'slf: 'out,
     {
         ctx.get(self.f_anchor.as_ref().unwrap())
+    }
+
+    fn reconnect_on_observed(&mut self) {
+        self.output_stale = true;
     }
 
     fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
@@ -610,6 +624,10 @@ macro_rules! impl_tuple_then_dedupe {
                 'slf: 'out,
             {
                 ctx.get(self.f_anchor.as_ref().unwrap())
+            }
+
+            fn reconnect_on_observed(&mut self) {
+                self.output_stale = true;
             }
 
             fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {

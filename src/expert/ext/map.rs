@@ -182,6 +182,10 @@ macro_rules! impl_tuple_map {
                     .expect("output called on Map before value was calculated")
             }
 
+            fn reconnect_on_observed(&mut self) {
+                self.output_stale = true;
+            }
+
             fn debug_location(&self) -> Option<(&'static str, &'static Location<'static>)> {
                 Some(("map", self.location))
             }

@@ -75,6 +75,70 @@ fn test_mark_observed() {
 }
 
 #[test]
+fn mark_observed_should_rebuild_then_after_reobserve() {
+    ////////////////////////////////////////////////////////////////////////////////
+    // 回归测试:
+    // - 模拟 `then` 输出在 observed -> unobserved -> observed 之间切换分支；
+    // - 若 re-observe 后仍直接返回旧缓存,说明“重新观察 Ready 节点”没有把依赖链重新接回。
+    //
+    // 这和 combobox 当前的症状高度一致:
+    // - EventSnapshot root 在 keepalive gate 关闭时会被 mark_unobserved；
+    // - 之后 refresh rev / subtree builder 已变化,但重新 observed 后仍拿到旧 popup skeleton。
+    ////////////////////////////////////////////////////////////////////////////////
+    let mut engine = Engine::new();
+
+    let rev = Var::new(0u32);
+    let left = Var::new(10i32);
+    let right = Var::new(20i32);
+
+    let left_watch = left.watch();
+    let right_watch = right.watch();
+    let switched = rev.watch().then(move |current_rev| {
+        if *current_rev == 0 {
+            left_watch.map(|value| *value)
+        } else {
+            right_watch.map(|value| *value)
+        }
+    });
+
+    engine.mark_observed(&switched);
+    assert_eq!(engine.get(&switched), 10);
+
+    // 先断开 observed,再在“无人观察”的阶段切换输出分支并改值。
+    engine.mark_unobserved(&switched);
+    rev.set(1);
+    right.set(99);
+
+    // 重新 observed 后,必须重新接回依赖,不能继续吐旧的 left 分支缓存。
+    engine.mark_observed(&switched);
+    assert_eq!(engine.get(&switched), 99);
+}
+
+#[test]
+fn request_node_should_reconnect_unnecessary_child_before_reuse() {
+    ////////////////////////////////////////////////////////////////////////////////
+    // 回归测试:
+    // - parent / child 都是带内部 stale 标志的 map；
+    // - parent unobserve 期间,child 的输入已经变化；
+    // - 重新 observe parent 时,request_node 不能把 Ready 的 child 直接当成“可复用旧值”。
+    ////////////////////////////////////////////////////////////////////////////////
+    let mut engine = Engine::new();
+
+    let source = Var::new(1i32);
+    let child = source.watch().map(|value| *value + 10);
+    let parent = child.map(|value| *value + 100);
+
+    engine.mark_observed(&parent);
+    assert_eq!(engine.get(&parent), 111);
+
+    engine.mark_unobserved(&parent);
+    source.set(5);
+
+    engine.mark_observed(&parent);
+    assert_eq!(engine.get(&parent), 115);
+}
+
+#[test]
 fn update_dirty_marks_should_not_drop_vec_capacity() {
     ////////////////////////////////////////////////////////////////////////////////
     // 回归测试：锁定 dirty_marks 的 scratch 复用策略
