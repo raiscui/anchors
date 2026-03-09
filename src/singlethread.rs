@@ -2157,7 +2157,8 @@ fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
                 .debug_info
                 .get()
                 ._to_string();
-            if pending_dirty_match(parent_debug.as_str()) || pending_dirty_match(child_debug.as_str())
+            if pending_dirty_match(parent_debug.as_str())
+                || pending_dirty_match(child_debug.as_str())
             {
                 eprintln!(
                     "[anchors][pending_dirty_push] child={} ({child_debug}) -> parent={} ({parent_debug}) size={}",
@@ -2469,8 +2470,9 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
         }
 
         let self_is_necessary = Engine::check_observed_raw(self.node) != ObservedState::Unnecessary;
-        let child_was_unnecessary =
-            necessary && self_is_necessary && Engine::check_observed_raw(child) == ObservedState::Unnecessary;
+        let child_was_unnecessary = necessary
+            && self_is_necessary
+            && Engine::check_observed_raw(child) == ObservedState::Unnecessary;
 
         if graph2::recalc_state(child) != RecalcState::Ready {
             child.add_clean_parent(self.node);

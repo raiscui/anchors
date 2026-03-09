@@ -597,13 +597,15 @@ mod tests {
         let src_for_either = src.clone();
         let fallback_for_either = fallback.clone();
         let either: crate::expert::Anchor<i32, Engine> =
-            choose_src.watch().either(move |selected| -> crate::expert::ValOrAnchor<i32, Engine> {
-            if *selected {
-                src_for_either.watch().into()
-            } else {
-                fallback_for_either.watch().into()
-            }
-        });
+            choose_src
+                .watch()
+                .either(move |selected| -> crate::expert::ValOrAnchor<i32, Engine> {
+                    if *selected {
+                        src_for_either.watch().into()
+                    } else {
+                        fallback_for_either.watch().into()
+                    }
+                });
 
         let downstream = either.map(|value: &i32| value + 1);
 
