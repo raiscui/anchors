@@ -2026,6 +2026,12 @@ impl Graph2 {
                         *children = Vec::new();
                     }
                 }
+                // NOTE: 新节点初始高度必须为 0。
+                // - 曾试验"继承 max_seen_height"(方案 G)与"SLACK 富余提升", 均被确定性计数
+                //   证伪(ANCHORS_SMH_STATS): 追赶本质是"高度有差的两链建边, 低侧整链提升",
+                //   单侧抬高初始高度只会翻转追赶方向(旧链反追新链), 传播量不降反升
+                //   (insert_middle200 从 14s 恶化到 300s 超时)。根治需"建边不传播"的
+                //   调度语义(挂起/唤醒兜底)或"新节点高度=创建上下文高度-1"的就近继承。
                 guard.ptrs.height.set(0);
                 guard.ptrs.handle_count.set(1);
                 guard.ptrs.prev.set(None);
@@ -2096,6 +2102,37 @@ impl Drop for Graph2 {
     fn drop(&mut self) {
         self.still_alive.set(false);
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// set_min_height 确定性访问计数（诊断设施，ANCHORS_SMH_STATS=1 + 宿主退出打印）：
+// - 用途： 算法层 A/B 验证，不受 CPU 争抢/环境噪声影响；
+// - visits = 传播栈实际处理的节点数；lifts = 真正执行高度提升的次数。
+// ────────────────────────────────────────────────────────────────────────────
+struct SmhStats {
+    visits: std::sync::atomic::AtomicU64,
+    lifts: std::sync::atomic::AtomicU64,
+}
+static SMH_STATS: SmhStats = SmhStats {
+    visits: std::sync::atomic::AtomicU64::new(0),
+    lifts: std::sync::atomic::AtomicU64::new(0),
+};
+#[inline]
+fn smh_stats_record(visited: bool, lifted: bool) {
+    if visited {
+        SMH_STATS.visits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if lifted {
+        SMH_STATS.lifts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+/// 读取 set_min_height 诊断计数（visits=处理过的节点数, lifts=实际提升次数）。
+/// 供宿主程序在退出路径显式打印（static 不保证 drop，必须显式快照）。
+pub fn smh_stats_snapshot() -> (u64, u64) {
+    (
+        SMH_STATS.visits.load(std::sync::atomic::Ordering::Relaxed),
+        SMH_STATS.lifts.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 pub fn ensure_height_increases<'a>(
@@ -2226,6 +2263,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
 
                     // 剪枝：已有更大的高度，无需继续向上回填。
                     if height(n) >= item.min_height {
+                        smh_stats_record(true, false);
                         continue;
                     }
                     // 环检测：只标记错误，依靠 Exit 步骤清理 visited。
@@ -2234,7 +2272,11 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
                         continue;
                     }
 
+                    smh_stats_record(true, true);
                     n.visited.set(true);
+                    // NOTE: 曾试验"SLACK 富余高度"(实际高度=需求+32)以降低传播频率,
+                    // 被确定性计数证伪(ANCHORS_SMH_STATS: 动态重建负载下传播 2.2 亿次/op
+                    // 集合、剪枝近零——新节点与高链的追赶距离反而被 SLACK 拉大), 已回滚。
                     n.ptrs.height.set(item.min_height);
 
                     // 先压 Exit，再压父节点 Enter：保证“先处理父，再清 visited”。

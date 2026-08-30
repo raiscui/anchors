@@ -8,6 +8,8 @@
 
 mod anchor_pool;
 mod generation;
+// 诊断设施快照的 re-export：graph2 为私有模块，宿主经此路径读取计数。
+pub use graph2::smh_stats_snapshot;
 mod graph2;
 
 #[cfg(test)]
