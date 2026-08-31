@@ -696,6 +696,11 @@ pub enum RecalcState {
     Needed,
     Pending,
     Ready,
+    /// 方案 A M2b: 挂起态 — poll 因依赖未 Ready 而中止, 已从 FIFO 队列摘除,
+    /// 等待依赖完成的唤醒(child 值 Updated 走 mark_dirty 链; 值 Unchanged 走
+    /// wake_waiting_dependents)。queue_recalc/queue_recalc_force 对本状态按常规入队(即唤醒)。
+    /// 注意: 死锁形态 = 队列空 + dirty 空 + Waiting 非空(依赖环), M3 以 Kahn 检测。
+    Waiting,
 }
 
 pub struct Graph2 {
@@ -1559,6 +1564,38 @@ impl<'gg> Graph2Guard<'gg> {
             cur = node.ptrs.next.get();
         }
         out
+    }
+
+    /// 方案 A M2b: 挂起 — poll 因依赖未 Ready 中止, 从调度中摘除, 等待依赖完成唤醒。
+    ///
+    /// 调用时机: stabilize 循环中 recalculate 返回 false(Pending 传染)后,
+    /// 节点刚被 pop 出队列(不在链表), 仅需状态切换。唤醒入口(单点纪律):
+    /// - child 值 Updated: mark_dirty(skip_self) drain 时 queue_recalc(本节点);
+    /// - child 值 Unchanged: wake_waiting_dependents;
+    /// - mark_dirty 链/force 补偿触达: queue_recalc(本节点)。
+    pub fn park_recalc(&self, node: NodeGuard<'gg>) {
+        debug_assert_eq!(
+            node.ptrs.recalc_state.get(),
+            RecalcState::Ready,
+            "park_recalc 只允许作用于刚出队的 Ready 节点, token={:?} debug={}",
+            node.key().raw_token(),
+            node.debug_info.get()._to_string(),
+        );
+        node.ptrs.recalc_state.set(RecalcState::Waiting);
+    }
+
+    /// 方案 A M2b: 本节点重算完成但值 Unchanged 时, 放行挂起在它上的 Waiting 依赖者。
+    ///
+    /// - 只唤醒(入队), 不发 dirty(值没变, 依赖者缓存仍有效), 不递归
+    ///   (依赖者 re-poll 后各自用 read_gen 判定, 需要传播会自行走 mark_dirty);
+    /// - 与 Poll::Updated 路径的 mark_dirty(skip_self) 互补, 两条完成路径都有唤醒出口。
+    pub fn wake_waiting_dependents(&self, node: NodeGuard<'gg>) {
+        node.for_each_parent(|parent| {
+            if parent.ptrs.recalc_state.get() == RecalcState::Waiting {
+                crate::singlethread::waiting_record_wake_by_child_ready();
+                self.queue_recalc(parent);
+            }
+        });
     }
 
     /// 入队重算(方案 A M2a: FIFO 尾插, 无高度桶)。
