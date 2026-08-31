@@ -80,7 +80,7 @@ impl FreeTraceConfig {
     fn from_env() -> Self {
         ////////////////////////////////////////////////////////////////////////////////
         // NOTE:
-        // - 这是纯调试能力：用于定位“某个 token 在谁/何时被 free”。
+        // - 这是纯调试能力：用于定位"某个 token 在谁/何时被 free"。
         // - 默认关闭，避免在正常运行时产生额外分支与日志。
         //
         // 用法（示例）：
@@ -433,7 +433,7 @@ mod node_store {
 
             ////////////////////////////////////////////////////////////////////////////////
             // NOTE:
-            // - 纯调试能力：定位“某个 token 在何处被 remove()（进入 free list）”。
+            // - 纯调试能力：定位"某个 token 在何处被 remove()（进入 free list）"。
             // - 该日志发生在真正执行 remove 的位置，便于区分 free() 与 retry_pending_free。
             //
             // 用法（示例）：
@@ -448,7 +448,7 @@ mod node_store {
                     if cfg.should_log(token, debug_info.as_str()) {
                         ////////////////////////////////////////////////////////////////////////////////
                         // NOTE:
-                        // - remove() 发生时，理论上 handle_count 应该已经归零（否则会导致“活句柄变 stale”）。
+                        // - remove() 发生时，理论上 handle_count 应该已经归零（否则会导致"活句柄变 stale"）。
                         // - 这里把关键状态一起打印出来，便于定位 invalid_token 的根因。
                         ////////////////////////////////////////////////////////////////////////////////
                         let handle_count = guard.ptrs.handle_count.get();
@@ -478,14 +478,14 @@ mod node_store {
             }
 
             ////////////////////////////////////////////////////////////////////////////////
-            // 关键修复：free/remove 时必须解绑 “child -> parent” 的 clean_parents 指针。
+            // 关键修复：free/remove 时必须解绑 "child -> parent" 的 clean_parents 指针。
             //
             // 背景：
             // - 依赖边是双向维护的：
             //   - parent.ptrs.necessary_children 记录输入 child
             //   - child.ptrs.clean_parents 记录依赖者 parent
             // - 过去我们只清了 parent.necessary_children，但没有把 parent 从 child.clean_parents 移除。
-            // - 在 slotmap/free list “复用槽位”后，旧的 NodePtr 会指向新的节点内容，
+            // - 在 slotmap/free list "复用槽位"后，旧的 NodePtr 会指向新的节点内容，
             //   导致 child 更新时把 dirty 误投递给新节点（常见表现：Constant/Var 的 dirty 报错刷屏）。
             //
             // 做法：
@@ -502,7 +502,7 @@ mod node_store {
             //   重入的 remove 可能因为借用冲突失败，导致 gc_skipped + retry，形成额外常数开销。
             //
             // 做法：
-            // - 将“解绑 + clear”放入独立作用域，作用域结束后 RefMut 自动释放；
+            // - 将"解绑 + clear"放入独立作用域，作用域结束后 RefMut 自动释放；
             // - 再进行 dequeue 与 drop anchor，最大化降低重入借用冲突概率。
             ////////////////////////////////////////////////////////////////////////////////
             {
@@ -527,7 +527,7 @@ mod node_store {
                 // - 这里直接对 `children` 做两次迭代，避免额外分配。
                 ////////////////////////////////////////////////////////////////////////////////
 
-                // 预检：确保所有 child 的 clean_parents 都可写，避免“解绑做到一半就失败”的不一致状态。
+                // 预检：确保所有 child 的 clean_parents 都可写，避免"解绑做到一半就失败"的不一致状态。
                 for child_ptr in children.iter().copied() {
                     let child = unsafe { guard.0.lookup_ptr(child_ptr) };
                     if child.ptrs.clean_parents.try_borrow_mut().is_err() {
@@ -658,7 +658,7 @@ pub struct GcStatsSnapshot {
     pub free_attempts: u64,
     pub free_succeeded: u64,
     pub pending_free: usize,
-    /// epoch 嵌套深度（>0 表示处于“读窗口”，禁止 token 回收/复用）。
+    /// epoch 嵌套深度（>0 表示处于"读窗口"，禁止 token 回收/复用）。
     pub epoch_depth: usize,
     /// epoch 期间被 retire 的待回收节点数量（epoch end 统一尝试回收）。
     pub retired_free: usize,
@@ -711,9 +711,9 @@ pub struct Graph2 {
     ////////////////////////////////////////////////////////////////////////////////
     // Epoch（读窗口）：
     // - epoch_depth > 0：禁止 token 物理回收/复用（nodes.remove -> free list）。
-    // - 仅允许把待回收节点“退休(retire)”到队列中，等 epoch end 再统一回收。
+    // - 仅允许把待回收节点"退休(retire)"到队列中，等 epoch end 再统一回收。
     //
-    // 这样可以覆盖 “事件派发 + stabilize + render” 的读窗口，避免 TOCTOU：
+    // 这样可以覆盖 "事件派发 + stabilize + render" 的读窗口，避免 TOCTOU：
     // 派发前半段拿到的 token，在派发后半段继续 get 时被回收导致 hard panic。
     ////////////////////////////////////////////////////////////////////////////////
     epoch_depth: Cell<usize>,
@@ -728,10 +728,14 @@ pub struct Graph2 {
 
     still_alive: Rc<Cell<bool>>,
 
-    /// height -> first node in that height's queue
-    recalc_queues: RefCell<Vec<Option<NodePtr>>>,
-    recalc_min_height: Cell<usize>,
-    recalc_max_height: Cell<usize>,
+    /// recalc FIFO 队列(方案 A M2a: 拆掉按 height 分桶的多桶结构, 退化为单一先进先出链表)。
+    ///
+    /// 设计依据(specs/anchors_plan_a_denumericalized_scheduling.md §3.5):
+    /// - 入队顺序已内含因果序(mark_dirty0 先 queue(child) 再递归 queue(parent);
+    ///   request 分支一先 queue(C) 再挂 P), FIFO 即近似拓扑序;
+    /// - 原型 v2/v3 打转的公因子是桶结构(min_height 扫描被高度打乱), 纯 FIFO 公平队列收敛可论证。
+    recalc_head: Cell<Option<NodePtr>>,
+    recalc_tail: Cell<Option<NodePtr>>,
 
     /// pointer to head of linked list of free nodes
     free_head: Box<Cell<Option<NodePtr>>>,
@@ -775,7 +779,7 @@ pub struct Node {
 
     pub slot_token: Cell<u64>,
     /// parent 依赖 epoch：
-    /// - 用于“逻辑失效”旧 parent link，而不是每次 dirty 都物理清空容器；
+    /// - 用于"逻辑失效"旧 parent link，而不是每次 dirty 都物理清空容器；
     /// - 当前 epoch 的 link 视为 active，旧 epoch 自动视为 stale。
     pub parent_epoch: Cell<u64>,
 
@@ -878,11 +882,11 @@ pub struct NodePtrs {
     /// 设计动机（性能 + 正确性）：
     /// - 过去 dequeue 需要按 `height(node)` 找 bucket；
     /// - 但 `ensure_height_increases/set_min_height` 可能在节点 Pending 后提升 height；
-    /// - 若不同时“改桶”，节点会残留在旧 bucket，导致 dequeue 找不到并遗留脏指针；
-    /// - 原修复是“扫描所有 bucket 按 NodePtr 摘除”，正确但在高频 remove 下非常慢。
+    /// - 若不同时"改桶"，节点会残留在旧 bucket，导致 dequeue 找不到并遗留脏指针；
+    /// - 原修复是"扫描所有 bucket 按 NodePtr 摘除"，正确但在高频 remove 下非常慢。
     ///
     /// 现在改为：
-    /// - 入队时记录 `recalc_bucket = Some(node_height)`（表示“当前挂在哪个 bucket 链表上”，不要求等于最新 height）；
+    /// - 入队时记录 `recalc_bucket = Some(node_height)`（表示"当前挂在哪个 bucket 链表上"，不要求等于最新 height）；
     /// - dequeue/remove 时优先用 `recalc_bucket` O(1) 命中并摘除；
     /// - 若链表指针/状态不一致，再兜底扫描所有 bucket（极少数路径）。
     recalc_bucket: Cell<Option<usize>>,
@@ -891,8 +895,8 @@ pub struct NodePtrs {
     /// Next node in free list (仅用于 anchors_slotmap)。
     ///
     /// 重要：free list 与 recalc queue 必须使用**不同**的指针字段。
-    /// 否则当“已回收节点”意外残留在 recalc 队列里时，recalc_pop_next 会误把 free list 的 next 当成 queue next，
-    /// 直接污染 free_head 链表，最终导致“活节点被复用 -> stale token -> invalid_token request”。
+    /// 否则当"已回收节点"意外残留在 recalc 队列里时，recalc_pop_next 会误把 free list 的 next 当成 queue next，
+    /// 直接污染 free_head 链表，最终导致"活节点被复用 -> stale token -> invalid_token request"。
     free_next: Cell<Option<NodePtr>>,
     /// Prev node in free list (仅用于 anchors_slotmap)。
     free_prev: Cell<Option<NodePtr>>,
@@ -1033,7 +1037,7 @@ impl<'a> NodeGuard<'a> {
             read_gen: initial_read_gen,
         };
         ////////////////////////////////////////////////////////////////////////////////
-        // 架构调整：parent link 不再通过“drain 物理删除”失效，而是通过 epoch 逻辑失效。
+        // 架构调整：parent link 不再通过"drain 物理删除"失效，而是通过 epoch 逻辑失效。
         //
         // 规则：
         // - 同 ptr 命中：只刷新 token/epoch，不做容器改动；
@@ -1148,10 +1152,10 @@ impl<'a> NodeGuard<'a> {
         // 为什么要做：
         // - clean_parents 的内容会在 mark_dirty() 时被 drain；
         // - 但如果 parent 被 unrequest/free 且 child 长时间不 dirty，
-        //   旧 parent 指针会“卡住”，在 slotmap/free list 复用槽位后变成误伤。
+        //   旧 parent 指针会"卡住"，在 slotmap/free list 复用槽位后变成误伤。
         ////////////////////////////////////////////////////////////////////////////////
         ////////////////////////////////////////////////////////////////////////////////
-        // 轻量“压缩”：
+        // 轻量"压缩"：
         // - 若 clean_parent0 被清空而 clean_parent1 仍有值，则把 clean_parent1 移到 0 槽位，
         //   让后续热路径更容易命中 slot0（减少分支与 Vec 访问概率）。
         ////////////////////////////////////////////////////////////////////////////////
@@ -1258,10 +1262,10 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
-    /// 遍历“当前 epoch 下”的父节点 key（不做活性校验）。
+    /// 遍历"当前 epoch 下"的父节点 key（不做活性校验）。
     ///
     /// 适用场景：
-    /// - `set_min_height` 这类“稍后会在处理阶段再次做 token/anchor 校验”的路径；
+    /// - `set_min_height` 这类"稍后会在处理阶段再次做 token/anchor 校验"的路径；
     /// - 这样可以避免在遍历阶段就做一次 `lookup_unchecked + token/anchor` 检查，
     ///   进而减少重复校验造成的常数开销。
     pub fn for_each_parent_key(&self, mut f: impl FnMut(NodeKey)) {
@@ -1283,7 +1287,7 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
-    /// 取出并“逻辑失效”当前父节点列表，供 mark_dirty 等热路径复用。
+    /// 取出并"逻辑失效"当前父节点列表，供 mark_dirty 等热路径复用。
     pub fn drain_parents(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         let draining_epoch = self.bump_parent_epoch();
         if let Some(p0) = self.ptrs.clean_parent0.get() {
@@ -1366,7 +1370,7 @@ impl<'a> NodeGuard<'a> {
                 .necessary_count
                 .set(child.necessary_count.get().saturating_sub(1));
 
-            // 同步解绑 child -> parent，避免产生“只删了一半边”的悬挂 parent 指针。
+            // 同步解绑 child -> parent，避免产生"只删了一半边"的悬挂 parent 指针。
             child.remove_clean_parent_ptr(self.make_ptr());
         }
     }
@@ -1437,20 +1441,7 @@ impl<'gg> Graph2Guard<'gg> {
 
     #[inline]
     pub fn has_recalc_pending(&self) -> bool {
-        let queues = self.graph.recalc_queues.borrow();
-        let max_height = self.graph.recalc_max_height.get();
-        let mut idx = self.graph.recalc_min_height.get();
-        if queues.is_empty() || idx > max_height {
-            return false;
-        }
-        idx = idx.min(queues.len().saturating_sub(1));
-        while idx <= max_height && idx < queues.len() {
-            if queues[idx].is_some() {
-                return true;
-            }
-            idx = idx.saturating_add(1);
-        }
-        false
+        self.graph.recalc_head.get().is_some()
     }
 
     #[inline]
@@ -1483,71 +1474,56 @@ impl<'gg> Graph2Guard<'gg> {
         guard
     }
 
-    pub fn recalc_pop_next(&self) -> Option<(usize, NodeGuard<'gg>)> {
-        let mut recalc_queues = self.graph.recalc_queues.borrow_mut();
-        while self.graph.recalc_min_height.get() <= self.graph.recalc_max_height.get() {
-            if let Some(ptr) = recalc_queues[self.graph.recalc_min_height.get()] {
-                let node = NodeGuard(unsafe { ptr.lookup_unchecked() });
-                recalc_queues[self.graph.recalc_min_height.get()] = node.ptrs.next.get();
-                if let Some(next_in_queue_ptr) = node.ptrs.next.get() {
-                    NodeGuard(unsafe { next_in_queue_ptr.lookup_unchecked() })
-                        .ptrs
-                        .prev
-                        .set(None);
+    /// 从 FIFO 队头弹出下一个待重算节点(方案 A M2a: 单链表版, 无高度桶)。
+    pub fn recalc_pop_next(&self) -> Option<NodeGuard<'gg>> {
+        while let Some(head_ptr) = self.graph.recalc_head.get() {
+            let node = NodeGuard(unsafe { head_ptr.lookup_unchecked() });
+            // 队头后移并维护双向链表指针。
+            self.graph.recalc_head.set(node.ptrs.next.get());
+            match node.ptrs.next.get() {
+                Some(next_ptr) => {
+                    unsafe { next_ptr.lookup_unchecked() }.ptrs.prev.set(None);
                 }
-                node.ptrs.prev.set(None);
-                node.ptrs.next.set(None);
-                node.ptrs.recalc_bucket.set(None);
-                node.ptrs.recalc_state.set(RecalcState::Ready);
-                // ┌─────────────────────────────────────────────────────────────┐
-                // │ 队列可能残留“已回收节点”（anchor 已置空、handle_count 归零）。│
-                // │ 这些节点若继续出队将触发重算 panic，故在此直接跳过。           │
-                // └─────────────────────────────────────────────────────────────┘
-                if unsafe { (*node.anchor.get()).is_none() } {
-                    if debug_queue_enabled() {
-                        println!(
-                            "QUEUE POP skip freed token={:?} debug={}",
-                            node.key().raw_token(),
-                            node.debug_info.get()._to_string()
-                        );
-                    }
-                    if cfg!(debug_assertions) {
-                        // 理论上 anchor 置空时 handle_count 也应归零；若未归零则说明存在异常释放路径。
-                        debug_assert!(
-                            node.handle_count() == 0,
-                            "queue_pop: anchor=None 但 handle_count>0，疑似非法释放路径，token={:?} debug={}",
-                            node.key().raw_token(),
-                            node.debug_info.get()._to_string()
-                        );
-                    }
-                    continue;
+                None => {
+                    self.graph.recalc_tail.set(None);
                 }
+            }
+            node.ptrs.prev.set(None);
+            node.ptrs.next.set(None);
+            node.ptrs.recalc_bucket.set(None);
+            node.ptrs.recalc_state.set(RecalcState::Ready);
+            // ┌─────────────────────────────────────────────────────────────┐
+            // │ 队列可能残留"已回收节点"（anchor 已置空、handle_count 归零）。│
+            // │ 这些节点若继续出队将触发重算 panic，故在此直接跳过。           │
+            // └─────────────────────────────────────────────────────────────┘
+            if unsafe { (*node.anchor.get()).is_none() } {
                 if debug_queue_enabled() {
                     println!(
-                        "QUEUE POP height={} token={:?} debug={}",
-                        self.graph.recalc_min_height.get(),
+                        "QUEUE POP skip freed token={:?} debug={}",
                         node.key().raw_token(),
                         node.debug_info.get()._to_string()
                     );
                 }
-                return Some((self.graph.recalc_min_height.get(), node));
-            } else {
-                self.graph
-                    .recalc_min_height
-                    .set(self.graph.recalc_min_height.get() + 1);
+                if cfg!(debug_assertions) {
+                    // 理论上 anchor 置空时 handle_count 也应归零；若未归零则说明存在异常释放路径。
+                    debug_assert!(
+                        node.handle_count() == 0,
+                        "queue_pop: anchor=None 但 handle_count>0，疑似非法释放路径，token={:?} debug={}",
+                        node.key().raw_token(),
+                        node.debug_info.get()._to_string()
+                    );
+                }
+                continue;
             }
+            if debug_queue_enabled() {
+                println!(
+                    "QUEUE POP token={:?} debug={}",
+                    node.key().raw_token(),
+                    node.debug_info.get()._to_string()
+                );
+            }
+            return Some(node);
         }
-        ////////////////////////////////////////////////////////////////////////////////
-        // NOTE: 队列已耗尽时，恢复到 Graph2::new() 的“空队列哨兵”语义：
-        // - recalc_min_height = recalc_queues.len()
-        // - recalc_max_height = 0
-        //
-        // 这样下一次入队时：
-        // - 无论 node_height 多大，都能立刻把 min_height 拉回正确起点
-        // - 且更配合 queue_recalc() 里对 Pending 丢队列的“min_height > node_height”判断
-        ////////////////////////////////////////////////////////////////////////////////
-        self.graph.recalc_min_height.set(recalc_queues.len());
-        self.graph.recalc_max_height.set(0);
         None
     }
 
@@ -1559,85 +1535,42 @@ impl<'gg> Graph2Guard<'gg> {
     /// - dependents = 该节点的 clean_parents 数(有多少依赖者挂着它)。
     pub fn collect_pending_nodes_brief(&self, limit: usize) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let recalc_queues = self.graph.recalc_queues.borrow();
-        'outer: for (h, head) in recalc_queues.iter().enumerate() {
-            let Some(mut cur) = *head else { continue };
-            // 防御上限: 链表若异常成环, 本函数不能跟着死循环。
-            let mut steps = 0usize;
-            loop {
-                steps += 1;
-                if steps > 10_000 {
+        let mut cur = self.graph.recalc_head.get();
+        // 防御上限: 链表若异常成环, 本函数不能跟着死循环。
+        let mut steps = 0usize;
+        while let Some(ptr) = cur {
+            steps += 1;
+            if steps > 10_000 {
+                break;
+            }
+            let node = NodeGuard(unsafe { ptr.lookup_unchecked() });
+            if out.len() < limit && unsafe { (*node.anchor.get()).is_some() } {
+                out.push(format!(
+                    "token={} state={:?} dependents={} debug={}",
+                    node.key().raw_token(),
+                    node.ptrs.recalc_state.get(),
+                    node.parents_len(),
+                    node.debug_info.get()._to_string(),
+                ));
+                if out.len() == limit {
                     break;
                 }
-                let node = NodeGuard(unsafe { cur.lookup_unchecked() });
-                if out.len() < limit && unsafe { (*node.anchor.get()).is_some() } {
-                    out.push(format!(
-                        "height={h} token={} state={:?} dependents={} debug={}",
-                        node.key().raw_token(),
-                        node.ptrs.recalc_state.get(),
-                        node.parents_len(),
-                        node.debug_info.get()._to_string(),
-                    ));
-                    if out.len() == limit {
-                        break 'outer;
-                    }
-                }
-                match node.ptrs.next.get() {
-                    Some(next) => cur = next,
-                    None => break,
-                }
             }
+            cur = node.ptrs.next.get();
         }
         out
     }
 
+    /// 入队重算(方案 A M2a: FIFO 尾插, 无高度桶)。
+    ///
+    /// 不变量: Pending 状态的节点必在 FIFO 链表中(append 与 pop 单点配对维护),
+    /// 因此旧"丢队列防御"(recalc_min_height > node_bucket 强制重排)不再需要。
     pub fn queue_recalc(&self, node: NodeGuard<'gg>) {
-        // ─────────────────────────────────────────────────────────────
-        // 防御性修复：Pending 但可能已“丢队列”
-        //
-        // 现象：
-        // - 某些场景下（例如 Dyn/ForEach 高频增删导致依赖链频繁重排），节点可能处于 `Pending`，
-        //   但实际已不在 recalc 队列中（prev/next/queue head 不一致）。
-        // - 此时若继续按 “already pending -> skip” 处理，会导致该节点永远不会被 pop，
-        //   上游节点不断 request 它并自旋，最终表现为 CPU 满载卡死。
-        //
-        // 处理：
-        // - 当检测到 `recalc_min_height` 已经越过该节点高度时，说明它极可能在队列中“饥饿/丢失”；此时强制重排队。
-        // - 这条路径应当非常少见；正常情况下 `Pending` 节点会被 pop，不会进入该分支。
-        // ─────────────────────────────────────────────────────────────
         if node.ptrs.recalc_state.get() == RecalcState::Pending {
-            // 注意：节点 Pending 后其 height 可能会被提升，但它仍然挂在“入队时”的 bucket 链表上。
-            // 因此这里判断“是否可能丢队列/饥饿”应优先用 recalc_bucket，而不是最新 height。
-            let node_bucket = node
-                .ptrs
-                .recalc_bucket
-                .get()
-                .unwrap_or_else(|| height(node));
-            if self.graph.recalc_min_height.get() > node_bucket {
-                if debug_queue_enabled() {
-                    println!(
-                        "queue_recalc requeue pending (min_height={} > node_bucket={}) token={:?} debug={}",
-                        self.graph.recalc_min_height.get(),
-                        node_bucket,
-                        node.key().raw_token(),
-                        node.debug_info.get()._to_string()
-                    );
-                }
-                // 若节点确实已丢队列，dequeue_calc 会把它恢复到 Ready；随后走常规入队逻辑。
-                dequeue_calc(self.graph, node);
-            } else {
-                if debug_queue_enabled() {
-                    println!(
-                        "queue_recalc skip (already pending) token={:?} debug={}",
-                        node.key().raw_token(),
-                        node.debug_info.get()._to_string()
-                    );
-                }
-                // already in recalc queue
-                return;
-            }
+            // already in recalc queue
+            return;
         }
-        // 如果节点正在重算（anchor_locked=true），跳过此次入队，改为标记“需补偿”，由 AnchorLockGuard 在解锁时入队，避免 strict 下的重入同时不丢更新。
+        // 如果节点正在重算（anchor_locked=true），跳过此次入队，改为标记"需补偿"，由 AnchorLockGuard 在解锁时入队，避免 strict 下的重入同时不丢更新。
         if node.anchor_locked.get() {
             #[cfg(debug_assertions)]
             if crate::singlethread::lock_trace_enabled() {
@@ -1653,9 +1586,8 @@ impl<'gg> Graph2Guard<'gg> {
         }
         if debug_queue_enabled() {
             println!(
-                "queue_recalc enqueue token={:?} height={} debug={}",
+                "queue_recalc enqueue token={:?} debug={}",
                 node.key().raw_token(),
-                height(node),
                 node.debug_info.get()._to_string()
             );
         }
@@ -1665,10 +1597,9 @@ impl<'gg> Graph2Guard<'gg> {
             let bt = Backtrace::force_capture();
             tracing::warn!(
                 target: "anchors",
-                "queue_recalc: token={:?} locked={} height={} debug={}",
+                "queue_recalc: token={:?} locked={} debug={}",
                 node.key().raw_token(),
                 node.anchor_locked.get(),
-                height(node),
                 node.debug_info.get()._to_string()
             );
             println!(
@@ -1678,49 +1609,21 @@ impl<'gg> Graph2Guard<'gg> {
             );
         }
         node.ptrs.recalc_state.set(RecalcState::Pending);
-        let node_height = height(node);
-        let mut recalc_queues = self.graph.recalc_queues.borrow_mut();
-        if node_height >= recalc_queues.len() {
-            let old_len = recalc_queues.len();
-            // ── 以 1.2 倍扩容减少每次只增加一个槽位导致的高频 warn，同时仍确保覆盖必需高度。
-            let required_len = node_height.saturating_add(1);
-            let ratio_len = {
-                let scaled = old_len.saturating_mul(12).saturating_add(9) / 10;
-                scaled.max(old_len.saturating_add(1))
-            };
-            let target_len = required_len.max(ratio_len);
-            recalc_queues.resize(target_len, None);
-            if self.graph.recalc_min_height.get() >= old_len {
-                // 队列原本为空（min==len），扩容后同步更新哨兵值，确保后续 pop 逻辑不越界。
-                self.graph.recalc_min_height.set(target_len);
+        // FIFO 尾插: prev 指向旧尾, 旧尾(若有)的 next 指向本节点。
+        node.ptrs.prev.set(self.graph.recalc_tail.get());
+        node.ptrs.next.set(None);
+        match self.graph.recalc_tail.get() {
+            Some(tail_ptr) => {
+                unsafe { tail_ptr.lookup_unchecked() }
+                    .ptrs
+                    .next
+                    .set(Some(node.make_ptr()));
             }
-            tracing::warn!(
-                target: "anchors",
-                token = node.key().raw_token(),
-                old_capacity = old_len,
-                new_capacity = target_len,
-                ratio_target = ratio_len,
-                required_height = node_height,
-                debug = %node.debug_info.get()._to_string(),
-                "recalc_queues 容量不足，自动扩容"
-            );
-        }
-        if let Some(old) = recalc_queues[node_height] {
-            NodeGuard(unsafe { old.lookup_unchecked() })
-                .ptrs
-                .prev
-                .set(Some(node.make_ptr()));
-            node.ptrs.next.set(Some(old));
-        } else {
-            if self.graph.recalc_min_height.get() > node_height {
-                self.graph.recalc_min_height.set(node_height);
-            }
-            if self.graph.recalc_max_height.get() < node_height {
-                self.graph.recalc_max_height.set(node_height);
+            None => {
+                self.graph.recalc_head.set(Some(node.make_ptr()));
             }
         }
-        node.ptrs.recalc_bucket.set(Some(node_height));
-        recalc_queues[node_height] = Some(node.make_ptr());
+        self.graph.recalc_tail.set(Some(node.make_ptr()));
     }
 
     /// 强制入队：无视 Pending/locked 状态，先摘旧队列再入队（主要用于解锁后补偿重算）。
@@ -1818,7 +1721,7 @@ impl Graph2 {
     fn retry_pending_free(&self) {
         ////////////////////////////////////////////////////////////////////////////////
         // epoch 内禁止 token 物理回收/复用：
-        // - pending_free 里的节点同样属于“待回收”，必须等到 epoch end 才能真正 remove。
+        // - pending_free 里的节点同样属于"待回收"，必须等到 epoch end 才能真正 remove。
         ////////////////////////////////////////////////////////////////////////////////
         if self.epoch_depth.get() > 0 {
             return;
@@ -1901,7 +1804,7 @@ impl Graph2 {
 
         if Self::epoch_trace_enabled() {
             // NOTE: 这里不打印 token/debug，避免和 free_trace_cfg 的定位能力重复。
-            //       epoch trace 更关注“队列是否积压”。
+            //       epoch trace 更关注"队列是否积压"。
             let depth = self.epoch_depth.get();
             let retired_len = retired.len();
             eprintln!("[anchors][epoch] retire depth={depth} retired_free={retired_len}");
@@ -1947,7 +1850,8 @@ impl Graph2 {
         self.retry_pending_free();
     }
 
-    pub fn new(max_height: usize) -> Self {
+    /// `max_height` 为历史参数(分桶时代), M2a 拆桶后已不使用, 保留只为少动调用点, M4 清理。
+    pub fn new(_max_height: usize) -> Self {
         Self {
             nodes: ag::NodeStore::new(),
             anchor_pool: AnchorMemPool::new(),
@@ -1962,9 +1866,8 @@ impl Graph2 {
             free_attempts: Cell::new(0),
             free_succeeded: Cell::new(0),
             last_deleted_token: Cell::new(None),
-            recalc_queues: RefCell::new(vec![None; max_height]),
-            recalc_min_height: Cell::new(max_height),
-            recalc_max_height: Cell::new(0),
+            recalc_head: Cell::new(None),
+            recalc_tail: Cell::new(None),
             still_alive: Rc::new(Cell::new(true)),
             free_head: Box::new(Cell::new(None)),
         }
@@ -2044,7 +1947,7 @@ impl Graph2 {
                 // 从 free list 取出一个空槽位。
                 //
                 // anchors_slotmap 下：free list 使用专用指针字段（free_next/free_prev），
-                // 避免和 recalc 队列（next/prev）互相污染导致“活节点被误复用”。
+                // 避免和 recalc 队列（next/prev）互相污染导致"活节点被误复用"。
                 {
                     self.free_head.set(guard.ptrs.free_next.get());
                     if let Some(next_ptr) = guard.ptrs.free_next.get() {
@@ -2057,7 +1960,7 @@ impl Graph2 {
                 guard.necessary_count.set(0);
                 ////////////////////////////////////////////////////////////////////////////////
                 // NOTE:
-                // - 纯调试能力：定位“哪个旧 token 被复用成新 token”，用于追踪失效 token 的来源。
+                // - 纯调试能力：定位"哪个旧 token 被复用成新 token"，用于追踪失效 token 的来源。
                 // - 触发点：Graph2::insert 复用 free list 槽位时。
                 //
                 // 用法（示例）：
@@ -2074,12 +1977,12 @@ impl Graph2 {
                             let new_debug = debug_info._to_string();
                             ////////////////////////////////////////////////////////////////////////////////
                             // NOTE:
-                            // - 复用时补充“旧槽位状态”用于定位 invalid_token：
+                            // - 复用时补充"旧槽位状态"用于定位 invalid_token：
                             //   - old_handle_count：理论上应为 0（已进入 free list）。
                             //   - old_necessary_count：理论上应为 0（已无必要父链）。
                             //   - old_anchor_none：理论上应为 true（anchor 已被 remove）。
                             //
-                            // 若这些值不满足预期，说明存在“仍被引用但被回收/复用”的生命周期错误。
+                            // 若这些值不满足预期，说明存在"仍被引用但被回收/复用"的生命周期错误。
                             ////////////////////////////////////////////////////////////////////////////////
                             let old_handle_count = guard.ptrs.handle_count.get();
                             let old_necessary_count = guard.necessary_count.get();
@@ -2110,7 +2013,7 @@ impl Graph2 {
                 //   pprof 里常体现为 `RawVecInner::finish_grow` 热点。
                 //
                 // 风险控制：
-                // - 为避免极端情况下 free list “长期持有超大 Vec buffer”导致 RSS 不可控,
+                // - 为避免极端情况下 free list "长期持有超大 Vec buffer"导致 RSS 不可控,
                 //   对少数超大容量做阈值回收(直接丢弃 buffer)。
                 ////////////////////////////////////////////////////////////////////////////////
                 {
@@ -2265,7 +2168,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     }
 
     ////////////////////////////////////////////////////////////////////////////////
-    // 性能改良：把“递归 + 每层分配 Vec”改为“显式栈 DFS”
+    // 性能改良：把"递归 + 每层分配 Vec"改为"显式栈 DFS"
     //
     // 背景：
     // - `ensure_height_increases` 会在 request 依赖时调用本函数；
@@ -2277,14 +2180,14 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     // - 仍然沿用 `node.visited` 做环检测；
     // - 发现环时不立刻 return（否则会遗留 visited=true），而是标记 did_err；
     // - 最关键：复用 thread-local 的 Vec 缓冲区，避免每次调用都分配/释放，
-    //   同时把 capacity 拉高到一个“足够大”的值，减少 `grow_one/finish_grow` 反复扩容。
+    //   同时把 capacity 拉高到一个"足够大"的值，减少 `grow_one/finish_grow` 反复扩容。
     ////////////////////////////////////////////////////////////////////////////////
     #[derive(Clone, Copy)]
     enum WorkKind {
-        /// 已经在“入栈阶段”完成活性校验的 Enter（本轮 set_min_height 内可视为稳定）。
+        /// 已经在"入栈阶段"完成活性校验的 Enter（本轮 set_min_height 内可视为稳定）。
         ///
         /// 目的：
-        /// - 避免“入栈阶段校验一次 + 出栈阶段再校验一次”的重复常数；
+        /// - 避免"入栈阶段校验一次 + 出栈阶段再校验一次"的重复常数；
         /// - 在 parent 较多时，这个重复校验会在 pprof 里集中成 Top 热点。
         EnterAssumedLive,
         Exit,
@@ -2301,7 +2204,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     // 性能关键：
     // - 这里的 stack 只在本线程使用；
     // - 通过 thread-local 复用底层容量，避免每次调用都触发 alloc/dealloc；
-    // - 用 Enter/Exit 两类步骤模拟递归的“入栈/出栈”，保持 visited 的语义为“当前路径栈标记”（用于环检测）。
+    // - 用 Enter/Exit 两类步骤模拟递归的"入栈/出栈"，保持 visited 的语义为"当前路径栈标记"（用于环检测）。
     ////////////////////////////////////////////////////////////////////////////////
     const MIN_CAPACITY: usize = 256;
     thread_local! {
@@ -2310,7 +2213,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
 
     // NOTE:
     // - 仅用于本轮 `set_min_height` 内部（单线程、无 free/reuse 的前提下）；
-    // - 调用方必须确保该 key 在“入栈阶段”已通过 token+anchor 校验。
+    // - 调用方必须确保该 key 在"入栈阶段"已通过 token+anchor 校验。
     #[inline]
     unsafe fn node_from_key_unchecked<'a>(key: NodeKey) -> NodeGuard<'a> {
         NodeGuard(unsafe { key.ptr.lookup_unchecked() })
@@ -2322,7 +2225,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
         // 复用容量：只 clear，不释放。
         stack.clear();
 
-        // 关键：尽量在第一次就把 capacity 拉到一个“够用”的水平，减少 grow_one。
+        // 关键：尽量在第一次就把 capacity 拉到一个"够用"的水平，减少 grow_one。
         {
             let cap = stack.capacity();
             if cap < MIN_CAPACITY {
@@ -2389,7 +2292,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
                     // 集合、剪枝近零——新节点与高链的追赶距离反而被 SLACK 拉大), 已回滚。
                     n.ptrs.height.set(item.min_height);
 
-                    // 先压 Exit，再压父节点 Enter：保证“先处理父，再清 visited”。
+                    // 先压 Exit，再压父节点 Enter：保证"先处理父，再清 visited"。
                     stack.push(WorkItem {
                         kind: WorkKind::Exit,
                         key: n.key(),
@@ -2399,13 +2302,13 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
                     let parent_min_h = item.min_height + 1;
                     n.for_each_parent_key(|parent_key| {
                         ////////////////////////////////////////////////////////////////////////////////
-                        // 性能：parent 遍历阶段做一次“早剪枝”，减少无效 WorkItem 入栈
+                        // 性能：parent 遍历阶段做一次"早剪枝"，减少无效 WorkItem 入栈
                         //
                         // - 之前这里会把所有 parent 都 push 进栈，很多 parent 在后续 pop 时会因为：
                         //   - token/anchor 失效（节点已被 GC/free）
                         //   - height 已满足（无需提升）
                         //   而立刻被剪枝。
-                        // - 这些“push + pop + 再剪枝”的纯常数会在 pprof 里集中到该行。
+                        // - 这些"push + pop + 再剪枝"的纯常数会在 pprof 里集中到该行。
                         // - 这里先做一次轻量判断：只有确实需要提升的 parent 才入栈。
                         //
                         // 注意：依赖环检测仍保持语义：
@@ -2413,7 +2316,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
                         ////////////////////////////////////////////////////////////////////////////////
                         // NOTE:
                         // - 先读 height：高度已满足的 parent，直接返回，避免多余的 token/anchor 读取；
-                        // - 只有在“确实需要提升”的情况下，才做 token/anchor 校验与 visited 检测。
+                        // - 只有在"确实需要提升"的情况下，才做 token/anchor 校验与 visited 检测。
                         let parent = NodeGuard(unsafe { parent_key.ptr.lookup_unchecked() });
                         if height(parent) >= parent_min_h {
                             return;
@@ -2445,7 +2348,7 @@ fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
     })
 }
 
-/// 辅助：当节点已经 Pending 但需要“重新排队”时，先摘下旧位置再重新入队，避免 recalc_min_height 已越过导致饥饿。
+/// 辅助：当节点已经 Pending 但需要"重新排队"时，先摘下旧位置再重新入队，避免 recalc_min_height 已越过导致饥饿。
 #[allow(dead_code)]
 pub fn requeue_pending<'gg>(graph: Graph2Guard<'gg>, node: NodeGuard<'gg>) {
     // 仅处理 Pending 节点，其余保持原逻辑。
@@ -2490,110 +2393,61 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
 
 fn dequeue_calc_by_ptr(graph: &Graph2, target_ptr: NodePtr) -> bool {
     // ─────────────────────────────────────────────────────────────
-    // 关键修复（升级版）：
-    // - 过去为了处理“Pending 后 height 被提升导致找不到 bucket”，这里会扫描所有 bucket；
-    // - 现在为每个 Pending 节点维护 `recalc_bucket`（即使 height 后续变化也不影响 dequeue 命中）；
-    // - 因此绝大多数情况下可以 O(1) 摘除，扫描仅作为极少数兜底。
-    // ─────────────────────────────────────────────────────────────
-    let target_guard = unsafe { target_ptr.lookup_unchecked() };
-    // 这里不能完全信任 recalc_state：
-    // - remove/free 路径要求“尽力把节点从队列摘干净”，以免残留脏指针污染 free list；
-    // - 在极端重入/借用冲突修复路径里，可能出现 state 与链表指针短暂不一致。
+    // 方案 A M2a: 单 FIFO 链表版 O(1) 摘除。
     //
-    // 但也不能无脑扫描所有 bucket（remove 会高频触发）。
-    // 因此先做一个“是否可能在队列里”的快速判定：
-    // - 有 bucket / 有 prev/next / 或 state=Pending 才继续；否则直接返回。
-    let has_link = target_guard.ptrs.prev.get().is_some() || target_guard.ptrs.next.get().is_some();
-    let bucket_opt = target_guard.ptrs.recalc_bucket.get();
-    if bucket_opt.is_none()
-        && !has_link
-        && target_guard.ptrs.recalc_state.get() != RecalcState::Pending
-    {
+    // - 这里不能完全信任 recalc_state:
+    //   remove/free 路径要求"尽力把节点从队列摘干净"，以免残留脏指针污染 free list;
+    //   在极端重入/借用冲突修复路径里，可能出现 state 与链表指针短暂不一致。
+    // - 因此先做"是否可能在队列里"的快速判定(有 prev/next 链接或 state=Pending),
+    //   再做头/前/后三向一致性校验, 全部通过才摘除 — 与原多桶版同风格。
+    // ─────────────────────────────────────────────────────────────
+    let target = unsafe { target_ptr.lookup_unchecked() };
+    let has_link = target.ptrs.prev.get().is_some() || target.ptrs.next.get().is_some();
+    if !has_link && target.ptrs.recalc_state.get() != RecalcState::Pending {
         return false;
     }
 
-    if let Some(bucket_idx) = bucket_opt {
-        let mut recalc_queues = graph.recalc_queues.borrow_mut();
-        if bucket_idx < recalc_queues.len() {
-            let prev_ptr = target_guard.ptrs.prev.get();
-            let next_ptr = target_guard.ptrs.next.get();
+    let prev_ptr = target.ptrs.prev.get();
+    let next_ptr = target.ptrs.next.get();
 
-            let head_matches = prev_ptr.is_some() || recalc_queues[bucket_idx] == Some(target_ptr);
-            let prev_matches = prev_ptr.is_none()
-                || unsafe { prev_ptr.unwrap().lookup_unchecked() }
-                    .ptrs
-                    .next
-                    .get()
-                    == Some(target_ptr);
-            let next_matches = next_ptr.is_none()
-                || unsafe { next_ptr.unwrap().lookup_unchecked() }
-                    .ptrs
-                    .prev
-                    .get()
-                    == Some(target_ptr);
+    let head_matches = prev_ptr.is_some() || graph.recalc_head.get() == Some(target_ptr);
+    let prev_matches = prev_ptr.is_none()
+        || unsafe { prev_ptr.unwrap().lookup_unchecked() }
+            .ptrs
+            .next
+            .get()
+            == Some(target_ptr);
+    let next_matches = next_ptr.is_none()
+        || unsafe { next_ptr.unwrap().lookup_unchecked() }
+            .ptrs
+            .prev
+            .get()
+            == Some(target_ptr);
 
-            if head_matches && prev_matches && next_matches {
-                if let Some(prev_ptr) = prev_ptr {
-                    unsafe { prev_ptr.lookup_unchecked() }
-                        .ptrs
-                        .next
-                        .set(next_ptr);
-                } else {
-                    recalc_queues[bucket_idx] = next_ptr;
-                }
-
-                if let Some(next_ptr) = next_ptr {
-                    unsafe { next_ptr.lookup_unchecked() }
-                        .ptrs
-                        .prev
-                        .set(prev_ptr);
-                }
-
-                target_guard.ptrs.prev.set(None);
-                target_guard.ptrs.next.set(None);
-                target_guard.ptrs.recalc_bucket.set(None);
-                target_guard.ptrs.recalc_state.set(RecalcState::Ready);
-                return true;
-            }
+    if head_matches && prev_matches && next_matches {
+        if let Some(prev_ptr) = prev_ptr {
+            unsafe { prev_ptr.lookup_unchecked() }
+                .ptrs
+                .next
+                .set(next_ptr);
+        } else {
+            graph.recalc_head.set(next_ptr);
         }
-    }
-
-    // ── 兜底：扫描所有 bucket，按 NodePtr 精确摘除目标节点
-    let mut recalc_queues = graph.recalc_queues.borrow_mut();
-    for queue_idx in 0..recalc_queues.len() {
-        let mut head_ptr = recalc_queues[queue_idx];
-        let mut found_prev: Option<NodePtr> = None;
-
-        while let Some(cur_ptr) = head_ptr {
-            if cur_ptr == target_ptr {
-                let cur_guard = unsafe { cur_ptr.lookup_unchecked() };
-                let next_ptr = cur_guard.ptrs.next.get();
-
-                if let Some(prev_ptr) = found_prev {
-                    unsafe { prev_ptr.lookup_unchecked() }
-                        .ptrs
-                        .next
-                        .set(next_ptr);
-                } else {
-                    recalc_queues[queue_idx] = next_ptr;
-                }
-
-                if let Some(next) = next_ptr {
-                    unsafe { next.lookup_unchecked() }.ptrs.prev.set(found_prev);
-                }
-
-                cur_guard.ptrs.prev.set(None);
-                cur_guard.ptrs.next.set(None);
-                cur_guard.ptrs.recalc_bucket.set(None);
-                cur_guard.ptrs.recalc_state.set(RecalcState::Ready);
-                return true;
-            }
-
-            found_prev = Some(cur_ptr);
-            head_ptr = unsafe { cur_ptr.lookup_unchecked() }.ptrs.next.get();
+        if let Some(next_ptr) = next_ptr {
+            unsafe { next_ptr.lookup_unchecked() }
+                .ptrs
+                .prev
+                .set(prev_ptr);
+        } else {
+            graph.recalc_tail.set(prev_ptr);
         }
-    }
 
+        target.ptrs.prev.set(None);
+        target.ptrs.next.set(None);
+        target.ptrs.recalc_bucket.set(None);
+        target.ptrs.recalc_state.set(RecalcState::Ready);
+        return true;
+    }
     false
 }
 
@@ -2603,8 +2457,8 @@ unsafe fn free(ptr: NodePtr) {
 
     ////////////////////////////////////////////////////////////////////////////////
     // NOTE:
-    // - 这里是在 “handle_count 刚刚归零 -> 触发 free()” 的时刻。
-    // - 即使后续因为借用冲突走了 enqueue_free_retry，这里仍然能看到“是谁触发了 free”。
+    // - 这里是在 "handle_count 刚刚归零 -> 触发 free()" 的时刻。
+    // - 即使后续因为借用冲突走了 enqueue_free_retry, 这里仍然能看到"是谁触发了 free"。
     ////////////////////////////////////////////////////////////////////////////////
     let cfg = free_trace_cfg();
     if cfg.enabled {
@@ -2619,7 +2473,7 @@ unsafe fn free(ptr: NodePtr) {
         }
     }
 
-    // epoch 内禁止 token 物理回收/复用：只允许 retire，等待 epoch end 再统一 reclaim。
+    // epoch 内禁止 token 物理回收/复用: 只允许 retire, 等待 epoch end 再统一 reclaim。
     if graph.epoch_depth.get() > 0 {
         graph.retire_free(ptr);
         return;
@@ -2787,24 +2641,20 @@ mod test {
     }
 
     #[test]
-    fn test_insert_pop() {
+    /// 方案 A M2a: FIFO 语义版(原高度分桶序断言已随数值化调度一并退役)。
+    /// 覆盖: 入队顺序=弹出顺序、Pending 防重复入队、队尾追加。
+    fn test_recalc_fifo_order() {
         let graph = Graph2::new(10);
         graph.with(|guard| {
             let a = guard.insert_testing_guard();
-            set_min_height(a, 0).unwrap();
             let b = guard.insert_testing_guard();
-            set_min_height(b, 5).unwrap();
             let c = guard.insert_testing_guard();
-            set_min_height(c, 3).unwrap();
             let d = guard.insert_testing_guard();
-            set_min_height(d, 4).unwrap();
             let e = guard.insert_testing_guard();
-            set_min_height(e, 1).unwrap();
             let e2 = guard.insert_testing_guard();
-            set_min_height(e2, 1).unwrap();
             let e3 = guard.insert_testing_guard();
-            set_min_height(e3, 1).unwrap();
 
+            // a 重复入队三次: Pending 状态应防重复, 只占一个队列位。
             guard.queue_recalc(a);
             guard.queue_recalc(a);
             guard.queue_recalc(a);
@@ -2812,20 +2662,20 @@ mod test {
             guard.queue_recalc(c);
             guard.queue_recalc(d);
 
-            assert_eq!(Some(a), guard.recalc_pop_next().map(|(_, v)| v));
-            assert_eq!(Some(c), guard.recalc_pop_next().map(|(_, v)| v));
-            assert_eq!(Some(d), guard.recalc_pop_next().map(|(_, v)| v));
+            // FIFO: 按入队顺序弹出。
+            assert_eq!(Some(a), guard.recalc_pop_next());
+            assert_eq!(Some(b), guard.recalc_pop_next());
+            assert_eq!(Some(c), guard.recalc_pop_next());
+            assert_eq!(Some(d), guard.recalc_pop_next());
 
             guard.queue_recalc(e);
             guard.queue_recalc(e2);
             guard.queue_recalc(e3);
 
-            assert_eq!(Some(e3), guard.recalc_pop_next().map(|(_, v)| v));
-            assert_eq!(Some(e2), guard.recalc_pop_next().map(|(_, v)| v));
-            assert_eq!(Some(e), guard.recalc_pop_next().map(|(_, v)| v));
-            assert_eq!(Some(b), guard.recalc_pop_next().map(|(_, v)| v));
-
-            assert_eq!(None, guard.recalc_pop_next().map(|(_, v)| v));
+            assert_eq!(Some(e), guard.recalc_pop_next());
+            assert_eq!(Some(e2), guard.recalc_pop_next());
+            assert_eq!(Some(e3), guard.recalc_pop_next());
+            assert_eq!(None, guard.recalc_pop_next());
         })
     }
 
@@ -2849,41 +2699,6 @@ mod test {
                 "已移除的 anchor 不应再次出队重算"
             );
         });
-    }
-
-    #[test]
-    fn queue_recalc_auto_expands_capacity() {
-        let graph = Graph2::new(4);
-        graph.with(|guard| {
-            let node = guard.insert_testing_guard();
-            // 人工设置较大的高度，模拟深链依赖场景。
-            node.ptrs.height.set(12);
-            guard.queue_recalc(node);
-        });
-        assert!(graph.recalc_queues.borrow().len() >= 13);
-    }
-
-    #[test]
-    fn queue_recalc_prefers_ratio_growth() {
-        let graph = Graph2::new(10);
-        graph.with(|guard| {
-            let node = guard.insert_testing_guard();
-            // ── 高度刚好落在旧容量边界，验证扩容会按 1.2 倍执行而非只补足 1 个槽位。
-            node.ptrs.height.set(10);
-            guard.queue_recalc(node);
-        });
-        assert_eq!(12, graph.recalc_queues.borrow().len());
-    }
-
-    #[test]
-    fn insert_above_initial_height_does_not_panic() {
-        let graph = Graph2::new(10);
-        graph.with(|guard| {
-            let a = guard.insert_testing_guard();
-            set_min_height(a, 10).unwrap();
-            guard.queue_recalc(a);
-        });
-        assert!(graph.recalc_queues.borrow().len() >= 11);
     }
 
     #[test]
@@ -2931,7 +2746,7 @@ mod test {
     #[test]
     fn drop_parent_detaches_from_child_clean_parents() {
         ////////////////////////////////////////////////////////////////////////////////
-        // 回归测试：避免 “free 后槽位复用 -> child 仍持有旧 parent NodePtr -> dirty 误投递”。
+        // 回归测试：避免 "free 后槽位复用 -> child 仍持有旧 parent NodePtr -> dirty 误投递"。
         //
         // 关键断言：
         // - parent drop（触发 free/remove）后，child.clean_parents 不应再包含该 parent 指针。

@@ -1040,6 +1040,17 @@ impl Engine {
         self.stabilize_with_pending_queue();
     }
 
+    /// 方案 A M2a: 读取点惰性收敛(lazy ensure)。
+    ///
+    /// 用于 EngineContext(Mut)::get 遇到非 Ready 节点的兜底: 动态内部 anchor
+    /// (Either/snapshot view_gel 重建)经 request 分支一刚入队但排在 FIFO 后段,
+    /// 数值化调度靠"新节点高度最低"排序兜底, FIFO 改为读取点就地跑一遍队列
+    /// 固定点循环(队列耗尽即停; 正在重算的节点 anchor_locked 会被跳过, 无重入)。
+    /// 队列耗尽后仍未 Ready(如脏源尚在 dirty_marks 未 flush)由调用方按原语义 panic。
+    fn stabilize_lazy_ensure_ready(&self, _target: NodeKey) {
+        self.stabilize_with_pending_queue();
+    }
+
     fn stabilize_with_pending_queue(&self) {
         #[cfg(debug_assertions)]
         trace!("stabilize0");
@@ -1082,12 +1093,12 @@ impl Engine {
             // - 过去即使没开 `ANCHORS_DEBUG_SPIN`,也会 `with_capacity(32)` 触发一次堆分配；
             // - 在 list perf 场景下(数百次点击),这会放大 allocator/drop 噪声。
             ////////////////////////////////////////////////////////////////////////////////
-            let mut spin_last: VecDeque<(usize, u64, String)> = VecDeque::new();
+            let mut spin_last: VecDeque<(u64, String)> = VecDeque::new();
             if spin_debug {
                 spin_last = VecDeque::with_capacity(32);
             }
             graph.retry_pending_free();
-            while let Some((height, node)) = graph.recalc_pop_next() {
+            while let Some(node) = graph.recalc_pop_next() {
                 // 诊断计数: 调度活动总量(成功弹出的重算节点数)。
                 waiting_record_pop();
                 if spin_debug {
@@ -1096,7 +1107,6 @@ impl Engine {
                         spin_last.pop_front();
                     }
                     spin_last.push_back((
-                        height,
                         node.key().raw_token(),
                         node.debug_info.get()._to_string(),
                     ));
@@ -1110,29 +1120,19 @@ impl Engine {
                         let active_nodes = graph.active_nodes();
                         let _ = writeln!(&mut msg, "active_nodes={active_nodes}");
                         let _ = writeln!(&mut msg, "recent_recalc (oldest -> newest):");
-                        for (i, (h, tok, info)) in spin_last.iter().enumerate() {
-                            let _ = writeln!(
-                                &mut msg,
-                                "  #{i} height={h} token={tok} node={info}"
-                            );
+                        for (i, (tok, info)) in spin_last.iter().enumerate() {
+                            let _ = writeln!(&mut msg, "  #{i} token={tok} node={info}");
                         }
                         panic!("{msg}");
                     }
                 }
-                let calculation_complete = if graph2::height(node) == height {
-                    #[cfg(debug_assertions)]
-                    trace!("recalculate height");
-
-                    // TODO with new graph we can automatically relocate nodes if their height changes
-                    // this nodes height is current, so we can recalculate
-                    self.recalculate(graph, node)
-                } else {
-                    // skip calculation, redo at correct height
-                    false
-                };
+                // 方案 A M2a: FIFO 队列无"弹出高度 vs 当前高度"漂移问题(无传播),
+                // 出队即重算。
+                let calculation_complete = self.recalculate(graph, node);
 
                 if !calculation_complete {
-                    // 诊断计数: 挂起者的隐式重排(现状"唤醒"机制)。
+                    // 诊断计数: 挂起者的隐式重排(M2a: FIFO requeue-to-tail;
+                    // M2b 将改为摘除挂起 + child-ready 事件唤醒)。
                     waiting_record_requeue();
                     graph.queue_recalc(node);
                 }
@@ -2199,21 +2199,21 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
     #[cfg(debug_assertions)]
     trace!("mark_dirty0 {:?}", next);
     let id = next.key();
-    if Engine::check_observed_raw(next) != ObservedState::Unnecessary {
-        // 如果节点当前正处于重算（anchor_locked=true），说明父链路已在调用栈上，无需再次入队以免触发重入检测。
-        if !next.anchor_locked.get() {
-            waiting_record_wake();
-            graph.queue_recalc(next);
-        }
-    } else if graph2::recalc_state(next) == RecalcState::Ready {
-        graph2::needs_recalc(next);
-        if debug_mark_enabled() {
-            println!(
-                "mark_dirty0 unnecessary node={:?} parents={}",
-                next.debug_info.get()._to_string(),
-                next.parents_len()
-            );
-        }
+    ////////////////////////////////////////////////////////////////////////////////
+    // 标脏时的依赖者传播(方案 A M2a 修正):
+    //
+    // - 数值化调度时代, observed 节点只入队自己、不递归依赖者 — 依赖者的重算
+    //   顺序由高度序兜底(pop 序恒为 child -> parent), "依赖者读到中间态"的
+    //   窗口不可达, 延迟到值真变时再通知(recalculate 完成点 mark_dirty)是纯优化;
+    // - FIFO 调度(M2a 起)没有高度序兜底: B 入队期间, 依赖者 E 仍是 Ready 旧态,
+    //   若 E 的依赖者 P 恰在此时 poll 并 request(E) 判 Updated, get 会读到
+    //   "E Ready 但 E 的内部依赖 B Pending" 的中间态, 触发 get 契约 panic
+    //   (实证: for_each_state insert_middle 首击, Either::output 内部 get)。
+    // - 因此 observed 分支也必须同步向依赖者传播标脏(先 queue(child) 再
+    //   queue(parents), FIFO 顺序内含因果序); 对数值化语义完全兼容(高度序不变,
+    //   仅队列多出提前条目, 依赖者 Pending 白跑一次由 requeue 吸收)。
+    ////////////////////////////////////////////////////////////////////////////////
+    let propagate_to_parents = |next: &NodeGuard<'a>| {
         next.for_each_parent(|parent| {
             if parent.anchor_locked.get() {
                 // 父节点正在重算：只记录 dirty，等待解锁后补偿入队。
@@ -2233,6 +2233,24 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
             graph.queue_recalc(parent);
             mark_dirty0(graph, parent);
         });
+    };
+    if Engine::check_observed_raw(next) != ObservedState::Unnecessary {
+        // 如果节点当前正处于重算（anchor_locked=true），说明父链路已在调用栈上，无需再次入队以免触发重入检测。
+        if !next.anchor_locked.get() {
+            waiting_record_wake();
+            graph.queue_recalc(next);
+        }
+        propagate_to_parents(&next);
+    } else if graph2::recalc_state(next) == RecalcState::Ready {
+        graph2::needs_recalc(next);
+        if debug_mark_enabled() {
+            println!(
+                "mark_dirty0 unnecessary node={:?} parents={}",
+                next.debug_info.get()._to_string(),
+                next.parents_len()
+            );
+        }
+        propagate_to_parents(&next);
     }
 }
 
@@ -2276,7 +2294,17 @@ impl<'eng> OutputContext<'eng> for EngineContext<'eng> {
                 .engine
                 .expect_node(&graph, anchor.token(), "EngineContext::get");
             if graph2::recalc_state(node) != RecalcState::Ready {
-                panic!("attempted to get node that was not previously requested")
+                // 方案 A M2a: 就地收敛(lazy ensure, Salsa on-demand 同构)。
+                //
+                // 背景: Either 类动态内部 anchor(snapshot/view_gel 重建)在 output 读取时,
+                // 其内部持有的新节点可能刚 mount 并经 request 分支一入队(尚未 Ready);
+                // 数值化调度时代靠"新节点高度最低, 依赖链全在其上"的排序保证读取安全,
+                // FIFO 调度失去该兜底。读取点就地把队列处理到目标 Ready(嵌套调度
+                // 在 global engine get 的 stabilize 重入中已有先例), 窗口命中 rare。
+                self.engine.stabilize_lazy_ensure_ready(anchor.token());
+                if graph2::recalc_state(node) != RecalcState::Ready {
+                    panic!("attempted to get node that was not previously requested")
+                }
             }
             let anchor_ptr =
                 unsafe { *node.anchor.get() }.expect("EngineContext::get: anchor 缺失");
@@ -2304,7 +2332,11 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                 .engine
                 .expect_node(&graph, anchor.token(), "EngineContextMut::get");
             if graph2::recalc_state(node) != RecalcState::Ready {
-                panic!("attempted to get node that was not previously requested")
+                // 同 EngineContext::get 的 lazy ensure(方案 A M2a, 见其注释)。
+                self.engine.stabilize_lazy_ensure_ready(anchor.token());
+                if graph2::recalc_state(node) != RecalcState::Ready {
+                    panic!("attempted to get node that was not previously requested")
+                }
             }
 
             let anchor_ptr =
@@ -2467,28 +2499,23 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
 
 impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
     fn request_node(&mut self, child: NodeGuard<'gg>, necessary: bool) -> Poll {
-        let height_already_increased = match graph2::ensure_height_increases(child, self.node) {
-            Ok(v) => v,
-            Err(()) => {
-                tracing::error!(
-                    target: "anchors",
-                    "检测到依赖环，跳过本次 request，parent={:?} child={:?}",
-                    self.node.debug_info.get()._to_string(),
-                    child.debug_info.get()._to_string()
-                );
-                return Poll::Unchanged;
-            }
-        };
-
+        ////////////////////////////////////////////////////////////////////////////////
+        // 方案 A M2a: 建边不再做高度传播(ensure_height_increases 停用)。
+        //
+        // - 正确性由 M1 落地的边级 read_gen 判定 + mark_dirty 唤醒链 + stabilize
+        //   固定点承载; FIFO 入队顺序内含因果序(mark_dirty0 先 queue(child) 再
+        //   queue(parents); 分支一先 queue(C) 再挂 P)。
+        // - 即时环检测(visited 随传播走)随之停用, 环将表现为 stabilize 不收敛
+        //   (8 轮上限 warn + M0 的残留子图 dump), M3 补 Kahn 式死锁定位。
+        ////////////////////////////////////////////////////////////////////////////////
         if debug_request_enabled() {
             println!(
-                "REQUEST parent_token={} parent={:?} child_token={} child={:?} ready={:?} height_ok={}",
+                "REQUEST parent_token={} parent={:?} child_token={} child={:?} ready={:?}",
                 self.node.key().raw_token(),
                 self.node.debug_info.get()._to_string(),
                 child.key().raw_token(),
                 child.debug_info.get()._to_string(),
                 graph2::recalc_state(child),
-                height_already_increased
             );
         }
 
@@ -2537,8 +2564,16 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
                 // (C 在本轮 stabilize 内刚 Updated, poll 应看到新值)。
                 (Some(a), Some(v)) if a == v && v == self.engine.generation => Poll::Updated,
                 (Some(_), Some(_)) => Poll::Unchanged,
-                // 边无版本记忆(P 从未完成, read_gen=None)或 C 无时间戳: 保守读。
-                _ => Poll::Updated,
+                // 边无版本记忆(P 从未完成过, read_gen=None)且 C 已有时间戳: 首读,
+                // 必须写回版本 — 否则本边每次 request 都判 Updated, 会让 P 反复用
+                // C 的透传型 output(如 cutoff/map)重算缓存(实证: test_cutoff_simple_observed
+                // 135!=110 回归)。
+                (Some(a), None) => {
+                    child.set_parent_link_read_gen(self.node.make_ptr(), Some(a));
+                    Poll::Updated
+                }
+                // C 自身无时间戳(从未 Updated 过): 无版本可记, 保守读。
+                (None, _) => Poll::Updated,
             }
         }
     }
