@@ -1047,10 +1047,6 @@ impl Engine {
     /// 数值化调度靠"新节点高度最低"排序兜底, FIFO 改为读取点就地跑一遍队列
     /// 固定点循环(队列耗尽即停; 正在重算的节点 anchor_locked 会被跳过, 无重入)。
     /// 队列耗尽后仍未 Ready(如脏源尚在 dirty_marks 未 flush)由调用方按原语义 panic。
-    fn stabilize_lazy_ensure_ready(&self, _target: NodeKey) {
-        waiting_record_lazy_ensure();
-        self.stabilize_with_pending_queue();
-    }
 
     fn stabilize_with_pending_queue(&self) {
         #[cfg(debug_assertions)]
@@ -2061,8 +2057,6 @@ pub struct WaitingStatsSnapshot {
     pub wake_by_mark_dirty: u64,
     /// M2b: child 完成但值 Unchanged 时的挂起依赖者放行次数。
     pub wake_by_child_ready: u64,
-    /// M2a: get 遇非 Ready 节点走就地收敛(lazy ensure)的次数。
-    pub lazy_ensure: u64,
     pub recalc_pops: u64,
     /// 9 槽直方图: index 0..7 = 收敛于 1..8 轮, index 8 = 8 轮超限。
     pub stabilize_rounds: [u64; 9],
@@ -2073,7 +2067,6 @@ struct WaitingStats {
     parked: std::sync::atomic::AtomicU64,
     wake_by_mark_dirty: std::sync::atomic::AtomicU64,
     wake_by_child_ready: std::sync::atomic::AtomicU64,
-    lazy_ensure: std::sync::atomic::AtomicU64,
     recalc_pops: std::sync::atomic::AtomicU64,
     stabilize_rounds: [std::sync::atomic::AtomicU64; 9],
 }
@@ -2082,7 +2075,6 @@ static WAITING_STATS: WaitingStats = WaitingStats {
     parked: std::sync::atomic::AtomicU64::new(0),
     wake_by_mark_dirty: std::sync::atomic::AtomicU64::new(0),
     wake_by_child_ready: std::sync::atomic::AtomicU64::new(0),
-    lazy_ensure: std::sync::atomic::AtomicU64::new(0),
     recalc_pops: std::sync::atomic::AtomicU64::new(0),
     stabilize_rounds: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
 };
@@ -2104,12 +2096,6 @@ fn waiting_record_park() {
 pub(crate) fn waiting_record_wake_by_child_ready() {
     WAITING_STATS
         .wake_by_child_ready
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-#[inline]
-pub(crate) fn waiting_record_lazy_ensure() {
-    WAITING_STATS
-        .lazy_ensure
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[inline]
@@ -2146,7 +2132,6 @@ pub fn waiting_stats_snapshot() -> WaitingStatsSnapshot {
         parked: WAITING_STATS.parked.load(Relaxed),
         wake_by_mark_dirty: WAITING_STATS.wake_by_mark_dirty.load(Relaxed),
         wake_by_child_ready: WAITING_STATS.wake_by_child_ready.load(Relaxed),
-        lazy_ensure: WAITING_STATS.lazy_ensure.load(Relaxed),
         recalc_pops: WAITING_STATS.recalc_pops.load(Relaxed),
         stabilize_rounds,
     }
@@ -2323,19 +2308,18 @@ impl<'eng> OutputContext<'eng> for EngineContext<'eng> {
             let node = self
                 .engine
                 .expect_node(&graph, anchor.token(), "EngineContext::get");
-            if graph2::recalc_state(node) != RecalcState::Ready {
-                // 方案 A M2a: 就地收敛(lazy ensure, Salsa on-demand 同构)。
-                //
-                // 背景: Either 类动态内部 anchor(snapshot/view_gel 重建)在 output 读取时,
-                // 其内部持有的新节点可能刚 mount 并经 request 分支一入队(尚未 Ready);
-                // 数值化调度时代靠"新节点高度最低, 依赖链全在其上"的排序保证读取安全,
-                // FIFO 调度失去该兜底。读取点就地把队列处理到目标 Ready(嵌套调度
-                // 在 global engine get 的 stabilize 重入中已有先例), 窗口命中 rare。
-                self.engine.stabilize_lazy_ensure_ready(anchor.token());
-                if graph2::recalc_state(node) != RecalcState::Ready {
-                    panic!("attempted to get node that was not previously requested")
-                }
-            }
+            ////////////////////////////////////////////////////////////////////////////////
+            // 方案 A S2 修复: 读路径绝不触发重算(pull 读语义)。
+            //
+            // 原 M2b 的 lazy ensure(读取点嵌套 stabilize)是"自噬使能器": output 递归链
+            // (Either::output -> get(either_anchor))中途的重算会重建子树, 旧 anchor 槽位
+            // 被复用后, 继续执行的读取栈拿到新住客 -> downcast None 崩溃(实证: 第 6 次
+            // 连续中插, probe Some 后正式调用 None, 中间仅隔嵌套重算)。
+            //
+            // 正确语义: token 校验通过 + 节点 handle 存活 => anchor impl 类型恒定,
+            // 直接读其 output 缓存(可能略旧, 数值一致性由外层 stabilize 固定点保证);
+            // 不校验 Ready(挂起中的节点同样可读旧值), 不做任何调度动作。
+            ////////////////////////////////////////////////////////////////////////////////
             let anchor_ptr =
                 unsafe { *node.anchor.get() }.expect("EngineContext::get: anchor 缺失");
             let anchor_impl = unsafe { anchor_ptr.as_ref() };
@@ -2361,14 +2345,8 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
             let node = self
                 .engine
                 .expect_node(&graph, anchor.token(), "EngineContextMut::get");
-            if graph2::recalc_state(node) != RecalcState::Ready {
-                // 同 EngineContext::get 的 lazy ensure(方案 A M2a, 见其注释)。
-                self.engine.stabilize_lazy_ensure_ready(anchor.token());
-                if graph2::recalc_state(node) != RecalcState::Ready {
-                    panic!("attempted to get node that was not previously requested")
-                }
-            }
-
+            // 方案 A S2 修复: 读路径绝不触发重算(pull 读语义, 语义与理由详见
+            // EngineContext::get 的注释) — 挂起中的节点直接读 output 旧值。
             let anchor_ptr =
                 unsafe { *node.anchor.get() }.expect("EngineContextMut::get: anchor 缺失");
             let anchor_impl = unsafe { anchor_ptr.as_ref() };
