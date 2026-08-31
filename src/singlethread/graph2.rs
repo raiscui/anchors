@@ -614,10 +614,8 @@ mod node_store {
 
             guard.ptrs.handle_count.set(0);
             guard.observed.set(false);
-            guard.visited.set(false);
             guard.necessary_count.set(0);
             guard.ptrs.recalc_state.set(super::RecalcState::Needed);
-            guard.ptrs.recalc_bucket.set(None);
             guard.recalc_retry.set(0);
             guard.pending_dirty.borrow_mut().clear();
             guard.pending_recalc.set(false);
@@ -776,9 +774,6 @@ pub struct Graph2Guard<'gg> {
 pub struct Node {
     pub observed: Cell<bool>,
 
-    /// bool used during height incrementing to check for loops
-    pub visited: Cell<bool>,
-
     /// number of nodes that list this node as a necessary child
     pub necessary_count: Cell<usize>,
 
@@ -894,7 +889,6 @@ pub struct NodePtrs {
     /// - 入队时记录 `recalc_bucket = Some(node_height)`（表示"当前挂在哪个 bucket 链表上"，不要求等于最新 height）；
     /// - dequeue/remove 时优先用 `recalc_bucket` O(1) 命中并摘除；
     /// - 若链表指针/状态不一致，再兜底扫描所有 bucket（极少数路径）。
-    recalc_bucket: Cell<Option<usize>>,
     recalc_state: Cell<RecalcState>,
 
     /// Next node in free list (仅用于 anchors_slotmap)。
@@ -908,8 +902,6 @@ pub struct NodePtrs {
 
     /// sorted in pointer order
     necessary_children: RefCell<Vec<NodePtr>>,
-
-    height: Cell<usize>,
 
     handle_count: Cell<usize>,
 }
@@ -1495,7 +1487,6 @@ impl<'gg> Graph2Guard<'gg> {
             }
             node.ptrs.prev.set(None);
             node.ptrs.next.set(None);
-            node.ptrs.recalc_bucket.set(None);
             node.ptrs.recalc_state.set(RecalcState::Ready);
             // ┌─────────────────────────────────────────────────────────────┐
             // │ 队列可能残留"已回收节点"（anchor 已置空、handle_count 归零）。│
@@ -1993,8 +1984,7 @@ impl Graph2 {
                     }
                 }
                 guard.observed.set(false);
-                guard.visited.set(false);
-                guard.necessary_count.set(0);
+                    guard.necessary_count.set(0);
                 ////////////////////////////////////////////////////////////////////////////////
                 // NOTE:
                 // - 纯调试能力：定位"哪个旧 token 被复用成新 token"，用于追踪失效 token 的来源。
@@ -2059,7 +2049,6 @@ impl Graph2 {
                     // clean_parents 通常很小,默认不做 shrink,尽量保留容量复用。
                 }
                 guard.parent_epoch.set(1);
-                guard.ptrs.recalc_bucket.set(None);
                 guard.ptrs.recalc_state.set(RecalcState::Needed);
                 guard.ptrs.free_next.set(None);
                 guard.ptrs.free_prev.set(None);
@@ -2071,14 +2060,8 @@ impl Graph2 {
                         *children = Vec::new();
                     }
                 }
-                // NOTE: 新节点初始高度必须为 0（四个方案已全部证伪，勿重复尝试）：
-                // - SLACK 富余(需求+32): 传播量不变(需求增长远超富余);
-                // - 全局 max 继承(方案 G): 追赶方向翻转, 14s->300s;
-                // - 创建者高度-1 继承(方案 H): 其它低高度依赖者反追新节点, 传播量 x2.9;
-                // - 周期性重归一化(方案 R, 2026-08-30): 值域压回紧凑后传播量仅降 0.03%——
-                //   传播距离取决于链长而非高度差, 追赶是结构性的(每帧动态重建拓扑必然要求
-                //   低侧走链提升)。根治只剩"建边不传播(去数值化调度, pending 挂起/唤醒兜底)"一条路。
-                guard.ptrs.height.set(0);
+                // 历史证伪注记(SLACK/方案G/方案H/方案R 对高度传播的系统性排除)
+                // 已迁移至 specs/anchors_plan_a_denumericalized_scheduling.md §1.2, 勿再尝试。
                 guard.ptrs.handle_count.set(1);
                 guard.ptrs.prev.set(None);
                 guard.ptrs.next.set(None);
@@ -2103,7 +2086,6 @@ impl Graph2 {
             } else {
                 let node = Node {
                     observed: Cell::new(false),
-                    visited: Cell::new(false),
                     necessary_count: Cell::new(0),
                     slot_token: Cell::new(self.next_slot_token()),
                     parent_epoch: Cell::new(1),
@@ -2114,12 +2096,10 @@ impl Graph2 {
                         graph: self,
                         next: Cell::new(None),
                         prev: Cell::new(None),
-                        recalc_bucket: Cell::new(None),
                         recalc_state: Cell::new(RecalcState::Needed),
                         free_next: Cell::new(None),
                         free_prev: Cell::new(None),
                         necessary_children: RefCell::new(vec![]),
-                        height: Cell::new(0),
                         handle_count: Cell::new(1),
                     },
                     debug_info: Cell::new(debug_info),
@@ -2150,255 +2130,6 @@ impl Drop for Graph2 {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// set_min_height 确定性访问计数（诊断设施，ANCHORS_SMH_STATS=1 + 宿主退出打印）：
-// - 用途： 算法层 A/B 验证，不受 CPU 争抢/环境噪声影响；
-// - visits = 传播栈实际处理的节点数；lifts = 真正执行高度提升的次数。
-// ────────────────────────────────────────────────────────────────────────────
-struct SmhStats {
-    visits: std::sync::atomic::AtomicU64,
-    lifts: std::sync::atomic::AtomicU64,
-}
-static SMH_STATS: SmhStats = SmhStats {
-    visits: std::sync::atomic::AtomicU64::new(0),
-    lifts: std::sync::atomic::AtomicU64::new(0),
-};
-#[inline]
-fn smh_stats_record(visited: bool, lifted: bool) {
-    if visited {
-        SMH_STATS
-            .visits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    if lifted {
-        SMH_STATS
-            .lifts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-/// 读取 set_min_height 诊断计数（visits=处理过的节点数, lifts=实际提升次数）。
-/// 供宿主程序在退出路径显式打印（static 不保证 drop，必须显式快照）。
-pub fn smh_stats_snapshot() -> (u64, u64) {
-    (
-        SMH_STATS.visits.load(std::sync::atomic::Ordering::Relaxed),
-        SMH_STATS.lifts.load(std::sync::atomic::Ordering::Relaxed),
-    )
-}
-
-pub fn ensure_height_increases<'a>(
-    child: NodeGuard<'a>,
-    parent: NodeGuard<'a>,
-) -> Result<bool, ()> {
-    if height(child) < height(parent) {
-        return Ok(true);
-    }
-    child.visited.set(true);
-    let res = set_min_height(parent, height(child) + 1);
-    child.visited.set(false);
-    res.map(|()| false)
-}
-
-fn set_min_height(node: NodeGuard<'_>, min_height: usize) -> Result<(), ()> {
-    // 剪枝：高度已满足，无需向上回填。
-    if height(node) >= min_height {
-        return Ok(());
-    }
-
-    ////////////////////////////////////////////////////////////////////////////////
-    // 性能改良：把"递归 + 每层分配 Vec"改为"显式栈 DFS"
-    //
-    // 背景：
-    // - `ensure_height_increases` 会在 request 依赖时调用本函数；
-    // - 在深链/高频 request 场景里，递归 + 临时 Vec 分配会产生显著常数开销；
-    // - pprof 里 `set_min_height` 会占很高的 flat%。
-    //
-    // 做法：
-    // - 用一个 Vec 作为工作栈，走 DFS 传播；
-    // - 仍然沿用 `node.visited` 做环检测；
-    // - 发现环时不立刻 return（否则会遗留 visited=true），而是标记 did_err；
-    // - 最关键：复用 thread-local 的 Vec 缓冲区，避免每次调用都分配/释放，
-    //   同时把 capacity 拉高到一个"足够大"的值，减少 `grow_one/finish_grow` 反复扩容。
-    ////////////////////////////////////////////////////////////////////////////////
-    #[derive(Clone, Copy)]
-    enum WorkKind {
-        /// 已经在"入栈阶段"完成活性校验的 Enter（本轮 set_min_height 内可视为稳定）。
-        ///
-        /// 目的：
-        /// - 避免"入栈阶段校验一次 + 出栈阶段再校验一次"的重复常数；
-        /// - 在 parent 较多时，这个重复校验会在 pprof 里集中成 Top 热点。
-        EnterAssumedLive,
-        Exit,
-    }
-
-    #[derive(Clone, Copy)]
-    struct WorkItem {
-        kind: WorkKind,
-        key: NodeKey,
-        min_height: usize,
-    }
-
-    ////////////////////////////////////////////////////////////////////////////////
-    // 性能关键：
-    // - 这里的 stack 只在本线程使用；
-    // - 通过 thread-local 复用底层容量，避免每次调用都触发 alloc/dealloc；
-    // - 用 Enter/Exit 两类步骤模拟递归的"入栈/出栈"，保持 visited 的语义为"当前路径栈标记"（用于环检测）。
-    ////////////////////////////////////////////////////////////////////////////////
-    const MIN_CAPACITY: usize = 256;
-    thread_local! {
-        static STACK: RefCell<Vec<WorkItem>> = RefCell::new(Vec::new());
-    }
-
-    // NOTE:
-    // - 仅用于本轮 `set_min_height` 内部（单线程、无 free/reuse 的前提下）；
-    // - 调用方必须确保该 key 在"入栈阶段"已通过 token+anchor 校验。
-    #[inline]
-    unsafe fn node_from_key_unchecked<'a>(key: NodeKey) -> NodeGuard<'a> {
-        NodeGuard(unsafe { key.ptr.lookup_unchecked() })
-    }
-
-    STACK.with(|stack_cell| {
-        let mut stack = stack_cell.borrow_mut();
-
-        // 复用容量：只 clear，不释放。
-        stack.clear();
-
-        // 关键：尽量在第一次就把 capacity 拉到一个"够用"的水平，减少 grow_one。
-        {
-            let cap = stack.capacity();
-            if cap < MIN_CAPACITY {
-                stack.reserve(MIN_CAPACITY - cap);
-            }
-        }
-
-        stack.push(WorkItem {
-            kind: WorkKind::EnterAssumedLive,
-            key: node.key(),
-            min_height,
-        });
-
-        let mut did_err = false;
-        while let Some(item) = stack.pop() {
-            match item.kind {
-                WorkKind::Exit => {
-                    // Exit 一定来自本轮 Enter 成功后的 push，因此这里可以跳过重复活性校验。
-                    let n = unsafe { node_from_key_unchecked(item.key) };
-                    #[cfg(debug_assertions)]
-                    {
-                        debug_assert_eq!(
-                            n.slot_token.get(),
-                            item.key.token,
-                            "set_min_height Exit: slot_token/token 不一致（疑似 key 非 live）"
-                        );
-                        debug_assert!(
-                            unsafe { (*n.anchor.get()).is_some() },
-                            "set_min_height Exit: anchor=None（疑似 key 非 live）"
-                        );
-                    }
-                    n.visited.set(false);
-                }
-                WorkKind::EnterAssumedLive => {
-                    let n = unsafe { node_from_key_unchecked(item.key) };
-                    #[cfg(debug_assertions)]
-                    {
-                        debug_assert_eq!(
-                            n.slot_token.get(),
-                            item.key.token,
-                            "set_min_height EnterAssumedLive: slot_token/token 不一致（疑似 key 非 live）"
-                        );
-                        debug_assert!(
-                            unsafe { (*n.anchor.get()).is_some() },
-                            "set_min_height EnterAssumedLive: anchor=None（疑似 key 非 live）"
-                        );
-                    }
-
-                    // 剪枝：已有更大的高度，无需继续向上回填。
-                    if height(n) >= item.min_height {
-                        smh_stats_record(true, false);
-                        continue;
-                    }
-                    // 环检测：只标记错误，依靠 Exit 步骤清理 visited。
-                    if n.visited.get() {
-                        did_err = true;
-                        continue;
-                    }
-
-                    smh_stats_record(true, true);
-                    n.visited.set(true);
-                    // NOTE: 曾试验"SLACK 富余高度"(实际高度=需求+32)以降低传播频率,
-                    // 被确定性计数证伪(ANCHORS_SMH_STATS: 动态重建负载下传播 2.2 亿次/op
-                    // 集合、剪枝近零——新节点与高链的追赶距离反而被 SLACK 拉大), 已回滚。
-                    n.ptrs.height.set(item.min_height);
-
-                    // 先压 Exit，再压父节点 Enter：保证"先处理父，再清 visited"。
-                    stack.push(WorkItem {
-                        kind: WorkKind::Exit,
-                        key: n.key(),
-                        min_height: 0,
-                    });
-
-                    let parent_min_h = item.min_height + 1;
-                    n.for_each_parent_key(|parent_key| {
-                        ////////////////////////////////////////////////////////////////////////////////
-                        // 性能：parent 遍历阶段做一次"早剪枝"，减少无效 WorkItem 入栈
-                        //
-                        // - 之前这里会把所有 parent 都 push 进栈，很多 parent 在后续 pop 时会因为：
-                        //   - token/anchor 失效（节点已被 GC/free）
-                        //   - height 已满足（无需提升）
-                        //   而立刻被剪枝。
-                        // - 这些"push + pop + 再剪枝"的纯常数会在 pprof 里集中到该行。
-                        // - 这里先做一次轻量判断：只有确实需要提升的 parent 才入栈。
-                        //
-                        // 注意：依赖环检测仍保持语义：
-                        // - 仅当 parent 需要提升且已在当前路径 visited 时，才标记 did_err。
-                        ////////////////////////////////////////////////////////////////////////////////
-                        // NOTE:
-                        // - 先读 height：高度已满足的 parent，直接返回，避免多余的 token/anchor 读取；
-                        // - 只有在"确实需要提升"的情况下，才做 token/anchor 校验与 visited 检测。
-                        let parent = NodeGuard(unsafe { parent_key.ptr.lookup_unchecked() });
-                        if height(parent) >= parent_min_h {
-                            return;
-                        }
-                        if parent.slot_token.get() != parent_key.token {
-                            return;
-                        }
-                        if unsafe { (*parent.anchor.get()).is_none() } {
-                            return;
-                        }
-                        if parent.visited.get() {
-                            did_err = true;
-                            return;
-                        }
-
-                        stack.push(WorkItem {
-                            // parent 已通过 token+anchor 校验，这里标记为 AssumedLive，
-                            // 避免后续 pop 时再次做 token/anchor 校验。
-                            kind: WorkKind::EnterAssumedLive,
-                            key: parent_key,
-                            min_height: parent_min_h,
-                        });
-                    });
-                }
-            }
-        }
-
-        if did_err { Err(()) } else { Ok(()) }
-    })
-}
-
-/// 辅助：当节点已经 Pending 但需要"重新排队"时，先摘下旧位置再重新入队，避免 recalc_min_height 已越过导致饥饿。
-#[allow(dead_code)]
-pub fn requeue_pending<'gg>(graph: Graph2Guard<'gg>, node: NodeGuard<'gg>) {
-    // 仅处理 Pending 节点，其余保持原逻辑。
-    if node.ptrs.recalc_state.get() != RecalcState::Pending {
-        return;
-    }
-    // 先摘出旧的队列位置。
-    dequeue_calc(graph.graph, node);
-    node.ptrs.recalc_state.set(RecalcState::Ready);
-    // 再按 queue_recalc 正常入队，保证 recalc_min_height/prev/next 更新。
-    graph.queue_recalc(node);
-}
-
 /// 将节点状态强制置为 Ready（不改动队列指针），用于锁释放后无条件重新入队。
 #[allow(dead_code)]
 pub fn set_recalc_ready(node: NodeGuard<'_>) {
@@ -2425,7 +2156,6 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
     node.ptrs.recalc_state.set(RecalcState::Ready);
     node.ptrs.prev.set(None);
     node.ptrs.next.set(None);
-    node.ptrs.recalc_bucket.set(None);
 }
 
 fn dequeue_calc_by_ptr(graph: &Graph2, target_ptr: NodePtr) -> bool {
@@ -2481,7 +2211,6 @@ fn dequeue_calc_by_ptr(graph: &Graph2, target_ptr: NodePtr) -> bool {
 
         target.ptrs.prev.set(None);
         target.ptrs.next.set(None);
-        target.ptrs.recalc_bucket.set(None);
         target.ptrs.recalc_state.set(RecalcState::Ready);
         return true;
     }
@@ -2526,10 +2255,6 @@ unsafe fn free(ptr: NodePtr) {
     }
 }
 
-pub fn height(node: NodeGuard<'_>) -> usize {
-    node.ptrs.height.get()
-}
-
 pub fn needs_recalc(node: NodeGuard<'_>) {
     if node.ptrs.recalc_state.get() != RecalcState::Ready {
         // already in recalc queue, or already pending recalc
@@ -2548,133 +2273,6 @@ mod test {
 
     fn to_vec<I: IntoIterator>(iter: I) -> Vec<I::Item> {
         iter.into_iter().collect()
-    }
-
-    #[test]
-    fn set_edge_updates_correctly() {
-        let graph = Graph2::new(256);
-        graph.with(|guard| {
-            let a = guard.insert_testing_guard();
-            let b = guard.insert_testing_guard();
-            let empty: Vec<NodeGuard<'_>> = vec![];
-
-            assert_eq!(empty, to_vec(a.necessary_children()));
-            assert_eq!(empty, to_vec(a.clean_parents()));
-            assert_eq!(empty, to_vec(b.necessary_children()));
-            assert_eq!(empty, to_vec(b.clean_parents()));
-            assert!(a.necessary_count.get() == 0);
-            assert!(b.necessary_count.get() == 0);
-
-            assert_eq!(Ok(false), ensure_height_increases(a, b));
-            assert_eq!(Ok(true), ensure_height_increases(a, b));
-            a.add_clean_parent(b);
-
-            assert_eq!(empty, to_vec(a.necessary_children()));
-            assert_eq!(vec![b], to_vec(a.clean_parents()));
-            assert_eq!(empty, to_vec(b.necessary_children()));
-            assert_eq!(empty, to_vec(b.clean_parents()));
-            assert!(a.necessary_count.get() == 0);
-            assert!(b.necessary_count.get() == 0);
-
-            assert_eq!(Ok(true), ensure_height_increases(a, b));
-            b.add_necessary_child(a);
-
-            assert_eq!(empty, to_vec(a.necessary_children()));
-            assert_eq!(vec![b], to_vec(a.clean_parents()));
-            assert_eq!(vec![a], to_vec(b.necessary_children()));
-            assert_eq!(empty, to_vec(b.clean_parents()));
-            assert!(a.necessary_count.get() > 0);
-            assert!(b.necessary_count.get() == 0);
-
-            let _ = a.drain_clean_parents();
-
-            assert_eq!(empty, to_vec(a.necessary_children()));
-            assert_eq!(empty, to_vec(a.clean_parents()));
-            assert_eq!(vec![a], to_vec(b.necessary_children()));
-            assert_eq!(empty, to_vec(b.clean_parents()));
-            assert!(a.necessary_count.get() > 0);
-            assert!(b.necessary_count.get() == 0);
-
-            let _ = b.drain_necessary_children();
-
-            assert_eq!(empty, to_vec(a.necessary_children()));
-            assert_eq!(empty, to_vec(a.clean_parents()));
-            assert_eq!(empty, to_vec(b.necessary_children()));
-            assert_eq!(empty, to_vec(b.clean_parents()));
-            assert!(a.necessary_count.get() == 0);
-            assert!(b.necessary_count.get() == 0);
-        });
-    }
-
-    #[test]
-    fn height_calculated_correctly() {
-        let graph = Graph2::new(256);
-        graph.with(|guard| {
-            let a = guard.insert_testing_guard();
-            let b = guard.insert_testing_guard();
-            let c = guard.insert_testing_guard();
-
-            assert_eq!(0, height(a));
-            assert_eq!(0, height(b));
-            assert_eq!(0, height(c));
-
-            assert_eq!(Ok(false), ensure_height_increases(b, c));
-            assert_eq!(Ok(true), ensure_height_increases(b, c));
-            b.add_clean_parent(c);
-
-            assert_eq!(0, height(a));
-            assert_eq!(0, height(b));
-            assert_eq!(1, height(c));
-
-            assert_eq!(Ok(false), ensure_height_increases(a, b));
-            assert_eq!(Ok(true), ensure_height_increases(a, b));
-            a.add_clean_parent(b);
-
-            assert_eq!(0, height(a));
-            assert_eq!(1, height(b));
-            assert_eq!(2, height(c));
-
-            let _ = a.drain_clean_parents();
-
-            assert_eq!(0, height(a));
-            assert_eq!(1, height(b));
-            assert_eq!(2, height(c));
-        })
-    }
-
-    #[test]
-    fn cycles_cause_error() {
-        let graph = Graph2::new(256);
-        graph.with(|guard| {
-            let b = guard.insert_testing_guard();
-            let c = guard.insert_testing_guard();
-            ensure_height_increases(b, c).unwrap();
-            b.add_clean_parent(c);
-            ensure_height_increases(c, b).unwrap_err();
-        })
-    }
-
-    #[test]
-    fn non_cycles_wont_cause_errors() {
-        let graph = Graph2::new(256);
-        graph.with(|guard| {
-            let a = guard.insert_testing_guard();
-            let b = guard.insert_testing_guard();
-            let c = guard.insert_testing_guard();
-            let d = guard.insert_testing_guard();
-            let e = guard.insert_testing_guard();
-
-            ensure_height_increases(b, c).unwrap();
-            b.add_clean_parent(c);
-            ensure_height_increases(c, e).unwrap();
-            c.add_clean_parent(e);
-            ensure_height_increases(b, d).unwrap();
-            b.add_clean_parent(d);
-            ensure_height_increases(d, e).unwrap();
-            d.add_clean_parent(e);
-            ensure_height_increases(a, b).unwrap();
-            a.add_clean_parent(b);
-        })
     }
 
     #[test]
@@ -2714,28 +2312,6 @@ mod test {
             assert_eq!(Some(e3), guard.recalc_pop_next());
             assert_eq!(None, guard.recalc_pop_next());
         })
-    }
-
-    #[test]
-    fn stale_queue_entries_are_skipped_after_free() {
-        let graph = Graph2::new(10);
-        graph.with(|guard| {
-            let node = guard.insert_testing_guard();
-            set_min_height(node, 1).unwrap();
-            guard.queue_recalc(node);
-
-            // ── 模拟：节点在入队后被回收（anchor 清空），但队列仍残留旧指针。
-            unsafe {
-                *node.anchor.get() = None;
-            }
-            node.ptrs.handle_count.set(0);
-
-            // 修复前这里会返回 Some(node)，后续重算 panic；修复后应直接跳过。
-            assert!(
-                guard.recalc_pop_next().is_none(),
-                "已移除的 anchor 不应再次出队重算"
-            );
-        });
     }
 
     #[test]

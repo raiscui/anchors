@@ -151,8 +151,6 @@ where
                 self.dirty = true;
             }
             Poll::Unchanged | Poll::Pending => {}
-            #[cfg(feature = "anchors_pending_queue")]
-            Poll::PendingDefer => {}
         }
 
         if !self.dirty {
@@ -418,8 +416,6 @@ mod tests {
                 Some(Poll::Updated) => Poll::Updated,
                 Some(Poll::Unchanged) => Poll::Unchanged,
                 Some(Poll::Pending) => Poll::Pending,
-                #[cfg(feature = "anchors_pending_queue")]
-                Some(Poll::PendingDefer) => Poll::PendingDefer,
                 Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
                 None => Poll::Unchanged,
             }

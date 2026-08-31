@@ -554,7 +554,8 @@ fn s2_either_churn_repro() {
         let v = Var::new(0u64);
         (v.watch(), v)
     };
-    let layout_sa = (&a_var, &b_var, &c_var, &d_var).map(|a, b, c, d| a + b + c.0 + c.1 + *d as f32);
+    let layout_sa =
+        (&a_var, &b_var, &c_var, &d_var).map(|a, b, c, d| a + b + c.0 + c.1 + *d as f32);
 
     // —— 子层(跨节点引用, 还原崩溃栈形态): N 个并发子 MapMut, painter 输入 = 同一个父 Either ——
     // 真实链路: 每个列表 item 的 paint_ctx_sa 都引用父 local_painter_sa; 子 poll 时

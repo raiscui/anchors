@@ -430,8 +430,6 @@ mod test {
                     Some(Poll::Updated) => Poll::Updated,
                     Some(Poll::Unchanged) => Poll::Unchanged,
                     Some(Poll::Pending) => Poll::Pending,
-                    #[cfg(feature = "anchors_pending_queue")]
-                    Some(Poll::PendingDefer) => Poll::PendingDefer,
                     Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
                     None => Poll::Unchanged,
                 }

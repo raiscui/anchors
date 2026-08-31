@@ -297,8 +297,6 @@ where
                             self.output_dirty = false;
                         }
                         Poll::Pending => return Poll::Pending,
-                        #[cfg(feature = "anchors_pending_queue")]
-                        Poll::PendingDefer => return Poll::Pending,
                     }
                 }
             }
@@ -413,8 +411,6 @@ where
                 Poll::Unchanged
             }
             Poll::Pending => Poll::Pending,
-            #[cfg(feature = "anchors_pending_queue")]
-            Poll::PendingDefer => Poll::Pending,
         }
     }
 

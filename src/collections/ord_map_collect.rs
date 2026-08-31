@@ -317,8 +317,6 @@ where
                 self.invalid_keys.clear();
             }
             Poll::Unchanged | Poll::Pending => {}
-            #[cfg(feature = "anchors_pending_queue")]
-            Poll::PendingDefer => {}
         };
 
         // 2) 若无需重建，则保持 Unchanged。
@@ -681,8 +679,6 @@ mod test {
                     Some(Poll::Updated) => Poll::Updated,
                     Some(Poll::Unchanged) => Poll::Unchanged,
                     Some(Poll::Pending) => Poll::Pending,
-                    #[cfg(feature = "anchors_pending_queue")]
-                    Some(Poll::PendingDefer) => Poll::PendingDefer,
                     Some(Poll::PendingInvalidToken) => Poll::PendingInvalidToken,
                     None => Poll::Unchanged,
                 }

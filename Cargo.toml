@@ -18,7 +18,6 @@ default = ["generic_size_voa", "lock_strict"]
 # pool = ["im-rc/pool"]
 pool = []
 generic_size_voa = ["emg_common"]
-anchors_pending_queue = []
 lock_strict = []
 
 

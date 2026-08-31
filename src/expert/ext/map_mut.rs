@@ -237,7 +237,7 @@ mod tests {
     /// 单测：当依赖返回 PendingInvalidToken 时，map_mut 应保持旧输出并返回 Unchanged。
     ///
     /// 背景：
-    /// - 拆树期可能出现“失效 token request”，在 EngineContextMut::request 中会转成 PendingDefer；
+    /// - 拆树期可能出现“失效 token request”，在 EngineContextMut::request 中会转成 PendingInvalidToken；
     /// - map_mut 作为缓存型节点，应优先保持旧输出，避免把 Pending 继续向上传播导致 panic/自旋。
     /// ////////////////////////////////////////////////////////////////////////////
     #[test]
@@ -250,9 +250,9 @@ mod tests {
         let a: Anchor<u32, Engine> = Anchor::constant(1);
         let b: Anchor<u32, Engine> = Anchor::constant(2);
 
-        struct PendingDeferOnlyCtx;
+        struct InvalidTokenOnlyCtx;
 
-        impl crate::expert::UpdateContext for PendingDeferOnlyCtx {
+        impl crate::expert::UpdateContext for InvalidTokenOnlyCtx {
             type Engine = crate::singlethread::Engine;
 
             fn get<'out, 'slf, O: 'static>(&'slf self, _anchor: &Anchor<O, Self::Engine>) -> &'out O
@@ -288,7 +288,7 @@ mod tests {
             },
         };
 
-        let mut ctx = PendingDeferOnlyCtx;
+        let mut ctx = InvalidTokenOnlyCtx;
         let poll = mapped.poll_updated(&mut ctx);
         assert_eq!(Poll::Unchanged, poll);
         assert!(
