@@ -490,3 +490,118 @@ fn test_readme_example() {
     my_unread_updater.set(50);
     assert_eq!(engine.get(&dynamic_name), "Robo");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// S2: stale-anchor UB 最小复现(布局无关靶子, 供 Miri 擒获)
+//
+// 模拟真实崩溃场景的链形态(for_each_state insert_middle):
+// - 链 1(paint 形态): Either 由开关驱动切换 — "有 builder"分支每次 poll 重建
+//   MapMut 双输入链(paint_ctx_sa 形态), 切换时旧 either_anchor 被 unrequest+drop
+//   (级联 free 旧链); "无 builder"分支回落常量 anchor。
+// - 链 2(layout 形态): 4 输入 Map(to_layout_override 形态), 输入同批 churn。
+// - 每轮 set 全部输入 + get 两条链(推 stabilize, 触发挂起/唤醒时序)。
+// ────────────────────────────────────────────────────────────────────────────
+#[test]
+fn s2_either_churn_repro() {
+    use crate::expert::ValOrAnchor;
+
+    let mut engine = Engine::new();
+
+    // —— 链 1 输入 ——
+    let (builder_on_var, builder_on_setter) = {
+        let v = Var::new(false);
+        (v.watch(), v)
+    };
+    let (ws_var, ws_setter) = {
+        let v = Var::new(0u64);
+        (v.watch(), v)
+    };
+    // "父级 painter"常量(无 builder 时的回落)
+    let incoming = crate::expert::Anchor::constant(7u64);
+
+    // either 闭包: 每次切换构造全新 MapMut 链(模拟 paint_ctx_sa 的重建)
+    let ws_for_chain = ws_var.clone();
+    let inc_for_none = incoming.clone();
+    let painter_sa = builder_on_var.either(move |on| {
+        if *on {
+            ValOrAnchor::Anchor(
+                (&incoming, &ws_for_chain).map_mut(0u64, |out, _painter, ws| {
+                    let next = *ws + 1;
+                    let changed = *out != next;
+                    *out = next;
+                    changed
+                }),
+            )
+        } else {
+            ValOrAnchor::Anchor(inc_for_none.clone())
+        }
+    });
+
+    // —— 链 2(layout 形态: 4 输入 Map)——
+    let (a_var, a_setter) = {
+        let v = Var::new(0.0f32);
+        (v.watch(), v)
+    };
+    let (b_var, b_setter) = {
+        let v = Var::new(0.0f32);
+        (v.watch(), v)
+    };
+    let (c_var, c_setter) = {
+        let v = Var::new((0.0f32, 0.0f32));
+        (v.watch(), v)
+    };
+    let (d_var, d_setter) = {
+        let v = Var::new(0u64);
+        (v.watch(), v)
+    };
+    let layout_sa = (&a_var, &b_var, &c_var, &d_var).map(|a, b, c, d| a + b + c.0 + c.1 + *d as f32);
+
+    // —— 子层(跨节点引用, 还原崩溃栈形态): N 个并发子 MapMut, painter 输入 = 同一个父 Either ——
+    // 真实链路: 每个列表 item 的 paint_ctx_sa 都引用父 local_painter_sa; 子 poll 时
+    // get(父 Either) -> Either::output -> get(either_anchor) 正是崩溃路径。
+    const CHILD_N: usize = 20;
+    let child_ws_vars: Vec<_> = (0..CHILD_N)
+        .map(|k| {
+            let v = Var::new(k as u64);
+            (v.watch(), v)
+        })
+        .collect();
+    let child_maps: Vec<_> = child_ws_vars
+        .iter()
+        .map(|(ws, _setter)| {
+            (&painter_sa, ws).map_mut(0u64, |out, parent_painter, child_ws| {
+                let next = *parent_painter + *child_ws;
+                let changed = *out != next;
+                *out = next;
+                changed
+            })
+        })
+        .collect();
+
+    // —— churn: 交替切换 + 全输入变化 + 读取(推 stabilize)——
+    let rounds = std::env::var("S2_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(600);
+    let mut last_painter = 0u64;
+    let mut last_layout = 0.0f32;
+    let mut last_child = 0u64;
+    for i in 0..rounds {
+        builder_on_setter.set(i % 2 == 0);
+        ws_setter.set(i as u64);
+        for (k, (_ws, setter)) in child_ws_vars.iter().enumerate() {
+            setter.set(i as u64 * 3 + k as u64);
+        }
+        a_setter.set(i as f32 * 0.1);
+        b_setter.set(i as f32 * 0.2);
+        c_setter.set((i as f32 * 0.3, i as f32 * 0.4));
+        d_setter.set(i as u64);
+        last_painter = engine.get(&painter_sa);
+        last_layout = engine.get(&layout_sa);
+        last_child = engine.get(&child_maps[CHILD_N - 1]);
+    }
+    // 防优化: 输出参与断言
+    assert!(last_painter > 0, "last_painter={last_painter}");
+    assert!(last_layout > 0.0, "last_layout={last_layout}");
+    assert!(last_child > 0, "last_child={last_child}");
+}

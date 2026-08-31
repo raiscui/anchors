@@ -2224,6 +2224,7 @@ fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
     }
 }
 
+#[inline(never)]
 fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
     #[cfg(debug_assertions)]
     trace!("mark_dirty0 {:?}", next);
