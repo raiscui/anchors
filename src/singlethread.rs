@@ -1048,7 +1048,6 @@ impl Engine {
     /// 固定点循环(队列耗尽即停; 正在重算的节点 anchor_locked 会被跳过, 无重入)。
     /// 队列耗尽后仍未 Ready(如脏源尚在 dirty_marks 未 flush)由调用方按原语义 panic。
     fn stabilize_lazy_ensure_ready(&self, _target: NodeKey) {
-        waiting_record_lazy_ensure();
         self.stabilize_with_pending_queue();
     }
 
@@ -1132,11 +1131,10 @@ impl Engine {
                 let calculation_complete = self.recalculate(graph, node);
 
                 if !calculation_complete {
-                    // 方案 A M2b: Pending 传染者摘除挂起(不再 requeue-to-tail,
-                    // 消除提前 poll 白跑), 唤醒由依赖完成事件承载:
-                    // 值 Updated -> mark_dirty 链; 值 Unchanged -> wake_waiting_dependents。
-                    waiting_record_park();
-                    graph.park_recalc(node);
+                    // 诊断计数: 挂起者的隐式重排(M2a: FIFO requeue-to-tail;
+                    // M2b 将改为摘除挂起 + child-ready 事件唤醒)。
+                    waiting_record_requeue();
+                    graph.queue_recalc(node);
                 }
             }
             graph.retry_pending_free();
@@ -1659,10 +1657,6 @@ impl Engine {
                 true
             }
             Poll::Unchanged => {
-                // 方案 A M2b: 值未变也必须放行挂起在本节点上的 Waiting 依赖者
-                // (它们等的是"完成"而非"值变"; 不发 dirty, 依赖者 re-poll 时用
-                // read_gen 判定自然得出 Unchanged)。
-                graph.wake_waiting_dependents(node);
                 node.last_ready.set(Some(self.generation));
                 true
             }
@@ -2046,7 +2040,8 @@ fn panic_anchor_locked_strict(token: u64, node_debug: String, trace: Option<Stri
 // 计数语义(跨 M2 迁移对照设计, 详见 specs/anchors_plan_a_denumericalized_scheduling.md §5 M0):
 // - pending_branch:       request_node 走保守分支返回 Pending 的次数
 //                         (M2 前的"挂起"等价物; M2 后语义自然过渡为挂起次数);
-// - parked:                stabilize 循环 Pending 传染后的挂起次数(M2b 起摘除, 不再 requeue);
+// - requeue_after_pending: stabilize 循环 !calculation_complete -> queue_recalc 的次数
+//                         (现状挂起者的隐式重排; M2b 挂起摘除后应显著下降);
 // - wake_by_mark_dirty:   mark_dirty 唤醒链上的 queue_recalc 次数, 含 locked 补偿路径
 //                         (外部输入变化引起的唤醒链活动量);
 // - recalc_pops:          recalc_pop_next 成功弹出总数
@@ -2056,13 +2051,8 @@ fn panic_anchor_locked_strict(token: u64, node_debug: String, trace: Option<Stri
 #[derive(Debug, Clone, Default)]
 pub struct WaitingStatsSnapshot {
     pub pending_branch: u64,
-    /// M2b 起 Pending 传染者挂起摘除(不再 requeue; M2a 时代此值为 requeue 次数)。
-    pub parked: u64,
+    pub requeue_after_pending: u64,
     pub wake_by_mark_dirty: u64,
-    /// M2b: child 完成但值 Unchanged 时的挂起依赖者放行次数。
-    pub wake_by_child_ready: u64,
-    /// M2a: get 遇非 Ready 节点走就地收敛(lazy ensure)的次数。
-    pub lazy_ensure: u64,
     pub recalc_pops: u64,
     /// 9 槽直方图: index 0..7 = 收敛于 1..8 轮, index 8 = 8 轮超限。
     pub stabilize_rounds: [u64; 9],
@@ -2070,19 +2060,15 @@ pub struct WaitingStatsSnapshot {
 
 struct WaitingStats {
     pending_branch: std::sync::atomic::AtomicU64,
-    parked: std::sync::atomic::AtomicU64,
+    requeue_after_pending: std::sync::atomic::AtomicU64,
     wake_by_mark_dirty: std::sync::atomic::AtomicU64,
-    wake_by_child_ready: std::sync::atomic::AtomicU64,
-    lazy_ensure: std::sync::atomic::AtomicU64,
     recalc_pops: std::sync::atomic::AtomicU64,
     stabilize_rounds: [std::sync::atomic::AtomicU64; 9],
 }
 static WAITING_STATS: WaitingStats = WaitingStats {
     pending_branch: std::sync::atomic::AtomicU64::new(0),
-    parked: std::sync::atomic::AtomicU64::new(0),
+    requeue_after_pending: std::sync::atomic::AtomicU64::new(0),
     wake_by_mark_dirty: std::sync::atomic::AtomicU64::new(0),
-    wake_by_child_ready: std::sync::atomic::AtomicU64::new(0),
-    lazy_ensure: std::sync::atomic::AtomicU64::new(0),
     recalc_pops: std::sync::atomic::AtomicU64::new(0),
     stabilize_rounds: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
 };
@@ -2094,22 +2080,9 @@ fn waiting_record_pending_branch() {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[inline]
-fn waiting_record_park() {
+fn waiting_record_requeue() {
     WAITING_STATS
-        .parked
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-/// M2b: wake_waiting_dependents(graph2)使用的跨模块计数入口。
-#[inline]
-pub(crate) fn waiting_record_wake_by_child_ready() {
-    WAITING_STATS
-        .wake_by_child_ready
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-#[inline]
-pub(crate) fn waiting_record_lazy_ensure() {
-    WAITING_STATS
-        .lazy_ensure
+        .requeue_after_pending
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[inline]
@@ -2143,10 +2116,8 @@ pub fn waiting_stats_snapshot() -> WaitingStatsSnapshot {
         .map(|c| c.load(Relaxed));
     WaitingStatsSnapshot {
         pending_branch: WAITING_STATS.pending_branch.load(Relaxed),
-        parked: WAITING_STATS.parked.load(Relaxed),
+        requeue_after_pending: WAITING_STATS.requeue_after_pending.load(Relaxed),
         wake_by_mark_dirty: WAITING_STATS.wake_by_mark_dirty.load(Relaxed),
-        wake_by_child_ready: WAITING_STATS.wake_by_child_ready.load(Relaxed),
-        lazy_ensure: WAITING_STATS.lazy_ensure.load(Relaxed),
         recalc_pops: WAITING_STATS.recalc_pops.load(Relaxed),
         stabilize_rounds,
     }
