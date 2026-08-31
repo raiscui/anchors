@@ -1015,6 +1015,7 @@ impl Engine {
                 "stabilize: 调度工作集在上限轮次后仍未收敛（dirty/recalc/pending 仍存在），建议排查循环依赖或长期 PendingDefer 链路"
             );
         }
+
         #[cfg(debug_assertions)]
         trace!("....stabilize");
     }
