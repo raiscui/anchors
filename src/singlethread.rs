@@ -780,6 +780,15 @@ impl Engine {
             .clone()
     }
 
+    /// stabilize 8 轮未收敛时的残留子图 dump(方案 A M0 预铺, 为 M3 Kahn 死锁检测观察基线)。
+    ///
+    /// 现状(数值化调度)下不收敛意味着 recalc 队列仍有 Pending 节点反复 requeue;
+    /// M2(去数值化)后不收敛的形态将变为"队列空 + Waiting 挂起非空", dump 内容届时演进。
+    fn dump_unconverged_subgraph(&self) -> Vec<String> {
+        self.graph
+            .with(|graph| graph.collect_pending_nodes_brief(32))
+    }
+
     ////////////////////////////////////////////////////////////////////////////////
     // 汇总当前是否仍有待处理的工作：
     // - dirty_marks: Var/VarVOA::set 注入的脏标记
@@ -1008,10 +1017,16 @@ impl Engine {
             }
         }
 
+        // 诊断计数: stabilize 轮次直方图(未超限记实际轮数 1..8, 超限记 index 8)。
+        waiting_record_rounds(rounds, pending_work);
+
         if pending_work {
+            // 方案 A M0 预铺: 超限不收敛时附队列残留子图, 为 M3 Kahn 死锁检测积累基线形态。
+            let residue = self.dump_unconverged_subgraph();
             tracing::warn!(
                 target: "anchors",
                 rounds = MAX_STABILIZE_ROUNDS,
+                residue = ?residue,
                 "stabilize: 调度工作集在上限轮次后仍未收敛（dirty/recalc/pending 仍存在），建议排查循环依赖或长期 PendingDefer 链路"
             );
         }
@@ -1073,6 +1088,8 @@ impl Engine {
             }
             graph.retry_pending_free();
             while let Some((height, node)) = graph.recalc_pop_next() {
+                // 诊断计数: 调度活动总量(成功弹出的重算节点数)。
+                waiting_record_pop();
                 if spin_debug {
                     spin_counter = spin_counter.saturating_add(1);
                     if spin_last.len() == 32 {
@@ -1115,6 +1132,8 @@ impl Engine {
                 };
 
                 if !calculation_complete {
+                    // 诊断计数: 挂起者的隐式重排(现状"唤醒"机制)。
+                    waiting_record_requeue();
                     graph.queue_recalc(node);
                 }
             }
@@ -2013,6 +2032,97 @@ fn panic_anchor_locked_strict(token: u64, node_debug: String, trace: Option<Stri
 
 // skip_self = true indicates output has *definitely* changed, but node has been recalculated
 // skip_self = false indicates node has not yet been recalculated
+// ────────────────────────────────────────────────────────────────────────────
+// 方案 A(去数值化调度)调度活动确定性计数(诊断设施, ANCHORS_WAITING_STATS=1 + 宿主退出打印)。
+// 模式与 set_min_height 的 SMH_STATS 相同: 常开原子计数(Relaxed 足够便宜, 计数本身
+// 已包含在历史基线口径内), 快照由宿主 env 门控打印(static 不保证 drop, 必须显式快照)。
+//
+// 计数语义(跨 M2 迁移对照设计, 详见 specs/anchors_plan_a_denumericalized_scheduling.md §5 M0):
+// - pending_branch:       request_node 走保守分支返回 Pending 的次数
+//                         (M2 前的"挂起"等价物; M2 后语义自然过渡为挂起次数);
+// - requeue_after_pending: stabilize 循环 !calculation_complete -> queue_recalc 的次数
+//                         (现状挂起者的隐式重排; M2b 挂起摘除后应显著下降);
+// - wake_by_mark_dirty:   mark_dirty 唤醒链上的 queue_recalc 次数, 含 locked 补偿路径
+//                         (外部输入变化引起的唤醒链活动量);
+// - recalc_pops:          recalc_pop_next 成功弹出总数
+//                         (调度活动总量; M2 前后对照"提前 poll 浪费"的核心指标);
+// - stabilize_rounds[i]:  stabilize 实际使用轮次直方图(i=0..7 对应 1..8 轮, i=8 为超限)。
+// ────────────────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Default)]
+pub struct WaitingStatsSnapshot {
+    pub pending_branch: u64,
+    pub requeue_after_pending: u64,
+    pub wake_by_mark_dirty: u64,
+    pub recalc_pops: u64,
+    /// 9 槽直方图: index 0..7 = 收敛于 1..8 轮, index 8 = 8 轮超限。
+    pub stabilize_rounds: [u64; 9],
+}
+
+struct WaitingStats {
+    pending_branch: std::sync::atomic::AtomicU64,
+    requeue_after_pending: std::sync::atomic::AtomicU64,
+    wake_by_mark_dirty: std::sync::atomic::AtomicU64,
+    recalc_pops: std::sync::atomic::AtomicU64,
+    stabilize_rounds: [std::sync::atomic::AtomicU64; 9],
+}
+static WAITING_STATS: WaitingStats = WaitingStats {
+    pending_branch: std::sync::atomic::AtomicU64::new(0),
+    requeue_after_pending: std::sync::atomic::AtomicU64::new(0),
+    wake_by_mark_dirty: std::sync::atomic::AtomicU64::new(0),
+    recalc_pops: std::sync::atomic::AtomicU64::new(0),
+    stabilize_rounds: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
+};
+
+#[inline]
+fn waiting_record_pending_branch() {
+    WAITING_STATS
+        .pending_branch
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[inline]
+fn waiting_record_requeue() {
+    WAITING_STATS
+        .requeue_after_pending
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[inline]
+fn waiting_record_wake() {
+    WAITING_STATS
+        .wake_by_mark_dirty
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[inline]
+fn waiting_record_pop() {
+    WAITING_STATS
+        .recalc_pops
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[inline]
+fn waiting_record_rounds(rounds: usize, overflowed: bool) {
+    let idx = if overflowed {
+        8
+    } else {
+        rounds.saturating_sub(1).min(7)
+    };
+    WAITING_STATS.stabilize_rounds[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 读取调度活动诊断计数, 供宿主程序在退出路径显式打印(env 门控在宿主侧)。
+pub fn waiting_stats_snapshot() -> WaitingStatsSnapshot {
+    use std::sync::atomic::Ordering::Relaxed;
+    let stabilize_rounds = WAITING_STATS
+        .stabilize_rounds
+        .each_ref()
+        .map(|c| c.load(Relaxed));
+    WaitingStatsSnapshot {
+        pending_branch: WAITING_STATS.pending_branch.load(Relaxed),
+        requeue_after_pending: WAITING_STATS.requeue_after_pending.load(Relaxed),
+        wake_by_mark_dirty: WAITING_STATS.wake_by_mark_dirty.load(Relaxed),
+        recalc_pops: WAITING_STATS.recalc_pops.load(Relaxed),
+        stabilize_rounds,
+    }
+}
+
 fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) {
     #[cfg(debug_assertions)]
     trace!("mark_dirty {:?} ", node.debug_info.get(),);
@@ -2047,6 +2157,7 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
                     );
                 }
                 // 直接补偿入队一次：如果当下锁未释放，队列弹出时会跳过，等解锁后可正常重算。
+                waiting_record_wake();
                 graph.queue_recalc_force(parent);
                 return;
             }
@@ -2056,6 +2167,7 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
                 unsafe { anchor_ptr.as_mut().dirty(&child) };
             }
 
+            waiting_record_wake();
             graph.queue_recalc(parent);
             mark_dirty0(graph, parent);
         });
@@ -2090,6 +2202,7 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
     if Engine::check_observed_raw(next) != ObservedState::Unnecessary {
         // 如果节点当前正处于重算（anchor_locked=true），说明父链路已在调用栈上，无需再次入队以免触发重入检测。
         if !next.anchor_locked.get() {
+            waiting_record_wake();
             graph.queue_recalc(next);
         }
     } else if graph2::recalc_state(next) == RecalcState::Ready {
@@ -2106,6 +2219,7 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
                 // 父节点正在重算：只记录 dirty，等待解锁后补偿入队。
                 push_pending_dirty(parent, id);
                 parent.pending_recalc.set(true);
+                waiting_record_wake();
                 graph.queue_recalc_force(parent);
                 return;
             }
@@ -2115,6 +2229,7 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
                 unsafe { anchor_ptr.as_mut().dirty(&id) };
             }
 
+            waiting_record_wake();
             graph.queue_recalc(parent);
             mark_dirty0(graph, parent);
         });
@@ -2422,6 +2537,8 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
         necessary: bool,
         self_is_necessary: bool,
     ) -> Poll {
+        // 诊断计数: request_node 保守分支(分支一 child 未 Ready / 分支二 序刚被抬高)的唯一汇聚点。
+        waiting_record_pending_branch();
         let priority = PendingPriority::default_for(necessary, self_is_necessary);
         if self
             .engine

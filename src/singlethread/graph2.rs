@@ -1486,6 +1486,46 @@ impl<'gg> Graph2Guard<'gg> {
         None
     }
 
+    /// 收集当前 recalc 队列中的 Pending 节点摘要(方案 A M0 死锁 dump 预铺)。
+    ///
+    /// 用途: stabilize 8 轮未收敛时输出残留子图, 为 M3 Kahn 死锁检测观察基线。
+    /// - limit 控制最多输出条数, 防止不收敛场景刷屏;
+    /// - 与 recalc_pop_next 同口径: anchor=None 的已回收节点不计入;
+    /// - dependents = 该节点的 clean_parents 数(有多少依赖者挂着它)。
+    pub fn collect_pending_nodes_brief(&self, limit: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let recalc_queues = self.graph.recalc_queues.borrow();
+        'outer: for (h, head) in recalc_queues.iter().enumerate() {
+            let Some(mut cur) = *head else { continue };
+            // 防御上限: 链表若异常成环, 本函数不能跟着死循环。
+            let mut steps = 0usize;
+            loop {
+                steps += 1;
+                if steps > 10_000 {
+                    break;
+                }
+                let node = NodeGuard(unsafe { cur.lookup_unchecked() });
+                if out.len() < limit && unsafe { (*node.anchor.get()).is_some() } {
+                    out.push(format!(
+                        "height={h} token={} state={:?} dependents={} debug={}",
+                        node.key().raw_token(),
+                        node.ptrs.recalc_state.get(),
+                        node.parents_len(),
+                        node.debug_info.get()._to_string(),
+                    ));
+                    if out.len() == limit {
+                        break 'outer;
+                    }
+                }
+                match node.ptrs.next.get() {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+
     pub fn queue_recalc(&self, node: NodeGuard<'gg>) {
         // ─────────────────────────────────────────────────────────────
         // 防御性修复：Pending 但可能已“丢队列”
@@ -2121,10 +2161,14 @@ static SMH_STATS: SmhStats = SmhStats {
 #[inline]
 fn smh_stats_record(visited: bool, lifted: bool) {
     if visited {
-        SMH_STATS.visits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SMH_STATS
+            .visits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if lifted {
-        SMH_STATS.lifts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SMH_STATS
+            .lifts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 /// 读取 set_min_height 诊断计数（visits=处理过的节点数, lifts=实际提升次数）。
