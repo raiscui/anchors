@@ -845,6 +845,16 @@ impl NodeKey {
 struct ParentLink {
     key: NodeKey,
     epoch: u64,
+    /// 方案 A(M1)边级版本记忆: parent 在本边上"已消费"的 child 版本(None=未读过)。
+    ///
+    /// 语义与 Salsa 的 per-query read revision 同构:
+    /// - 新建边/parent 槽位被新实体复用(token 变化)时, 初始化为 parent.last_ready
+    ///   (对齐现状节点级判定语义, 避免首读保守差异);
+    /// - 同一 parent 实体(token 不变, epoch 复活)时保留旧值 — P 曾读过 C 的某代值,
+    ///   drain 后重 poll 若 C 未再变, 判 Unchanged 省一次重算(比现状更精确,
+    ///   行为差异由 M1 验收: 全测试 + graph.json 等价覆盖);
+    /// - request 判定为 Updated 时经 set_parent_link_read_gen 写回 C 当前 last_update。
+    read_gen: Option<Generation>,
 }
 
 pub struct NodePtrs {
@@ -957,7 +967,7 @@ impl<'a> std::ops::Deref for NodeGuard<'a> {
 
 impl<'a> NodeGuard<'a> {
     #[inline]
-    fn make_ptr(&self) -> NodePtr {
+    pub(crate) fn make_ptr(&self) -> NodePtr {
         self.0.make_ptr()
     }
 
@@ -994,12 +1004,33 @@ impl<'a> NodeGuard<'a> {
         link.epoch != current_epoch || self.live_parent_from_key(link.key).is_none()
     }
 
-    pub fn add_clean_parent(self, parent: NodeGuard<'a>) {
+    /// 建立或刷新"child <- parent"依赖边, 返回该边当前的 read_gen(方案 A M1 边级版本记忆)。
+    ///
+    /// 返回值语义: request_node 用它与 child.last_update 比较得出 Updated/Unchanged:
+    /// - 新建边/槽位被新 parent 实体复用(token 变化): read_gen = parent.last_ready;
+    /// - 同实体刷新(epoch 复活): 保留旧 read_gen(见 ParentLink.read_gen 注释)。
+    pub fn add_clean_parent(self, parent: NodeGuard<'a>) -> Option<Generation> {
+        if debug_parent_link_enabled() {
+            // 调试输出：带上节点的 debug_info，便于定位父子是谁
+            let child_dbg = self.debug_info.get()._to_string();
+            let parent_dbg = parent.debug_info.get()._to_string();
+            println!(
+                "add_clean_parent child={:?} ({}) parent={:?} ({}) epoch={}",
+                self.key().raw_token(),
+                child_dbg,
+                parent.key().raw_token(),
+                parent_dbg,
+                self.current_parent_epoch(),
+            );
+        }
         let parent_key = parent.key();
         let current_epoch = self.current_parent_epoch();
+        // 新建/复用槽位时的初始版本: 对齐现状"节点级 last_ready"判定语义。
+        let initial_read_gen = parent.last_ready.get();
         let new_link = ParentLink {
             key: parent_key,
             epoch: current_epoch,
+            read_gen: initial_read_gen,
         };
         ////////////////////////////////////////////////////////////////////////////////
         // 架构调整：parent link 不再通过“drain 物理删除”失效，而是通过 epoch 逻辑失效。
@@ -1011,22 +1042,32 @@ impl<'a> NodeGuard<'a> {
         ////////////////////////////////////////////////////////////////////////////////
         if let Some(mut p0) = self.ptrs.clean_parent0.get() {
             if p0.key.ptr == parent_key.ptr {
-                if p0.key.token != parent_key.token || p0.epoch != current_epoch {
+                if p0.key.token != parent_key.token {
+                    // 槽位被新的 parent 实体复用: 版本记忆按新实体初始化。
+                    p0.read_gen = initial_read_gen;
                     p0.key = parent_key;
                     p0.epoch = current_epoch;
                     self.ptrs.clean_parent0.set(Some(p0));
+                } else if p0.epoch != current_epoch {
+                    // 同实体 epoch 复活: 保留旧版本记忆, 只刷新 epoch。
+                    p0.epoch = current_epoch;
+                    self.ptrs.clean_parent0.set(Some(p0));
                 }
-                return;
+                return p0.read_gen;
             }
         }
         if let Some(mut p1) = self.ptrs.clean_parent1.get() {
             if p1.key.ptr == parent_key.ptr {
-                if p1.key.token != parent_key.token || p1.epoch != current_epoch {
+                if p1.key.token != parent_key.token {
+                    p1.read_gen = initial_read_gen;
                     p1.key = parent_key;
                     p1.epoch = current_epoch;
                     self.ptrs.clean_parent1.set(Some(p1));
+                } else if p1.epoch != current_epoch {
+                    p1.epoch = current_epoch;
+                    self.ptrs.clean_parent1.set(Some(p1));
                 }
-                return;
+                return p1.read_gen;
             }
         }
 
@@ -1035,44 +1076,68 @@ impl<'a> NodeGuard<'a> {
             || slot0.is_some_and(|link| self.is_reusable_parent_link(link, current_epoch))
         {
             self.ptrs.clean_parent0.set(Some(new_link));
+            return new_link.read_gen;
+        }
+        let slot1 = self.ptrs.clean_parent1.get();
+        if slot1.is_none()
+            || slot1.is_some_and(|link| self.is_reusable_parent_link(link, current_epoch))
+        {
+            self.ptrs.clean_parent1.set(Some(new_link));
+            return new_link.read_gen;
+        }
+        // 慢路径：>2 个 parent 才会走 Vec，且尽量复用 stale 槽位。
+        let mut parents = self.ptrs.clean_parents.borrow_mut();
+        if let Some(existing) = parents
+            .iter_mut()
+            .find(|link| link.key.ptr == parent_key.ptr)
+        {
+            if existing.key.token != parent_key.token {
+                *existing = new_link;
+            } else if existing.epoch != current_epoch {
+                existing.epoch = current_epoch;
+            }
+            existing.read_gen
+        } else if let Some(reuse_idx) = parents
+            .iter()
+            .position(|link| self.is_reusable_parent_link(*link, current_epoch))
+        {
+            parents[reuse_idx] = new_link;
+            new_link.read_gen
         } else {
-            let slot1 = self.ptrs.clean_parent1.get();
-            if slot1.is_none()
-                || slot1.is_some_and(|link| self.is_reusable_parent_link(link, current_epoch))
-            {
-                self.ptrs.clean_parent1.set(Some(new_link));
+            parents.push(new_link);
+            new_link.read_gen
+        }
+    }
+
+    /// 更新"child <- parent"边的版本记忆(request 判定为 Updated 时写回)。
+    ///
+    /// 找不到边(token 失配/已逻辑失效)时静默跳过 — 下次 add_clean_parent 会按新实体重建。
+    pub fn set_parent_link_read_gen(self, parent_ptr: NodePtr, read_gen: Option<Generation>) {
+        let mut apply = |link: &mut ParentLink| {
+            if link.key.ptr == parent_ptr {
+                link.read_gen = read_gen;
+                true
             } else {
-                // 慢路径：>2 个 parent 才会走 Vec，且尽量复用 stale 槽位。
-                let mut parents = self.ptrs.clean_parents.borrow_mut();
-                if let Some(existing) = parents
-                    .iter_mut()
-                    .find(|link| link.key.ptr == parent_key.ptr)
-                {
-                    if existing.key.token != parent_key.token || existing.epoch != current_epoch {
-                        *existing = new_link;
-                    }
-                } else if let Some(reuse_idx) = parents
-                    .iter()
-                    .position(|link| self.is_reusable_parent_link(*link, current_epoch))
-                {
-                    parents[reuse_idx] = new_link;
-                } else {
-                    parents.push(new_link);
-                }
+                false
+            }
+        };
+        if let Some(mut p0) = self.ptrs.clean_parent0.get() {
+            if apply(&mut p0) {
+                self.ptrs.clean_parent0.set(Some(p0));
+                return;
             }
         }
-        if debug_parent_link_enabled() {
-            // 调试输出：带上节点的 debug_info，便于定位父子是谁
-            let child_dbg = self.debug_info.get()._to_string();
-            let parent_dbg = parent.debug_info.get()._to_string();
-            println!(
-                "add_clean_parent child={:?} ({}) parent={:?} ({}) epoch={}",
-                self.key().raw_token(),
-                child_dbg,
-                parent.key().raw_token(),
-                parent_dbg,
-                current_epoch,
-            );
+        if let Some(mut p1) = self.ptrs.clean_parent1.get() {
+            if apply(&mut p1) {
+                self.ptrs.clean_parent1.set(Some(p1));
+                return;
+            }
+        }
+        let mut parents = self.ptrs.clean_parents.borrow_mut();
+        for link in parents.iter_mut() {
+            if apply(link) {
+                return;
+            }
         }
     }
 

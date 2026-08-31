@@ -2512,20 +2512,32 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
                 self.node.add_necessary_child(child);
             }
             self.defer_or_pending(child, necessary, self_is_necessary)
-        } else if !height_already_increased {
-            child.add_clean_parent(self.node);
-            self.pending_on_anchor_get = true;
-            self.defer_or_pending(child, necessary, self_is_necessary)
         } else {
-            child.add_clean_parent(self.node);
+            ////////////////////////////////////////////////////////////////////////////////
+            // 方案 A M1: C Ready 时一律走边级 read_gen 判定。
+            //
+            // - 旧"分支二"(序刚被本次 request 抬高 -> Pending 等下一轮)删除:
+            //   C Ready 意味着 C 不在队列、输出为当前稳定值, 直接读不破坏正确性,
+            //   高度序仅是调度近似而非读取前提 — 这正是去数值化要建立的新世界观。
+            // - 判定从节点级 (C.last_update vs P.last_ready) 换为边级
+            //   (C.last_update vs link.read_gen), 语义见 graph2::ParentLink 注释;
+            //   传播(ensure_height_increases)本阶段保留, SMH 计数应与基线一致。
+            ////////////////////////////////////////////////////////////////////////////////
+            let read_gen = child.add_clean_parent(self.node);
             if necessary && self_is_necessary {
                 self.node.add_necessary_child(child);
             }
-            match (child.last_update.get(), self.node.last_ready.get()) {
-                (Some(a), Some(b)) if a < b => Poll::Unchanged,
-                (Some(a), Some(b)) if a == b && b == self.engine.generation => Poll::Updated,
-                (Some(a), Some(b)) if a == b => Poll::Unchanged,
-                (Some(_), Some(_)) => Poll::Updated,
+            match (child.last_update.get(), read_gen) {
+                (Some(a), Some(v)) if a > v => {
+                    // 消费了新版本: 写回边级记忆, 下次同值比较可判 Unchanged。
+                    child.set_parent_link_read_gen(self.node.make_ptr(), Some(a));
+                    Poll::Updated
+                }
+                // 同轮刚更新特判: 保留旧 fast path `a == b == generation => Updated` 语义
+                // (C 在本轮 stabilize 内刚 Updated, poll 应看到新值)。
+                (Some(a), Some(v)) if a == v && v == self.engine.generation => Poll::Updated,
+                (Some(_), Some(_)) => Poll::Unchanged,
+                // 边无版本记忆(P 从未完成, read_gen=None)或 C 无时间戳: 保守读。
                 _ => Poll::Updated,
             }
         }
@@ -2537,7 +2549,8 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
         necessary: bool,
         self_is_necessary: bool,
     ) -> Poll {
-        // 诊断计数: request_node 保守分支(分支一 child 未 Ready / 分支二 序刚被抬高)的唯一汇聚点。
+        // 诊断计数: request_node 保守分支(child 未 Ready 时挂起等待)的唯一汇聚点。
+        // 注: M1 起旧"分支二"(序刚被抬高)已删除, 该计数仅覆盖分支一。
         waiting_record_pending_branch();
         let priority = PendingPriority::default_for(necessary, self_is_necessary);
         if self
