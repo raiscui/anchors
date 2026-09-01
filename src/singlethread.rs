@@ -1655,6 +1655,18 @@ fn waiting_record_rounds(rounds: usize, overflowed: bool) {
 }
 
 /// 读取调度活动诊断计数, 供宿主程序在退出路径显式打印(env 门控在宿主侧)。
+/// S9 诊断: 按 anchor impl 类型统计活节点频次 top-20(需在 graph 上下文外调用,
+/// 读取当前线程 DEFAULT_MOUNTER 的 engine 图)。
+pub fn anchor_type_histogram() -> Vec<(String, usize)> {
+    DEFAULT_MOUNTER.with(|m| {
+        let borrowed = m.borrow();
+        let Some(mounter) = borrowed.as_ref() else {
+            return Vec::new();
+        };
+        mounter.graph.with(|g| g.anchor_type_histogram())
+    })
+}
+
 pub fn waiting_stats_snapshot() -> WaitingStatsSnapshot {
     use std::sync::atomic::Ordering::Relaxed;
     let stabilize_rounds = WAITING_STATS

@@ -229,6 +229,14 @@ mod node_store {
             }
         }
 
+        /// S9 诊断: 遍历全部槽位的裸引用(含已回收, 调用方自行过滤)。仅诊断路径。
+        pub fn for_each_slot(&self, mut f: impl FnMut(&T)) {
+            let slots = unsafe { &*(*self.graph).slots.get() };
+            for (_k, v) in slots.iter() {
+                f(v);
+            }
+        }
+
         pub unsafe fn lookup_ptr(&self, ptr: NodePtr<T>) -> &T {
             let slots = unsafe { &*(*self.graph).slots.get() };
             ////////////////////////////////////////////////////////////////////////////////
@@ -1431,6 +1439,26 @@ impl<'gg> Graph2Guard<'gg> {
     pub fn active_nodes(&self) -> usize {
         self.graph.active_nodes.get()
     }
+
+    /// S9 诊断: 按 anchor impl 类型统计活节点频次(定位每列表项 ~400 节点的构成)。
+    pub fn anchor_type_histogram(&self) -> Vec<(String, usize)> {
+        use emg_hasher::std::HashMap;
+        let mut hist: HashMap<String, usize> = HashMap::default();
+        self.graph.nodes.with(|ns| {
+            ns.for_each_slot(|node: &Node| {
+                if unsafe { (*node.anchor.get()) }.is_none() {
+                    return;
+                }
+                let imp = unsafe { (*node.anchor.get()).unwrap().as_ref() };
+                *hist.entry(imp.debug_info().type_info.to_string()).or_insert(0) += 1;
+            });
+        });
+        let mut v: Vec<_> = hist.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(20);
+        v
+    }
+
 
     pub fn gc_stats(&self) -> GcStatsSnapshot {
         self.graph.gc_stats_snapshot()
