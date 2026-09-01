@@ -1450,13 +1450,18 @@ impl<'gg> Graph2Guard<'gg> {
                     return;
                 }
                 let imp = unsafe { (*node.anchor.get()).unwrap().as_ref() };
-                *hist.entry(imp.debug_info().type_info.to_string()).or_insert(0) += 1;
+                *hist
+                    .entry(imp.debug_info().type_info.to_string())
+                    .or_insert(0) += 1;
             });
         });
         let mut v: Vec<_> = hist.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         // S9-④: 上限由 env 控制(默认 20; 判据裁决需全量时设 ANCHORS_TYPE_HIST_ALL=1)。
-        let limit = if std::env::var("ANCHORS_TYPE_HIST_ALL").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        let limit = if std::env::var("ANCHORS_TYPE_HIST_ALL")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
             usize::MAX
         } else {
             20
@@ -1464,7 +1469,6 @@ impl<'gg> Graph2Guard<'gg> {
         v.truncate(limit);
         v
     }
-
 
     pub fn gc_stats(&self) -> GcStatsSnapshot {
         self.graph.gc_stats_snapshot()
