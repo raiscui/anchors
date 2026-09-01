@@ -1455,7 +1455,13 @@ impl<'gg> Graph2Guard<'gg> {
         });
         let mut v: Vec<_> = hist.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
-        v.truncate(20);
+        // S9-④: 上限由 env 控制(默认 20; 判据裁决需全量时设 ANCHORS_TYPE_HIST_ALL=1)。
+        let limit = if std::env::var("ANCHORS_TYPE_HIST_ALL").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+            usize::MAX
+        } else {
+            20
+        };
+        v.truncate(limit);
         v
     }
 
