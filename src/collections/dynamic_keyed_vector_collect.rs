@@ -199,7 +199,42 @@ where
             }
         }
 
-        let mut order_changed = next_keys != self.order_keys;
+        // ─────────────────────────────────────────────────────────────
+        // 顺序变化形态判定(增量输出的依据):
+        // - Unchanged: 顺序未变,只替换 poll==Updated 的元素;
+        // - TailAppend: 旧顺序是新顺序的前缀(tail push k 个) — 输出只 push_back 新元素;
+        // - TailRemove: 新顺序是旧顺序的前缀(tail pop k 个) — 输出只 pop_back 对齐;
+        // - Restructure: 中间变化(reorder/中间插入删除) — 保持全量重建。
+        //
+        // 背景(pprof 实证 2026-09-02): for_each_state 每次 click(push 一项)都会
+        // tail push,旧实现因此每次都走全量重建(N 次 push_back + N 次 clone),
+        // 是后期 click O(N) 成本的最大单项之一; tail 增量后 im_rc 结构共享使其
+        // 退化为 O(k)。
+        // ─────────────────────────────────────────────────────────────
+        enum OrderDelta {
+            Unchanged,
+            TailAppend { start: usize },
+            TailRemove,
+            Restructure,
+        }
+
+        let order_changed = next_keys != self.order_keys;
+        let mut delta = if !order_changed {
+            OrderDelta::Unchanged
+        } else {
+            let old_len = self.order_keys.len();
+            let new_len = next_keys.len();
+            let shared = old_len.min(new_len);
+            // 公共前缀比较: K 的 Eq 是轻量值比较,与旧实现的全量 != 同一量级
+            let prefix_same = self.order_keys[..shared] == next_keys[..shared];
+            if prefix_same && new_len > old_len {
+                OrderDelta::TailAppend { start: old_len }
+            } else if prefix_same && new_len < old_len {
+                OrderDelta::TailRemove
+            } else {
+                OrderDelta::Restructure
+            }
+        };
         if order_changed {
             self.order_keys = next_keys;
             self.order_anchors = next_anchors;
@@ -247,8 +282,8 @@ where
                 ctx.unrequest(&anchor);
             }
 
-            // 顺序变化 => output 必须重建
-            order_changed = true;
+            // 中间剔除 => 输出必须全量重建（无法安全增量）
+            delta = OrderDelta::Restructure;
         }
 
         if pending_child {
@@ -257,12 +292,12 @@ where
             return Poll::Pending;
         }
 
-        ////////////////////////////////////////////////////////////////////////////////
-        // 4) 生成/更新输出
-        ////////////////////////////////////////////////////////////////////////////////
+        // ─────────────────────────────────────────────────────────────
+        // 4) 生成/更新输出(按变化形态分派: 增量优先, 无法增量才全量重建)
+        // ─────────────────────────────────────────────────────────────
         let mut changed = false;
-        if order_changed || self.vals.is_none() {
-            // 需要重建 output（顺序变化 / 首次输出）
+        if self.vals.is_none() {
+            // 首次输出: 全量构造
             let pool = self.vals_pool.clone();
             let mut vals = Vector::with_pool(&pool);
             for anchor in self.order_anchors.iter() {
@@ -270,27 +305,79 @@ where
             }
             self.vals = Some(vals);
             changed = true;
-        } else if let Some(ref mut old_vals) = self.vals {
-            // 顺序未变：只更新 Updated 的元素
-            if old_vals.len() != self.order_anchors.len() {
-                // 防御：长度不一致时直接重建（避免越界/错位）
-                let pool = self.vals_pool.clone();
-                let mut vals = Vector::with_pool(&pool);
-                for anchor in self.order_anchors.iter() {
-                    vals.push_back(ctx.get(anchor).clone());
-                }
-                *old_vals = vals;
-                changed = true;
-            } else {
-                for ((old, poll), anchor) in old_vals
-                    .iter_mut()
-                    .zip(self.polls_buf.iter())
-                    .zip(self.order_anchors.iter())
-                {
-                    if poll == &Poll::Updated {
-                        *old = ctx.get(anchor).clone();
+        } else {
+            match delta {
+                OrderDelta::Unchanged => {
+                    // 顺序未变: 只更新 Updated 的元素(防御: 长度不一致时全量重建)
+                    let old_vals = self.vals.as_mut().expect("vals 已判定非 None");
+                    if old_vals.len() != self.order_anchors.len() {
+                        let pool = self.vals_pool.clone();
+                        let mut vals = Vector::with_pool(&pool);
+                        for anchor in self.order_anchors.iter() {
+                            vals.push_back(ctx.get(anchor).clone());
+                        }
+                        *old_vals = vals;
                         changed = true;
+                    } else {
+                        for ((old, poll), anchor) in old_vals
+                            .iter_mut()
+                            .zip(self.polls_buf.iter())
+                            .zip(self.order_anchors.iter())
+                        {
+                            if poll == &Poll::Updated {
+                                *old = ctx.get(anchor).clone();
+                                changed = true;
+                            }
+                        }
                     }
+                }
+                OrderDelta::TailAppend { start } => {
+                    // tail push: 旧部分只替换 Updated 项, 新部分 push_back(O(k), 结构共享)
+                    let old_vals = self.vals.as_mut().expect("vals 已判定非 None");
+                    for ((old, poll), anchor) in old_vals
+                        .iter_mut()
+                        .zip(self.polls_buf[..start].iter())
+                        .zip(self.order_anchors[..start].iter())
+                    {
+                        if poll == &Poll::Updated {
+                            *old = ctx.get(anchor).clone();
+                            changed = true;
+                        }
+                    }
+                    // 新 child 此前已确认全部 Ready(pending_child 提前返回), 可直接取值
+                    for anchor in self.order_anchors[start..].iter() {
+                        old_vals.push_back(ctx.get(anchor).clone());
+                    }
+                    changed = true;
+                }
+                OrderDelta::TailRemove => {
+                    // tail pop: 输出尾部对齐(pop_back 释放尾部 chunk 引用), 剩余部分替换 Updated 项
+                    let old_vals = self.vals.as_mut().expect("vals 已判定非 None");
+                    while old_vals.len() > self.order_anchors.len() {
+                        old_vals.pop_back();
+                    }
+                    for ((old, poll), anchor) in old_vals
+                        .iter_mut()
+                        .zip(self.polls_buf.iter())
+                        .zip(self.order_anchors.iter())
+                    {
+                        if poll == &Poll::Updated {
+                            *old = ctx.get(anchor).clone();
+                            changed = true;
+                        }
+                    }
+                    // 长度变化 => 输出必变
+                    changed = true;
+                }
+                OrderDelta::Restructure => {
+                    // 中间变化/首次/无法增量: 全量重建
+                    let pool = self.vals_pool.clone();
+                    let mut vals = Vector::with_pool(&pool);
+                    for anchor in self.order_anchors.iter() {
+                        vals.push_back(ctx.get(anchor).clone());
+                    }
+                    self.vals = Some(vals);
+                    changed = true;
                 }
             }
         }
@@ -377,6 +464,8 @@ mod tests {
         vals: HashMap<DummyToken, Box<dyn Any>>,
         requested: Vec<DummyToken>,
         unrequested: Vec<DummyToken>,
+        // get 调用计数: 用于断言增量路径只读取必要的元素(tail 增量不重读全量)
+        gets: std::rc::Rc<Cell<usize>>,
     }
 
     impl DummyCtx {
@@ -386,6 +475,7 @@ mod tests {
                 vals: HashMap::default(),
                 requested: Vec::new(),
                 unrequested: Vec::new(),
+                gets: std::rc::Rc::new(Cell::new(0)),
             }
         }
     }
@@ -400,6 +490,7 @@ mod tests {
         where
             'slf: 'out,
         {
+            self.gets.set(self.gets.get() + 1);
             let token = anchor.token();
             let any = self.vals.get(&token).expect("缺少测试值");
             any.downcast_ref::<O>().expect("DummyCtx get 类型不匹配")
@@ -687,6 +778,184 @@ mod tests {
         assert!(
             !ctx.requested.contains(&DummyToken(302)),
             "invalid key 必须被跳过，不应再 request 其子 Anchor"
+        );
+    }
+    // ─────────────────────────────────────────────────────────────────
+    // tail 增量输出测试(2026-09-02 刀 1):
+    // pprof 实证 for_each_state 每次 click 都触发 tail push, 旧实现全量重建
+    // 输出 Vector; 以下测试用 get 计数断言增量路径只读取必要元素。
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 构造测试 inner(与现有用例相同的字段布局)
+    fn make_inner(
+        order: ExpertAnchor<Vector<u32>, DummyEngine>,
+        make_anchor: impl Fn(&u32) -> ExpertAnchor<u32, DummyEngine> + 'static,
+    ) -> DynamicKeyedVectorCollect<u32, u32, DummyEngine> {
+        DynamicKeyedVectorCollect::<u32, u32, DummyEngine> {
+            order,
+            make_anchor: std::rc::Rc::new(make_anchor),
+            location: Location::caller(),
+            dirty: true,
+            invalid_keys: Default::default(),
+            cache: Default::default(),
+            order_keys: Vec::new(),
+            order_anchors: Vec::new(),
+            vals: None,
+            polls_buf: Vec::new(),
+            vals_pool: vector::RRBPool::<u32>::new(16),
+        }
+    }
+
+    #[test]
+    fn tail_append_pushes_only_new_elements() {
+        let order = order_anchor(DummyToken(1));
+        let mut inner = make_inner(order.clone(), |key| {
+            value_anchor(DummyToken(100 + u64::from(*key)))
+        });
+
+        let mut ctx = DummyCtx::new();
+        // 初始 order = [1,2,3], 子值 10/20/30
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
+        ctx.polls.insert(DummyToken(101), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(101), Box::new(10u32));
+        ctx.polls.insert(DummyToken(102), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(102), Box::new(20u32));
+        ctx.polls.insert(DummyToken(103), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(103), Box::new(30u32));
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        assert_eq!(inner.vals.clone().unwrap(), vector![10u32, 20, 30]);
+
+        // tail push: order = [1,2,3,4] — 只应 get 新元素(token 104)
+        ctx.gets.set(0);
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 2, 3, 4]));
+        ctx.polls.insert(DummyToken(104), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(104), Box::new(40u32));
+        inner.dirty = true;
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        assert_eq!(
+            inner.vals.clone().unwrap(),
+            vector![10u32, 20, 30, 40],
+            "tail append 后输出应等于旧输出 + 新元素"
+        );
+        // 计数 = 1 次 order 读取 + 1 次新元素读取(旧元素零重读)
+        assert_eq!(
+            ctx.gets.get(),
+            2,
+            "tail append 增量路径只应 get 新元素(旧元素不得重读)"
+        );
+    }
+
+    #[test]
+    fn tail_pop_truncates_without_rereading() {
+        let order = order_anchor(DummyToken(1));
+        let mut inner = make_inner(order.clone(), |key| {
+            value_anchor(DummyToken(400 + u64::from(*key)))
+        });
+
+        let mut ctx = DummyCtx::new();
+        // 初始 order = [1,2,3]
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
+        ctx.polls.insert(DummyToken(401), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(401), Box::new(10u32));
+        ctx.polls.insert(DummyToken(402), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(402), Box::new(20u32));
+        ctx.polls.insert(DummyToken(403), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(403), Box::new(30u32));
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+
+        // tail pop: order = [1,2] — 被移除 key 的 anchor 应 unrequest, 剩余元素不重读
+        ctx.gets.set(0);
+        ctx.unrequested.clear();
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals.insert(DummyToken(1), Box::new(vector![1u32, 2]));
+        inner.dirty = true;
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        assert_eq!(
+            inner.vals.clone().unwrap(),
+            vector![10u32, 20],
+            "tail pop 后输出应截断到新长度"
+        );
+        // 计数 = 1 次 order 读取 + 0 次元素读取(剩余元素零重读)
+        assert_eq!(
+            ctx.gets.get(),
+            1,
+            "tail pop 增量路径不应重读任何剩余元素"
+        );
+        assert!(
+            ctx.unrequested.contains(&DummyToken(403)),
+            "被移除 key 的 anchor 必须 unrequest"
+        );
+    }
+
+    #[test]
+    fn middle_change_still_full_rebuilds() {
+        let order = order_anchor(DummyToken(1));
+        let mut inner = make_inner(order.clone(), |key| {
+            value_anchor(DummyToken(500 + u64::from(*key)))
+        });
+
+        let mut ctx = DummyCtx::new();
+        // 初始 order = [1,2,3]
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 2, 3]));
+        ctx.polls.insert(DummyToken(501), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(501), Box::new(10u32));
+        ctx.polls.insert(DummyToken(502), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(502), Box::new(20u32));
+        ctx.polls.insert(DummyToken(503), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(503), Box::new(30u32));
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+
+        // 中间变化: order = [1,4,3] — 公共前缀断裂, 必须全量重建(get 全部元素)
+        ctx.gets.set(0);
+        ctx.polls.insert(DummyToken(1), Poll::Updated);
+        ctx.vals
+            .insert(DummyToken(1), Box::new(vector![1u32, 4, 3]));
+        ctx.polls.insert(DummyToken(504), Poll::Unchanged);
+        ctx.vals.insert(DummyToken(504), Box::new(40u32));
+        inner.dirty = true;
+
+        assert_eq!(
+            AnchorInner::poll_updated(&mut inner, &mut ctx),
+            Poll::Updated
+        );
+        assert_eq!(
+            inner.vals.clone().unwrap(),
+            vector![10u32, 40, 30],
+            "中间变化走全量重建, 输出按新顺序取值"
+        );
+        // 计数 = 1 次 order 读取 + 3 次全量元素读取
+        assert_eq!(
+            ctx.gets.get(),
+            4,
+            "中间变化(restructure)路径应全量读取所有元素"
         );
     }
 }
