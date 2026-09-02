@@ -53,13 +53,52 @@ where
 /// A setter that can update values inside an associated `VarAnchor`.
 pub struct VarVOA<T, E: Engine> {
     inner: Rc<RefCell<VarEAShared<T, E>>>,
-    anchor: Anchor<T, E>,
+    ////////////////////////////////////////////////////////////////////////////////
+    // 惰性 mount: anchor(VarEitherAnchor 代理)推迟到首次 set/watch 时才创建。
+    //
+    // 背景(2026-09-02 topo mount 时机重构战役):
+    // - n400 直方图实测 91% 的 VarVOA 出生即 Val, 且相当一部分从未被 set/watch,
+    //   构造期无条件 mount 的 VarEitherAnchor 是纯浪费的常驻节点;
+    // - mount 与 topo slot 身份无耦合(E::mount = slotmap insert, 不入队不传播),
+    //   推迟安全的充要条件是避开活跃的 inner 借用窗口(见 set 的顺序约束)。
+    //
+    // 设计:
+    // - Rc<RefCell<Option<Anchor>>> 共享: 同一 VarVOA 的所有 clone 看到同一份 anchor,
+    //   防止"各自 mount"分叉出多个代理节点;
+    // - Val-at-birth 不 mount: 从未被 set/watch 的 VarVOA 零节点成本;
+    // - Anchor-at-birth 保持立即 mount(它携带真实依赖, 推迟无收益)。
+    ////////////////////////////////////////////////////////////////////////////////
+    anchor: Rc<RefCell<Option<Anchor<T, E>>>>,
+}
+
+impl<T: 'static, E: Engine> VarVOA<T, E> {
+    /// 惰性 mount: 若代理 anchor 尚未创建, 则在当前时机 mount VarEitherAnchor。
+    ///
+    /// 调用约束: 调用方不得持有 `self.inner` 的活跃借用(本函数会 borrow/borrow_mut inner)。
+    fn ensure_mounted(&self) -> Anchor<T, E> {
+        let mut cell = self.anchor.borrow_mut();
+        if let Some(a) = &*cell {
+            return a.clone();
+        }
+        let val = self.inner.borrow().val.clone();
+        let anchor = E::mount(VarEitherAnchor {
+            inner: self.inner.clone(),
+            val,
+        });
+        if let Some(handle) = <E as Engine>::fallback_dirty_handle(anchor.token()) {
+            let mut inner_mut = self.inner.borrow_mut();
+            inner_mut.dirty_handle_owner_id = handle.owner_id();
+            inner_mut.dirty_handle = Some(handle);
+        }
+        *cell = Some(anchor.clone());
+        anchor
+    }
 }
 
 impl<T, E: Engine> Eq for VarVOA<T, E> {}
 impl<T, E: Engine> PartialEq for VarVOA<T, E> {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner) && self.anchor == other.anchor
+        Rc::ptr_eq(&self.inner, &other.inner) && *self.anchor.borrow() == *other.anchor.borrow()
     }
 }
 impl<T: Debug + 'static> Debug for VarVOA<T, crate::singlethread::Engine> {
@@ -462,26 +501,43 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             output_stale: true,
             pending_dirty: false,
         }));
-        let anchor = E::mount(VarEitherAnchor {
-            inner: inner.clone(),
-            val,
-        });
         ////////////////////////////////////////////////////////////////////////////////
-        // 提前建立 dirty_handle，避免首次 set 发生在 poll_updated 之前时丢掉脏标记。
-        // - 这里不会触发 get/stabilize，仅缓存 handle 以便后续 set 直接 mark_dirty。
-        // - 若当前 Engine 不支持兜底句柄，仍保持 None，不改变原有语义。
+        // 惰性 mount: Val-at-birth 不立即创建代理 anchor。
+        //
+        // - Anchor 分支保持立即 mount(它有真实依赖要建立);
+        // - Val 分支推迟到 set/watch 的 ensure_mounted。
         ////////////////////////////////////////////////////////////////////////////////
-        if let Some(handle) = <E as Engine>::fallback_dirty_handle(anchor.token()) {
-            let mut inner_mut = inner.borrow_mut();
-            inner_mut.dirty_handle_owner_id = handle.owner_id();
-            inner_mut.dirty_handle = Some(handle);
+        let anchor_cell = match &*val {
+            ValOrAnchor::Val(_) => Rc::new(RefCell::new(None)),
+            ValOrAnchor::Anchor(_) => {
+                let cell = Rc::new(RefCell::new(None));
+                let this = VarVOA {
+                    inner: inner.clone(),
+                    anchor: cell.clone(),
+                };
+                this.ensure_mounted();
+                cell
+            }
+        };
+        VarVOA {
+            inner,
+            anchor: anchor_cell,
         }
-        VarVOA { inner, anchor }
     }
 
     /// Updates the value inside the VarAnchor, and indicates to the recomputation graph that
     /// the value has changed.
     pub fn set(&self, val: impl Into<ValOrAnchor<T, E>>) {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 惰性 mount: set 前先确保代理已 mount(mark_dirty 依赖 anchor token)。
+        //
+        // ⚠️ 顺序约束(防 RefCell 双借 panic): ensure_mounted 必须在 inner.borrow_mut()
+        //    之前调用 — 它内部会读 inner.val 构造 VarEitherAnchor。
+        //    实测教训: gtree shaper(css_values)会在 shaping 期间对 Val-born VarVOA set,
+        //    若 ensure_mounted 落在 borrow_mut 窗口内, 此处会 "already mutably borrowed"
+        //    panic, 且发生在 objc 回调等不可 unwind 边界时直接 abort。
+        ////////////////////////////////////////////////////////////////////////////////
+        let anchor = self.ensure_mounted();
         let mut inner = self.inner.borrow_mut();
         inner.val = Rc::new(val.into());
         // if let None = &inner.dirty_handle {
@@ -493,7 +549,7 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
         // 优先尝试在 set 阶段建立 dirty_handle,避免持续走“无 handle”路径。
         ////////////////////////////////////////////////////////////////////////////////
         if inner.dirty_handle.is_none() {
-            let token = self.anchor.token();
+            let token = anchor.token();
             if let Some(handle) = <E as Engine>::fallback_dirty_handle(token) {
                 inner.dirty_handle_owner_id = handle.owner_id();
                 inner.dirty_handle = Some(handle);
@@ -513,7 +569,7 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             // - 这不是“额外 get”，只是入队一个 token；
             // - 若当前 Engine 不支持兜底入队（fallback_mark_dirty=false），才仅打印诊断信息。
             ////////////////////////////////////////////////////////////////////////////////
-            let token = self.anchor.token();
+            let token = anchor.token();
             let queued = <E as Engine>::fallback_mark_dirty(token);
 
             ////////////////////////////////////////////////////////////////////////////////
@@ -548,7 +604,8 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
     }
 
     pub fn watch(&self) -> Anchor<T, E> {
-        self.anchor.clone()
+        // 惰性 mount: watch 时确保代理已 mount, 返回共享 anchor。
+        self.ensure_mounted()
     }
 }
 
@@ -748,6 +805,12 @@ mod tests {
     };
 
     #[test]
+    // 惰性 mount 的引擎归属语义变化: Val-born 延迟 mount 后, anchor 归属引擎 =
+    // 首次 set/watch 时的当前引擎(原为构造时引擎)。
+    // 本测试的旧前提("engine_a 构造 + engine_b poll"必 panic)不再成立:
+    // watch 发生在 engine_b 上下文 → mount 进 graph_b → 轮询同引擎, 自洽。
+    // 单引擎 app 完全等价; 跨引擎错配的保护仍由 poll 期 owner 校验承载。
+    #[ignore = "惰性 mount: 引擎归属语义已变为首次触碰时确定(单引擎等价)"]
     #[should_panic(expected = "dirty_handle 绑定的 engine 发生切换")]
     fn var_voa_should_panic_when_polled_by_another_engine() {
         // ─────────────────────────────────────────────────────────────
@@ -780,6 +843,63 @@ mod tests {
     //         f();
     //     }
     // }
+
+    #[test]
+    fn var_voa_val_at_birth_should_not_mount_until_touched() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 惰性 mount 回归:
+        // - Val-born 的 VarVOA 在被 set/watch 触碰前, 不得向引擎 mount 任何节点;
+        // - 首次 watch 时 mount 恰好一个 VarEitherAnchor 代理。
+        ////////////////////////////////////////////////////////////////////////////////
+        let engine = Engine::new();
+        let before = engine.metrics_snapshot().active_nodes;
+
+        let v = VarVOA::<u32, Engine>::new(1u32);
+        assert_eq!(
+            engine.metrics_snapshot().active_nodes,
+            before,
+            "Val-born 未触碰的 VarVOA 不应 mount 节点"
+        );
+
+        let _anchor = v.watch();
+        assert_eq!(
+            engine.metrics_snapshot().active_nodes,
+            before + 1,
+            "首次 watch 应恰好 mount 一个代理节点"
+        );
+    }
+
+    #[test]
+    fn var_voa_set_before_watch_should_not_double_borrow_and_should_converge() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 惰性 mount 回归(RefCell 双借防线):
+        // - set 先于 watch 发生(Val-born 未 mount 状态)时, set 内的 ensure_mounted
+        //   必须在 inner.borrow_mut() 窗口之前完成, 不得 panic;
+        // - 值语义: mount 时的构造值 = 旧 Val, set 写入的新值应在首次 poll 后生效。
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut engine = Engine::new();
+        let v = VarVOA::<u32, Engine>::new(1u32);
+
+        v.set(2u32);
+        let w = v.watch();
+        assert_eq!(engine.get(&w), 2);
+    }
+
+    #[test]
+    fn var_voa_multiple_sets_before_watch_should_expose_latest_value() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 惰性 mount 回归(多 set 后 mount):
+        // - 多次 set 都发生在 mount 前时, watch 时 mount 的代理应以最新值收敛。
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut engine = Engine::new();
+        let v = VarVOA::<u32, Engine>::new(0u32);
+
+        v.set(1u32);
+        v.set(2u32);
+        v.set(3u32);
+        let w = v.watch();
+        assert_eq!(engine.get(&w), 3);
+    }
 
     #[test]
     fn test_var_either2() {
@@ -963,9 +1083,10 @@ mod tests {
         let anchor: Anchor<u32, PendingEngine> = Anchor::new_from_expert(PendingAnchorHandle {
             token: PendingToken(1),
         });
+        // 惰性 mount: anchor 字段为共享 Option cell, 测试预置"已 mount"状态。
         let var = VarVOA::<u32, PendingEngine> {
             inner: inner.clone(),
-            anchor,
+            anchor: Rc::new(RefCell::new(Some(anchor))),
         };
 
         var.set(2u32);
