@@ -529,7 +529,21 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
     /// the value has changed.
     pub fn set(&self, val: impl Into<ValOrAnchor<T, E>>) {
         ////////////////////////////////////////////////////////////////////////////////
-        // 惰性 mount: set 前先确保代理已 mount(mark_dirty 依赖 anchor token)。
+        // 惰性 mount(T5): 未 mount 时 set 走纯数据面 — 不物化响应面(与 Var::set 同构)。
+        //
+        // - 无消费者(anchor 未创建 ⇔ 从未被 watch)时, mark_dirty 没有可唤醒的对象,
+        //   mount 出来的节点纯属浪费(set-only VarVOA 零节点的依据);
+        // - 值累积在 inner.val; 未来首次 watch 时 ensure_mounted 用最新值构造
+        //   VarEitherAnchor, 消费者首次 poll 即读到最新值;
+        // - 已 mount 后的 set 走下方原路径(mark_dirty 通知既有消费者)。
+        ////////////////////////////////////////////////////////////////////////////////
+        if self.anchor.borrow().is_none() {
+            let mut inner = self.inner.borrow_mut();
+            inner.val = Rc::new(val.into());
+            return;
+        }
+        ////////////////////////////////////////////////////////////////////////////////
+        // 惰性 mount(T1): set 前先确保代理已 mount(mark_dirty 依赖 anchor token)。
         //
         // ⚠️ 顺序约束(防 RefCell 双借 panic): ensure_mounted 必须在 inner.borrow_mut()
         //    之前调用 — 它内部会读 inner.val 构造 VarEitherAnchor。
@@ -843,6 +857,30 @@ mod tests {
     //         f();
     //     }
     // }
+
+    #[test]
+    fn var_voa_set_only_should_not_mount_any_node() {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 惰性 mount 回归(T5, 与 Var::set_only 同构):
+        // - set-only(从未 watch)的 VarVOA 零节点物化;
+        // - get 读累积最新值; 事后首次 watch 仍能拿到最新值。
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut engine = Engine::new();
+        let before = engine.metrics_snapshot().active_nodes;
+
+        let v = VarVOA::<u32, Engine>::new(1);
+        v.set(2);
+        v.set(3);
+        assert_eq!(
+            engine.metrics_snapshot().active_nodes,
+            before,
+            "set-only(未 watch)的 VarVOA 不应 mount 节点"
+        );
+        assert_eq!(*v.get(), 3, "get 应读到累积的最新值");
+
+        let w = v.watch();
+        assert_eq!(engine.get(&w), 3, "事后首次 watch 应读到最新值");
+    }
 
     #[test]
     fn var_voa_val_at_birth_should_not_mount_until_touched() {
