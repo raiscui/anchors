@@ -898,11 +898,7 @@ mod tests {
             "tail pop 后输出应截断到新长度"
         );
         // 计数 = 1 次 order 读取 + 0 次元素读取(剩余元素零重读)
-        assert_eq!(
-            ctx.gets.get(),
-            1,
-            "tail pop 增量路径不应重读任何剩余元素"
-        );
+        assert_eq!(ctx.gets.get(), 1, "tail pop 增量路径不应重读任何剩余元素");
         assert!(
             ctx.unrequested.contains(&DummyToken(403)),
             "被移除 key 的 anchor 必须 unrequest"

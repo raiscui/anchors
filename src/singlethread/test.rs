@@ -606,3 +606,33 @@ fn s2_either_churn_repro() {
     assert!(last_layout > 0.0, "last_layout={last_layout}");
     assert!(last_child > 0, "last_child={last_child}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R 战役(级联 Drop 递归迭代化)回归:
+// - 旧实现: 释放一条长链时, AnchorHandle::drop → free → NodeStore::remove →
+//   原地 drop anchor 对象 → 字段析构同步触发下游 handle 归零 → 递归 remove —
+//   栈深线性于链长, 8MB 主线程栈在万级链长必爆。
+// - 新实现: anchor 对象入 pending_anchor_drops 队列, 最外层 drain 循环逐个
+//   析构 — 栈深 O(1)。本测试在**主测试线程**(默认 2MB 栈)上构造 5 万层链,
+//   旧实现必爆栈, 新实现必须正常完成。
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn deep_anchor_chain_drop_should_not_recurse_overflow() {
+    const CHAIN_LEN: usize = 50_000;
+
+    // 先初始化引擎(DEFAULT_MOUNTER 由 Engine::new() 设置)。
+    let mut engine = Engine::new();
+
+    // 构造 CHAIN_LEN 层链: 每层 map 在上一层输出上 +1。
+    let root: Anchor<u64> = Var::new(1u64).watch();
+    let mut cur = root;
+    for _ in 0..CHAIN_LEN {
+        cur = cur.map(|v: &u64| v.wrapping_add(1));
+    }
+    // 消费一次, 确保链已实例化且值正确。
+    let value = engine.get(&cur);
+    assert_eq!(value, CHAIN_LEN as u64 + 1, "链末端值 = 初值1 + 每层+1");
+    // drop 整条链: 释放 cur 后, 上游全部 handle 归零。
+    // 旧实现在此处(或 drop 完成的级联中)栈溢出; 新实现必须正常返回。
+    drop(cur);
+}

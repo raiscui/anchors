@@ -614,8 +614,10 @@ mod node_store {
             ////////////////////////////////////////////////////////////////////////////////
             let old_anchor = unsafe { (&mut *guard.anchor.get()).take() };
             if let Some(old_anchor) = old_anchor {
-                // 先析构，再回收 raw block（pool），减少 alloc/free 常数开销。
-                graph.drop_and_recycle_anchor_ptr(old_anchor);
+                // R 战役(级联 Drop 迭代化): 不再原地 drop(其字段析构会同步递归
+                // 下游 free/remove, 栈深线性于事件树链深) — 入队交由最外层
+                // drain 循环逐个析构, 见 pending_anchor_drops 字段注释。
+                graph.enqueue_anchor_drop(old_anchor);
             } else {
                 return true;
             }
@@ -719,6 +721,22 @@ pub struct Graph2 {
     anchor_pool: AnchorMemPool,
     active_nodes: Cell<usize>,
     pending_free: RefCell<Vec<NodePtr>>,
+    ////////////////////////////////////////////////////////////////////////////////
+    // 待析构 anchor 队列(2026-09-03 R 战役: 级联 Drop 递归迭代化):
+    // - 旧实现: remove 时原地 drop_in_place(anchor 对象), 其内部字段(下游
+    //   Anchor 句柄)析构会同步触发"下游 handle_count 归零 → free → remove →
+    //   再原地 drop"的**级联递归**, 栈深线性于事件匹配树链深 — 8MB 主线程栈
+    //   在 for_each_state n300+ 负载的 ~262 项处爆栈(crash report 511 帧)。
+    // - 新实现: remove 只做浅图操作(解绑边/出队/置 None/进 free list)后把
+    //   anchor 对象入队; drop_in_place 延迟到最外层 drain 循环里逐个执行,
+    //   下游的 remove 同样浅返回入队 — 递归深度降为 O(1)。
+    // - 语义不变: 图摘除(all 图状态)仍在 remove 同步完成, 被推迟的只有
+    //   "anchor 对象析构 + 内存块还给 pool"这两步纯本地操作。
+    ////////////////////////////////////////////////////////////////////////////////
+    pending_anchor_drops: RefCell<Vec<NonNull<dyn GenericAnchor>>>,
+    /// drain 重入闸: drop_in_place 引发的下游 remove 会再次 enqueue 并尝试
+    /// drain, 重入者直接返回, 由最外层 while 消费到底。
+    drop_drain_active: Cell<bool>,
     ////////////////////////////////////////////////////////////////////////////////
     // Epoch（读窗口）：
     // - epoch_depth > 0：禁止 token 物理回收/复用（nodes.remove -> free list）。
@@ -1924,6 +1942,8 @@ impl Graph2 {
             token_counter: Cell::new(0),
             active_nodes: Cell::new(0),
             pending_free: RefCell::new(vec![]),
+            pending_anchor_drops: RefCell::new(vec![]),
+            drop_drain_active: Cell::new(false),
             epoch_depth: Cell::new(0),
             retired_free: RefCell::new(vec![]),
             epoch_flushes: Cell::new(0),
@@ -1972,6 +1992,45 @@ impl Graph2 {
     }
 
     #[inline]
+    ////////////////////////////////////////////////////////////////////////////////
+    // R 战役(级联 Drop 递归迭代化)的入口与消费循环:
+    // - enqueue_anchor_drop: remove 摘除图状态后的 anchor 对象统一入口;
+    // - drain_pending_anchor_drops: 只允许最外层执行; drop_in_place 引发的
+    //   下游 remove 会再次 enqueue, 重入者被闸门拦截直接返回 — 队列由最外层
+    //   while 消费到底, 递归深度从 O(事件树链深) 降为 O(1)。
+    // - panic 安全: 闸门用 guard 复位, 析构链路 panic 后不会卡死后续回收。
+    ////////////////////////////////////////////////////////////////////////////////
+    fn enqueue_anchor_drop(&self, anchor: NonNull<dyn GenericAnchor>) {
+        self.pending_anchor_drops.borrow_mut().push(anchor);
+        self.drain_pending_anchor_drops();
+    }
+
+    fn drain_pending_anchor_drops(&self) {
+        if self.drop_drain_active.get() {
+            // 重入: 本次 drop_in_place 的下游 remove 已把新对象入队,
+            // 外层 while 会继续消费, 这里直接返回即可。
+            return;
+        }
+        self.drop_drain_active.set(true);
+        struct DrainGuard<'a>(&'a Cell<bool>);
+        impl Drop for DrainGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _guard = DrainGuard(&self.drop_drain_active);
+        loop {
+            // NOTE: 必须用 let-else 让 RefMut 临时在取值后立刻释放 —
+            // 若写成 `while let Some(..) = borrow_mut().pop()`, RefMut 会存活
+            // 到整个循环体结束, 循环体内 drop 引发的重入 enqueue 将撞上
+            // "RefCell already borrowed"。
+            let Some(anchor) = self.pending_anchor_drops.borrow_mut().pop() else {
+                break;
+            };
+            self.drop_and_recycle_anchor_ptr(anchor);
+        }
+    }
+
     fn drop_and_recycle_anchor_ptr(&self, anchor: NonNull<dyn GenericAnchor>) {
         unsafe {
             // dyn trait object：size/align 由 vtable 元数据决定。
