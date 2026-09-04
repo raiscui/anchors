@@ -32,6 +32,14 @@ struct VarEAShared<T, E: Engine> {
     // 延迟补偿：记录“set 发生但未能入队 dirty”的情况
     ////////////////////////////////////////////////////////////////////////////////
     pending_dirty: bool,
+    ////////////////////////////////////////////////////////////////////////////////
+    // 消费侧惰性 watch(V 战役 2026-09-03):
+    // - watch_lazy() 的快照 proxy(独立 VarVOA)注册在此;
+    // - 源处于 Val 且从未 set 时, proxy 只持初始值快照、对源零依赖边;
+    // - 源首次 set(T5 分支)时逐个升级: proxy.set(Anchor(真 watch)),
+    //   走 VarEitherAnchor 既有换源路径 — "set 事实发生即升级, 响应事实非预测"。
+    ////////////////////////////////////////////////////////////////////////////////
+    pending_lazy: Vec<VarVOA<T, E>>,
 }
 
 impl<T: Debug, E: Engine> Debug for VarEAShared<T, E>
@@ -91,6 +99,22 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             inner_mut.dirty_handle = Some(handle);
         }
         *cell = Some(anchor.clone());
+        ////////////////////////////////////////////////////////////////////////////////
+        // V 战役(消费侧惰性 watch)兜底升级:
+        // - watch_lazy 的快照 proxy 可能通过"源被直接 watch"路径走到这里
+        //   (而非 set 钩子) — 此时源已 mount, 立即升级所有 pending proxy,
+        //   否则 proxy 的消费者会永远停在初始快照值上(语义漏洞);
+        // - 升级走 proxy.set(Anchor) 的 VarEitherAnchor 换源路径;
+        // - 借用安全: cell(anchor 字段)借用与 inner 借用是两个不同的
+        //   RefCell, 升级仅触碰 proxy 自身的 inner, 与源 inner 无冲突。
+        ////////////////////////////////////////////////////////////////////////////////
+        let pending = {
+            let mut inner_mut = self.inner.borrow_mut();
+            std::mem::take(&mut inner_mut.pending_lazy)
+        };
+        for proxy in pending {
+            proxy.set(ValOrAnchor::Anchor(anchor.clone()));
+        }
         anchor
     }
 }
@@ -500,6 +524,7 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
             val: val.clone(),
             output_stale: true,
             pending_dirty: false,
+            pending_lazy: Vec::new(),
         }));
         ////////////////////////////////////////////////////////////////////////////////
         // 惰性 mount: Val-at-birth 不立即创建代理 anchor。
@@ -538,8 +563,51 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
         // - 已 mount 后的 set 走下方原路径(mark_dirty 通知既有消费者)。
         ////////////////////////////////////////////////////////////////////////////////
         if self.anchor.borrow().is_none() {
+            ////////////////////////////////////////////////////////////////////////////////
+            // V 战役(消费侧惰性 watch): 未 mount 分支须先检查 pending_lazy —
+            // 存在懒 watch 的快照 proxy 时, 源首次 set 意味着"静态→动态"的事实发生,
+            // 必须升级所有 proxy(proxy.set(Anchor(真 watch)))并正常进入传播。
+            // 时序纪律(T1 血案): ensure_mounted 内部会 borrow inner — 严禁在
+            // inner.borrow_mut() 的存活窗口内调用; 下方实现先短借用更新 val 并
+            // 取走 pending 列表, 释放借用后再 ensure_mounted + 升级 + mark_dirty。
+            ////////////////////////////////////////////////////////////////////////////////
+            let new_val: Rc<ValOrAnchor<T, E>> = Rc::new(val.into());
+            let lazy_watchers = {
+                let mut inner = self.inner.borrow_mut();
+                inner.val = new_val.clone();
+                std::mem::take(&mut inner.pending_lazy)
+            };
+            if lazy_watchers.is_empty() {
+                // 无懒消费者: 保持 T5 纯数据面写入(零节点)。
+                return;
+            }
+            // 有懒消费者: 升级为完整动态形态(ensure_mounted 在借用窗口外)。
+            let anchor = self.ensure_mounted();
+            for proxy in lazy_watchers {
+                proxy.set(ValOrAnchor::Anchor(anchor.clone()));
+            }
+            // 源自身进入传播(除 proxy 升级外, 直接消费者也要收到本次 set)。
             let mut inner = self.inner.borrow_mut();
-            inner.val = Rc::new(val.into());
+            inner.val = new_val;
+            if inner.dirty_handle.is_none() {
+                let token = anchor.token();
+                if let Some(handle) = <E as Engine>::fallback_dirty_handle(token) {
+                    inner.dirty_handle_owner_id = handle.owner_id();
+                    inner.dirty_handle = Some(handle);
+                }
+            }
+            if let Some(waker) = &inner.dirty_handle {
+                waker.mark_dirty();
+                inner.pending_dirty = false;
+            } else {
+                let token = anchor.token();
+                let queued = <E as Engine>::fallback_mark_dirty(token);
+                if queued {
+                    inner.pending_dirty = false;
+                } else {
+                    inner.pending_dirty = true;
+                }
+            }
             return;
         }
         ////////////////////////////////////////////////////////////////////////////////
@@ -620,6 +688,50 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
     pub fn watch(&self) -> Anchor<T, E> {
         // 惰性 mount: watch 时确保代理已 mount, 返回共享 anchor。
         self.ensure_mounted()
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // 消费侧惰性 watch(V 战役 2026-09-03):
+    //
+    // - 源处于 Val 且从未 set/watch(anchor 未 mount)→ 不建立对源的依赖边:
+    //   返回一个快照 proxy(独立 VarVOA, 初始值 = 源当前值), 并把 proxy 注册进
+    //   源的 pending_lazy; 源首次 set 时(T5 分支钩子)proxy 自动升级为真 watch。
+    // - 源已 mount(已被 set/watch 过)→ 与 watch() 完全一致(动态语义已成立)。
+    //
+    // 设计意图: 让"静态字面量 × 管线样板"的乘积在源未动时零依赖边 —
+    // push 建链成本的大头之一; 升级由 set 事实驱动(响应事实, 非运行期行为预测),
+    // 不属于被否定的自动静态化。
+    //
+    // 注意: proxy 是独立 VarVOA(非源的 clone), 消费者 watch 的是 proxy —
+    // 升级时 proxy.set(Anchor) 走 VarEitherAnchor 既有换源路径, 消费者无感。
+    ////////////////////////////////////////////////////////////////////////////////
+    pub fn watch_lazy(&self) -> Anchor<T, E> {
+        if self.anchor.borrow().is_some() {
+            // 已动态(被 set/watch 过): 快照无意义, 走现状。
+            return self.ensure_mounted();
+        }
+        // 源仍是纯 Val: 建快照 proxy 并注册升级。
+        // snapshot 直接复用源的 Rc<ValOrAnchor>(clone Rc, 无需 T: Clone)。
+        // 防御性检查: 源若已是 Anchor 形态(理论不可能 — anchor 未 mount 时
+        // val 恒为 Val), 走现状兜底。
+        let snapshot = self.inner.borrow().val.clone();
+        if matches!(&*snapshot, ValOrAnchor::Anchor(_)) {
+            return self.ensure_mounted();
+        }
+        let proxy = VarVOA {
+            inner: Rc::new(RefCell::new(VarEAShared {
+                dirty_handle: None,
+                dirty_handle_owner_id: None,
+                val: snapshot,
+                output_stale: true,
+                pending_dirty: false,
+                pending_lazy: Vec::new(),
+            })),
+            anchor: Rc::new(RefCell::new(None)),
+        };
+        self.inner.borrow_mut().pending_lazy.push(proxy.clone());
+        // proxy 自身是 Var(Val), watch 它 = ensure_mounted(VarEitherAnchor)。
+        proxy.watch()
     }
 }
 
@@ -1117,6 +1229,7 @@ mod tests {
             val: Rc::new(ValOrAnchor::Val(1u32)),
             output_stale: false,
             pending_dirty: false,
+            pending_lazy: Vec::new(),
         }));
         let anchor: Anchor<u32, PendingEngine> = Anchor::new_from_expert(PendingAnchorHandle {
             token: PendingToken(1),
@@ -1255,6 +1368,7 @@ mod tests {
             val: Rc::new(ValOrAnchor::Anchor(bad_anchor)),
             output_stale: true,
             pending_dirty: false,
+            pending_lazy: Vec::new(),
         }));
 
         let mut inner = super::VarEitherAnchor::<u32, DummyEngine> {
@@ -1383,6 +1497,7 @@ mod tests {
             val: bad_rc.clone(),
             output_stale: false,
             pending_dirty: false,
+            pending_lazy: Vec::new(),
         }));
 
         let mut inner = super::VarEitherAnchor::<u32, DummyEngine> {

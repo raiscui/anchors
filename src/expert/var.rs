@@ -30,6 +30,12 @@ struct VarShared<T, E: Engine> {
     // 延迟补偿：记录“set 发生但未能入队 dirty”的情况
     ////////////////////////////////////////////////////////////////////////////////
     pending_dirty: bool,
+    ////////////////////////////////////////////////////////////////////////////////
+    // 消费侧惰性 watch(V 战役 2026-09-03): watch_lazy 的快照 proxy(VarVOA,
+    // 带 ValOrAnchor 换源机制)注册在此; 源首次 set(T5 分支)或 ensure_mounted
+    // 时升级: proxy.set(Anchor(源真 watch)) — VarEitherAnchor 换源, 消费者无感。
+    ////////////////////////////////////////////////////////////////////////////////
+    pending_lazy: Vec<super::var_val_or_anchor::VarVOA<T, E>>,
 }
 
 // impl<T, E: Engine> Drop for VarShared<T, E> {
@@ -94,8 +100,22 @@ impl<T: 'static, E: Engine> Var<T, E> {
             inner_mut.dirty_handle = Some(handle);
         }
         *cell = Some(anchor.clone());
+        // V 战役兜底: watch_lazy 的 pending proxy 在源 mount 时升级 —
+        // 否则 proxy 消费者永远停在初始快照值(语义漏洞)。
+        // 升级入口 = 直接替换 proxy 的代理 anchor(VarAnchor 内部 val 共享
+        // 源 inner, 消费者自然读到新值)。
+        let pending = {
+            let mut inner_mut = self.inner.borrow_mut();
+            std::mem::take(&mut inner_mut.pending_lazy)
+        };
+        for proxy in pending {
+            proxy.set(crate::expert::var_val_or_anchor::ValOrAnchor::Anchor(
+                anchor.clone(),
+            ));
+        }
         anchor
     }
+
 }
 
 // impl<T, E: Engine> Drop for Var<T, E> {
@@ -189,6 +209,7 @@ impl<T: 'static, E: Engine> Var<T, E> {
             val: val.clone(),
             value_changed: true,
             pending_dirty: false,
+            pending_lazy: Vec::new(),
         }));
         ////////////////////////////////////////////////////////////////////////////////
         // 惰性 mount(T3): 构造期不 mount 代理节点 — Var 是纯值容器, 没有任何依赖
@@ -230,8 +251,36 @@ impl<T: 'static, E: Engine> Var<T, E> {
         // - 已 mount 后的 set 走下方原路径(mark_dirty 通知既有消费者)。
         ////////////////////////////////////////////////////////////////////////////////
         if self.anchor.borrow().is_none() {
+            // V 战役: pending_lazy 非空(有懒消费者)时, 首次 set = "静态→动态"
+            // 事实发生 — 升级所有 proxy 并正常进入传播(时序纪律: ensure_mounted
+            // 在 inner 借用窗口外)。
+            let lazy_watchers = {
+                let mut inner = self.inner.borrow_mut();
+                inner.val = Rc::new(val);
+                std::mem::take(&mut inner.pending_lazy)
+            };
+            if lazy_watchers.is_empty() {
+                return;
+            }
+            let anchor = self.ensure_mounted();
+            for proxy in lazy_watchers {
+                proxy.set(crate::expert::var_val_or_anchor::ValOrAnchor::Anchor(
+                    anchor.clone(),
+                ));
+            }
             let mut inner = self.inner.borrow_mut();
-            inner.val = Rc::new(val);
+            if let Some(waker) = &inner.dirty_handle {
+                waker.mark_dirty();
+                inner.pending_dirty = false;
+            } else {
+                let token = anchor.token();
+                let queued = <E as Engine>::fallback_mark_dirty(token);
+                if queued {
+                    inner.pending_dirty = false;
+                } else {
+                    inner.pending_dirty = true;
+                }
+            }
             return;
         }
         ////////////////////////////////////////////////////////////////////////////////
@@ -583,5 +632,34 @@ mod tests {
         let x = engine.get(&x);
         println!("{}", x);
         println!("{}", engine.get(&aw3));
+    }
+}
+
+// V 战役: watch_lazy 需要快照值克隆(T: Clone)— 独立 impl 块避免污染 Var 主 bound。
+impl<T: Clone + 'static, E: Engine> Var<T, E> {
+    ////////////////////////////////////////////////////////////////////////////////
+    // V 战役(消费侧惰性 watch):
+    // - 源处于 Val 且从未 set(anchor 未 mount)→ 不建对源的依赖边:
+    //   返回快照 proxy(VarVOA, 初始值 = 源当前值), 注册进源 pending_lazy;
+    //   源首次 set(T5 分支)或源被 mount 时(ensure_mounted 兜底)自动升级 —
+    //   升级走 VarEitherAnchor 换源, 消费者手里的 handle 不变、输出更新。
+    // - 源已 mount → 与 watch() 一致。
+    // - 响应 set 事实, 非运行期行为预测 — 不属于自动静态化陷阱。
+    ////////////////////////////////////////////////////////////////////////////////
+    pub fn watch_lazy(&self) -> Anchor<T, E> {
+        if self.anchor.borrow().is_some() {
+            return self.ensure_mounted();
+        }
+        let snapshot = self.inner.borrow().val.clone();
+        // 快照 proxy 用 VarVOA(携带 ValOrAnchor 换源机制); T: Clone 由
+        // VarShared.val 的 Rc<T> 解引用拷贝 — 此处需要 T: Clone(快照语义)。
+        let proxy = super::var_val_or_anchor::VarVOA::new(
+            crate::expert::var_val_or_anchor::ValOrAnchor::Val((*snapshot).clone()),
+        );
+        self.inner
+            .borrow_mut()
+            .pending_lazy
+            .push(proxy.clone());
+        proxy.watch()
     }
 }
