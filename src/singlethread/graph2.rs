@@ -1825,9 +1825,15 @@ impl Graph2 {
             );
             let freed = unsafe { self.nodes.remove(ptr) };
             if !freed {
-                if !still_pending.iter().any(|p| *p == ptr) {
-                    still_pending.push(ptr);
-                }
+                // 入队处 enqueue_free_retry 已保证 pending_free 无重复, drain 出的序列天然唯一,
+                // 这里直接回填; debug_assert 锁死不变量, 防止未来新增未去重入队点后
+                // 重复失败项在队列里无限繁殖。
+                debug_assert!(
+                    !still_pending.contains(&ptr),
+                    "pending_free 回填出现重复 ptr: {:?}",
+                    ptr
+                );
+                still_pending.push(ptr);
             }
         }
         *pending = still_pending;
