@@ -459,8 +459,8 @@ impl Engine {
             retries = retries.saturating_add(1);
             if retries > 3 {
                 panic!(
-                    "slotmap: anchor locked or pending after stabilize {:?}",
-                    node.debug_info.get()
+                    "slotmap: anchor locked or pending after stabilize {}",
+                    node.debug_info_text()
                 );
             }
         }
@@ -806,7 +806,7 @@ impl Engine {
                     }
                     spin_last.push_back((
                         node.key().raw_token(),
-                        node.debug_info.get()._to_string(),
+                        node.debug_info_text(),
                     ));
 
                     if spin_limit > 0 && spin_counter > spin_limit {
@@ -977,7 +977,7 @@ impl Engine {
                     if debug_requeue_enabled() {
                         println!(
                             "REQUEUE check node={:?} pending_recalc={}",
-                            node.debug_info.get()._to_string(),
+                            node.debug_info_text(),
                             node.pending_recalc.get()
                         );
                     }
@@ -986,7 +986,7 @@ impl Engine {
                         if debug_requeue_enabled() {
                             println!(
                                 "REQUEUE pending node={:?} state_before={:?}",
-                                node.debug_info.get()._to_string(),
+                                node.debug_info_text(),
                                 graph2::recalc_state(node),
                             );
                         }
@@ -1008,11 +1008,7 @@ impl Engine {
             if lock_strict_enabled() {
                 let trace = lock_trace_peek(node.key().raw_token());
                 // 冷路径：把 panic/backtrace 的大块逻辑挪到 out-of-line 函数，减少热路径 i-cache 压力。
-                panic_anchor_locked_strict(
-                    node.key().raw_token(),
-                    node.debug_info.get()._to_string(),
-                    trace,
-                );
+                panic_anchor_locked_strict(node.key().raw_token(), node.debug_info_text(), trace);
             }
             let retry = node.recalc_retry.get().saturating_add(1);
             node.recalc_retry.set(retry);
@@ -1021,7 +1017,7 @@ impl Engine {
                 tracing::warn!(
                     target: "anchors",
                     "检测到遗留 Anchor 锁，强制解锁后重算: {:?}, retry={}",
-                    node.debug_info.get()._to_string(),
+                    node.debug_info_text(),
                     retry
                 );
             }
@@ -1031,7 +1027,7 @@ impl Engine {
 
         // 可选调试：设置 `ANCHORS_RECALC_TRACE=1` 可打印正在重算的节点信息，便于跟踪依赖链。
         if recalc_trace_enabled() {
-            println!("RECALC {:?}", node.debug_info.get()._to_string());
+            println!("RECALC {:?}", node.debug_info_text());
         }
 
         let trace_key = if lock_trace_enabled() {
@@ -1040,7 +1036,7 @@ impl Engine {
             None
         };
         if let Some(key) = trace_key {
-            lock_trace_store(key, node.debug_info.get()._to_string());
+            lock_trace_store(key, node.debug_info_text());
         }
 
         let _lock_guard = AnchorLockGuard {
@@ -1060,7 +1056,7 @@ impl Engine {
                     node.handle_count() == 0,
                     "recalculate: anchor=None 但 handle_count>0，疑似非法释放路径，token={:?} debug={}",
                     node.key().raw_token(),
-                    node.debug_info.get()._to_string()
+                    node.debug_info_text()
                 );
             }
             return true;
@@ -1072,9 +1068,11 @@ impl Engine {
         let anchor_ref: &mut dyn GenericAnchor = unsafe { anchor_ptr.as_mut() };
         {
             // 把之前因借用冲突积累的 dirty 消息在这里一次性补偿。
-            let mut pending = node.pending_dirty.borrow_mut();
-            for child in pending.drain(..) {
-                anchor_ref.dirty(&child);
+            // 刀B: 惰性 Box — None (绝大多数节点) 时零开销跳过。
+            if let Some(pending) = node.pending_dirty.borrow_mut().as_deref_mut() {
+                for child in pending.drain(..) {
+                    anchor_ref.dirty(&child);
+                }
             }
         }
 
@@ -1086,7 +1084,7 @@ impl Engine {
             if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PENDING") {
                 println!(
                     "PENDING node={:?} pending_on_anchor_get={}",
-                    node.debug_info.get()._to_string(),
+                    node.debug_info_text(),
                     pending_on_anchor_get
                 );
             }
@@ -1110,7 +1108,7 @@ impl Engine {
             let raw_token = node.key().raw_token();
             let count = self.bump_unexpected_pending_count(raw_token);
             if Self::should_log_unexpected_pending(count) {
-                let debug = node.debug_info.get()._to_string();
+                let debug = node.debug_info_text();
                 eprintln!(
                     "[anchors][unexpected_pending] node={debug} token={raw_token} seen={count} poll={poll_debug:?}"
                 );
@@ -1129,7 +1127,7 @@ impl Engine {
 
             panic!(
                 "poll_updated 返回 Pending，但未 request 任何未就绪子 Anchor，且节点无历史输出无法降级；node={} token={raw_token}",
-                node.debug_info.get()._to_string(),
+                node.debug_info_text(),
             );
         };
         match poll_result {
@@ -1146,7 +1144,7 @@ impl Engine {
                 debug_assert!(
                     invalid_token_requested || !cfg!(debug_assertions),
                     "poll_updated 返回 PendingInvalidToken，但 ecx.invalid_token_requested=false，node={}",
-                    node.debug_info.get()._to_string()
+                    node.debug_info_text()
                 );
                 if node.last_ready.get().is_some() {
                     node.last_ready.set(Some(self.generation));
@@ -1154,7 +1152,7 @@ impl Engine {
                 }
                 panic!(
                     "slotmap: 检测到失效 token request，且节点尚无历史输出无法降级；请开启 ANCHORS_INVALID_TOKEN_BACKTRACE=1 定位根因，node={}",
-                    node.debug_info.get()._to_string()
+                    node.debug_info_text()
                 );
             }
             Poll::Pending => handle_waiting(Poll::Pending),
@@ -1163,7 +1161,7 @@ impl Engine {
                     let parents = node.clean_parents();
                     println!(
                         "UPDATED {:?} parents={}",
-                        node.debug_info.get()._to_string(),
+                        node.debug_info_text(),
                         parents.len()
                     );
                 }
@@ -1178,7 +1176,7 @@ impl Engine {
                     let parents = node.clean_parents();
                     println!(
                         "UPDATED {:?} parents={}",
-                        node.debug_info.get()._to_string(),
+                        node.debug_info_text(),
                         parents.len()
                     );
                 }
@@ -1270,7 +1268,7 @@ impl Engine {
             while let Some(tok) = queue.pop_front() {
                 if let Some(node) = graph.get(tok) {
                     // 生成节点标签：优先使用 debug 位置信息
-                    let dbg = node.debug_info.get();
+                    let dbg = node.debug_info_of();
                     let mut label = match dbg.location {
                         Some((name, loc)) => {
                             // 例如："file.rs:123:45\nname"
@@ -1373,7 +1371,7 @@ impl Engine {
         self.graph.with(|graph| {
             while let Some(tok) = queue.pop_front() {
                 if let Some(node) = graph.get(tok) {
-                    let dbg = node.debug_info.get();
+                    let dbg = node.debug_info_of();
                     let default_label = match dbg.location {
                         Some((name, loc)) => format!("{}\n{}", loc, name),
                         None => dbg._to_string(),
@@ -1685,13 +1683,13 @@ pub fn waiting_stats_snapshot() -> WaitingStatsSnapshot {
 
 fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) {
     #[cfg(debug_assertions)]
-    trace!("mark_dirty {:?} ", node.debug_info.get(),);
+    trace!("mark_dirty {} ", node.debug_info_text());
     if skip_self {
         if debug_mark_enabled() {
             let parents_len = node.parents_len();
             println!(
                 "mark_dirty skip_self node={:?} parents={}",
-                node.debug_info.get()._to_string(),
+                node.debug_info_text(),
                 parents_len
             );
         }
@@ -1704,16 +1702,16 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
                 if debug_dirty_flow_enabled() {
                     println!(
                         "DIRTY flow skip queue (parent locked) child={:?} parent={:?}",
-                        node.debug_info.get()._to_string(),
-                        parent.debug_info.get()._to_string()
+                        node.debug_info_text(),
+                        parent.debug_info_text()
                     );
                 }
                 if lock_trace_enabled() {
                     tracing::warn!(
                         target: "anchors",
                         "skip queue_recalc: parent locked; child={:?} parent={:?}",
-                        node.debug_info.get()._to_string(),
-                        parent.debug_info.get()._to_string()
+                        node.debug_info_text(),
+                        parent.debug_info_text()
                     );
                 }
                 // 直接补偿入队一次：如果当下锁未释放，队列弹出时会跳过，等解锁后可正常重算。
@@ -1738,18 +1736,17 @@ fn mark_dirty<'a>(graph: Graph2Guard<'a>, node: NodeGuard<'a>, skip_self: bool) 
 
 fn push_pending_dirty(parent: NodeGuard<'_>, child: NodeKey) {
     let mut pending = parent.pending_dirty.borrow_mut();
+    // 刀B: 首次 deferred dirty 才分配 Box (低频补偿路径)
+    let pending = pending.get_or_insert_with(|| Box::default());
     if !pending.contains(&child) {
         pending.push(child);
         if debug_dirty_flow_enabled() {
             println!(
                 "PENDING_DIRTY child={:?} ({}) -> parent={:?} ({})",
                 child.raw_token(),
-                unsafe { child.ptr.lookup_unchecked() }
-                    .debug_info
-                    .get()
-                    ._to_string(),
+                unsafe { child.ptr.lookup_unchecked() }.debug_info_text(),
                 parent.key().raw_token(),
-                parent.debug_info.get()._to_string()
+                parent.debug_info_text()
             );
         }
     }
@@ -1807,7 +1804,7 @@ fn mark_dirty0<'a>(graph: Graph2Guard<'a>, next: NodeGuard<'a>) {
         if debug_mark_enabled() {
             println!(
                 "mark_dirty0 unnecessary node={:?} parents={}",
-                next.debug_info.get()._to_string(),
+                next.debug_info_text(),
                 next.parents_len()
             );
         }
@@ -1938,12 +1935,12 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                     let slot_token = slot_debug.slot_token.get();
                     let slot_anchor_none = unsafe { (&*slot_debug.anchor.get()).is_none() };
                     let slot_anchor_locked = slot_debug.anchor_locked.get();
-                    let slot_dbg_info = slot_debug.debug_info.get()._to_string();
+                    let slot_dbg_info = slot_debug.debug_info_text();
 
                     eprintln!(
                         "[anchors][invalid_token][request] parent_token={} parent={} child_token={} output_type={} necessary={} caller={}:{}:{} audit_next_token={} audit_last_deleted={:?} seen={} slot_token={} slot_anchor_none={} slot_anchor_locked={} slot_debug={}",
                         self.node.key().raw_token(),
-                        self.node.debug_info.get()._to_string(),
+                        self.node.debug_info_text(),
                         raw_token,
                         output_type,
                         necessary,
@@ -1966,7 +1963,7 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                     tracing::warn!(
                         target: "anchors",
                         op = "request",
-                        parent = %self.node.debug_info.get()._to_string(),
+                        parent = %self.node.debug_info_text(),
                         parent_token = self.node.key().raw_token(),
                         child_token = raw_token,
                         output_type,
@@ -1984,7 +1981,7 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                     tracing::warn!(
                         target: "anchors",
                         op = "request",
-                        parent = %self.node.debug_info.get()._to_string(),
+                        parent = %self.node.debug_info_text(),
                         parent_token = self.node.key().raw_token(),
                         child_token = raw_token,
                         output_type,
@@ -2022,7 +2019,7 @@ impl<'eng, 'gg> UpdateContext for EngineContextMut<'eng, 'gg> {
                 tracing::warn!(
                     target: "anchors",
                     op = "unrequest",
-                    parent = %self.node.debug_info.get()._to_string(),
+                    parent = %self.node.debug_info_text(),
                     parent_token = self.node.key().raw_token(),
                     child_token = raw_token,
                     output_type,
@@ -2066,9 +2063,9 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             println!(
                 "REQUEST parent_token={} parent={:?} child_token={} child={:?} ready={:?}",
                 self.node.key().raw_token(),
-                self.node.debug_info.get()._to_string(),
+                self.node.debug_info_text(),
                 child.key().raw_token(),
-                child.debug_info.get()._to_string(),
+                child.debug_info_text(),
                 graph2::recalc_state(child),
             );
         }
@@ -2083,9 +2080,9 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
                 println!(
                     "REQUEST pending parent_token={} parent={:?} child_token={} child={:?} state={:?}",
                     self.node.key().raw_token(),
-                    self.node.debug_info.get()._to_string(),
+                    self.node.debug_info_text(),
                     child.key().raw_token(),
-                    child.debug_info.get()._to_string(),
+                    child.debug_info_text(),
                     graph2::recalc_state(child),
                 );
             }

@@ -321,9 +321,9 @@ impl<E: Engine, T: 'static> AnchorInner<E> for VarAnchor<T, E> {
 
         error!(
             target:"anchors",
-            "dirty,  edge: {:?},edge info: {:?}  ,type: {:?}",
+            "dirty,  edge: {:?},edge info: {}  ,type: {:?}",
             edge,
-            ng.debug_info.get(),
+            ng.debug_info_text(),
             std::any::type_name::<T>(),
         );
     }

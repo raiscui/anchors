@@ -3,6 +3,7 @@ use super::{AnchorDebugInfo, Generation, GenericAnchor};
 use super::{Engine, EngineContext};
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -172,6 +173,22 @@ fn remove_trace_cfg() -> &'static TokenTraceConfig {
 fn reuse_trace_cfg() -> &'static TokenTraceConfig {
     static CFG: OnceLock<TokenTraceConfig> = OnceLock::new();
     CFG.get_or_init(|| TokenTraceConfig::from_env("ANCHORS_TRACE_REUSE"))
+}
+
+/// S2-03 刀A(debug_info 侧表化): 任一"需要 debug_info 文本"的调试通道开启时,
+/// insert 会把 AnchorDebugInfo 写入 Graph2 侧表 (slot_token → info)。
+///
+/// - remove/reuse/free trace 的 `should_log(match_substr)` 过滤依赖 debug 文本,
+///   且 reuse/free 场景 anchor 可能已被 drop 无法现算 — 这些通道开启时侧表必须有数据;
+/// - debug_queue/parent_flow 仅 debug_assertions 下可开启;
+/// - 正常运行 (无任何 env) 时侧表恒空: 零分配、零查询、零写入。
+#[inline]
+fn debug_info_sidecar_wanted() -> bool {
+    remove_trace_cfg().enabled
+        || reuse_trace_cfg().enabled
+        || free_trace_cfg().enabled
+        || debug_queue_enabled()
+        || debug_parent_flow_enabled()
 }
 
 mod node_store {
@@ -452,7 +469,7 @@ mod node_store {
                 let cfg = super::remove_trace_cfg();
                 if cfg.enabled {
                     let token = guard.slot_token.get();
-                    let debug_info = guard.debug_info.get()._to_string();
+                    let debug_info = guard.debug_info_text();
                     if cfg.should_log(token, debug_info.as_str()) {
                         ////////////////////////////////////////////////////////////////////////////////
                         // NOTE:
@@ -627,7 +644,8 @@ mod node_store {
             guard.necessary_count.set(0);
             guard.ptrs.recalc_state.set(super::RecalcState::Needed);
             guard.recalc_retry.set(0);
-            guard.pending_dirty.borrow_mut().clear();
+            // 刀B: remove 进 free list 直接丢 Box (低频补偿数据不需要跨生命周期保留)
+            *guard.pending_dirty.borrow_mut() = None;
             guard.pending_recalc.set(false);
             guard.anchor_locked.set(false);
 
@@ -768,6 +786,15 @@ pub struct Graph2 {
 
     /// pointer to head of linked list of free nodes
     free_head: Box<Cell<Option<NodePtr>>>,
+
+    /// S2-03 刀A: AnchorDebugInfo 侧表 (slot_token → info)。
+    ///
+    /// Node 上原 `debug_info: Cell<AnchorDebugInfo>` (~48B/节点) 已删 —
+    /// 活节点的日志文本改由 anchor 现算 (GenericAnchor::debug_info, 与旧字段同源等价);
+    /// 已回收节点 (reuse/free/队列残留日志) 无法现算, 仅在
+    /// `debug_info_sidecar_wanted()` 为真 (trace 排障模式) 时 insert 写入本表。
+    /// 正常运行时本表恒空 (HashMap 惰性分配), 零内存零开销。
+    debug_info_sidecar: RefCell<HashMap<u64, AnchorDebugInfo>>,
 }
 
 /// epoch 的 RAII 守卫：
@@ -809,8 +836,6 @@ pub struct Node {
     /// - 当前 epoch 的 link 视为 active，旧 epoch 自动视为 stale。
     pub parent_epoch: Cell<u64>,
 
-    pub debug_info: Cell<AnchorDebugInfo>,
-
     /// tracks the generation when this Node last polled as Updated or Unchanged
     pub(super) last_ready: Cell<Option<Generation>>,
     /// tracks the generation when this Node last polled as Updated
@@ -818,7 +843,11 @@ pub struct Node {
     /// 记录因借用冲突导致的重算重试次数，避免无限排队。
     pub recalc_retry: Cell<u8>,
     /// 累积 deferred dirty 的子节点 token，借用冲突恢复后统一处理。
-    pub pending_dirty: RefCell<Vec<NodeKey>>,
+    ///
+    /// S2-03 刀B: 惰性 Box 形态 — 该列表只在"父节点被锁定期间子节点 dirty"的
+    /// 低频补偿路径才有数据, 绝大多数节点终身为 None (16B vs 原 Vec 32B);
+    /// 首次 push 时才分配 (Option<Box<Vec>> 的 niche 使 None 零堆开销)。
+    pub pending_dirty: RefCell<Option<Box<Vec<NodeKey>>>>,
     /// 锁期间被请求重算的标记，解锁时统一补偿入队，避免抢锁重入又不丢更新。
     pub pending_recalc: Cell<bool>,
 
@@ -833,6 +862,37 @@ pub struct Node {
     pub anchor_locked: Cell<bool>,
 
     pub ptrs: NodePtrs,
+}
+
+impl Node {
+    /// S2-03 刀A: 取节点的 AnchorDebugInfo (取代已删除的 `Node.debug_info` 字段)。
+    ///
+    /// - anchor 活着 → 现算 `GenericAnchor::debug_info()`, 与旧字段值同源等价
+    ///   (旧字段本就是 insert 时由同一个方法生成后缓存的);
+    /// - anchor 已回收 → 查 Graph2 侧表 (仅 trace 排障模式有数据),
+    ///   miss 时返回占位 (location=None, type_info="<freed>")。
+    ///
+    /// 挂在 Node 上: 内层 node_store::NodeGuard 与外层 graph2::NodeGuard 都经
+    /// Deref 消费, 无需各自转发。
+    pub fn debug_info_of(&self) -> AnchorDebugInfo {
+        if let Some(anchor) = unsafe { &*self.anchor.get() } {
+            return unsafe { anchor.as_ref() }.debug_info();
+        }
+        let graph = unsafe { &*self.ptrs.graph };
+        let sidecar = graph.debug_info_sidecar.borrow();
+        match sidecar.get(&self.slot_token.get()) {
+            Some(info) => *info,
+            None => AnchorDebugInfo {
+                location: None,
+                type_info: "<freed>",
+            },
+        }
+    }
+
+    /// 日志用的文本形态 (等价于旧 `debug_info.get()._to_string()`)。
+    pub fn debug_info_text(&self) -> String {
+        self.debug_info_of().to_display()
+    }
 }
 
 impl Drop for Node {
@@ -1039,8 +1099,8 @@ impl<'a> NodeGuard<'a> {
     pub fn add_clean_parent(self, parent: NodeGuard<'a>) -> Option<Generation> {
         if debug_parent_link_enabled() {
             // 调试输出：带上节点的 debug_info，便于定位父子是谁
-            let child_dbg = self.debug_info.get()._to_string();
-            let parent_dbg = parent.debug_info.get()._to_string();
+            let child_dbg = self.debug_info_text();
+            let parent_dbg = parent.debug_info_text();
             println!(
                 "add_clean_parent child={:?} ({}) parent={:?} ({}) epoch={}",
                 self.key().raw_token(),
@@ -1251,7 +1311,7 @@ impl<'a> NodeGuard<'a> {
         if debug_parent_flow_enabled() {
             println!(
                 "CLEAN_PARENTS node={:?} count={}",
-                self.debug_info.get()._to_string(),
+                self.debug_info_text(),
                 out.len()
             );
         }
@@ -1368,7 +1428,7 @@ impl<'a> NodeGuard<'a> {
         if debug_parent_flow_enabled() {
             println!(
                 "DRAIN_CLEAN_PARENTS node={:?} drained={}",
-                self.debug_info.get()._to_string(),
+                self.debug_info_text(),
                 res.len()
             );
         }
@@ -1553,7 +1613,7 @@ impl<'gg> Graph2Guard<'gg> {
                     println!(
                         "QUEUE POP skip freed token={:?} debug={}",
                         node.key().raw_token(),
-                        node.debug_info.get()._to_string()
+                        node.debug_info_text()
                     );
                 }
                 if cfg!(debug_assertions) {
@@ -1562,7 +1622,7 @@ impl<'gg> Graph2Guard<'gg> {
                         node.handle_count() == 0,
                         "queue_pop: anchor=None 但 handle_count>0，疑似非法释放路径，token={:?} debug={}",
                         node.key().raw_token(),
-                        node.debug_info.get()._to_string()
+                        node.debug_info_text()
                     );
                 }
                 continue;
@@ -1571,7 +1631,7 @@ impl<'gg> Graph2Guard<'gg> {
                 println!(
                     "QUEUE POP token={:?} debug={}",
                     node.key().raw_token(),
-                    node.debug_info.get()._to_string()
+                    node.debug_info_text()
                 );
             }
             return Some(node);
@@ -1602,7 +1662,7 @@ impl<'gg> Graph2Guard<'gg> {
                     node.key().raw_token(),
                     node.ptrs.recalc_state.get(),
                     node.parents_len(),
-                    node.debug_info.get()._to_string(),
+                    node.debug_info_text(),
                 ));
                 if out.len() == limit {
                     break;
@@ -1626,7 +1686,7 @@ impl<'gg> Graph2Guard<'gg> {
             RecalcState::Ready,
             "park_recalc 只允许作用于刚出队的 Ready 节点, token={:?} debug={}",
             node.key().raw_token(),
-            node.debug_info.get()._to_string(),
+            node.debug_info_text(),
         );
         node.ptrs.recalc_state.set(RecalcState::Waiting);
     }
@@ -1662,7 +1722,7 @@ impl<'gg> Graph2Guard<'gg> {
                     target: "anchors",
                     "queue_recalc skip locked node token={:?} debug={}",
                     node.key().raw_token(),
-                    node.debug_info.get()._to_string()
+                    node.debug_info_text()
                 );
             }
             node.pending_recalc.set(true);
@@ -1672,7 +1732,7 @@ impl<'gg> Graph2Guard<'gg> {
             println!(
                 "queue_recalc enqueue token={:?} debug={}",
                 node.key().raw_token(),
-                node.debug_info.get()._to_string()
+                node.debug_info_text()
             );
         }
         #[cfg(debug_assertions)]
@@ -1684,7 +1744,7 @@ impl<'gg> Graph2Guard<'gg> {
                 "queue_recalc: token={:?} locked={} debug={}",
                 node.key().raw_token(),
                 node.anchor_locked.get(),
-                node.debug_info.get()._to_string()
+                node.debug_info_text()
             );
             println!(
                 "QUEUE_RECALC TRACE token={:?}\n{:?}",
@@ -1962,6 +2022,7 @@ impl Graph2 {
             recalc_tail: Cell::new(None),
             still_alive: Rc::new(Cell::new(true)),
             free_head: Box::new(Cell::new(None)),
+            debug_info_sidecar: RefCell::new(HashMap::new()),
         }
     }
 
@@ -2101,7 +2162,8 @@ impl Graph2 {
                     let cfg = reuse_trace_cfg();
                     if cfg.enabled {
                         let old_token = guard.slot_token.get();
-                        let old_debug = guard.debug_info.get()._to_string();
+                        // 刀A: 旧 anchor 已 drop, 这里从侧表取旧身份 (trace 模式外为 "<freed>")
+                        let old_debug = guard.debug_info_text();
                         if cfg.should_log(old_token, old_debug.as_str()) {
                             let new_token = self.next_slot_token();
                             let new_debug = debug_info._to_string();
@@ -2168,16 +2230,20 @@ impl Graph2 {
                 guard.ptrs.handle_count.set(1);
                 guard.ptrs.prev.set(None);
                 guard.ptrs.next.set(None);
-                guard.debug_info.set(debug_info);
                 guard.last_ready.set(None);
                 guard.last_update.set(None);
                 guard.recalc_retry.set(0);
                 {
                     const MAX_KEEP_CAPACITY: usize = 64;
                     let mut pending = guard.pending_dirty.borrow_mut();
-                    pending.clear();
-                    if pending.capacity() > MAX_KEEP_CAPACITY {
-                        *pending = Vec::new();
+                    // 刀B: 超容量丢整个 Box; 否则保留 Box 清空 Vec (复用容量)
+                    if pending
+                        .as_deref()
+                        .is_some_and(|v| v.capacity() > MAX_KEEP_CAPACITY)
+                    {
+                        *pending = None;
+                    } else if let Some(pending) = pending.as_deref_mut() {
+                        pending.clear();
                     }
                 }
                 guard.pending_recalc.set(false);
@@ -2205,11 +2271,10 @@ impl Graph2 {
                         necessary_children: RefCell::new(vec![]),
                         handle_count: Cell::new(1),
                     },
-                    debug_info: Cell::new(debug_info),
                     last_ready: Cell::new(None),
                     last_update: Cell::new(None),
                     recalc_retry: Cell::new(0),
-                    pending_dirty: RefCell::new(vec![]),
+                    pending_dirty: RefCell::new(None),
                     pending_recalc: Cell::new(false),
                     anchor: UnsafeCell::new(Some(anchor)),
                     anchor_locked: Cell::new(false),
@@ -2217,6 +2282,13 @@ impl Graph2 {
                 NodeGuard(nodes.insert(node))
             };
             let num = guard.key();
+            // 刀A: trace 排障模式下把 debug_info 写入侧表 (供 freed 节点日志回溯身份);
+            // 正常运行跳过 — 侧表恒空, 零分配。
+            if debug_info_sidecar_wanted() {
+                self.debug_info_sidecar
+                    .borrow_mut()
+                    .insert(num.raw_token(), debug_info);
+            }
             self.active_nodes
                 .set(self.active_nodes.get().saturating_add(1));
             AnchorHandle {
@@ -2253,7 +2325,7 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
             target: "anchors",
             "dequeue_calc: pending 节点在队列中缺失，直接跳过 token={:?} debug={}",
             node.key().raw_token(),
-            node.debug_info.get()._to_string()
+            node.debug_info_text()
         );
     }
     node.ptrs.recalc_state.set(RecalcState::Ready);
@@ -2332,7 +2404,7 @@ unsafe fn free(ptr: NodePtr) {
     let cfg = free_trace_cfg();
     if cfg.enabled {
         let token = guard.slot_token.get();
-        let debug_info = guard.debug_info.get()._to_string();
+        let debug_info = guard.debug_info_text();
         if cfg.should_log(token, debug_info.as_str()) {
             eprintln!("[anchors][free] token={token} debug={debug_info}");
             if cfg.backtrace {
@@ -2373,6 +2445,24 @@ pub fn recalc_state(node: NodeGuard<'_>) -> RecalcState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    /// S2-03 回归防线: Node 布局尺寸预算。
+    ///
+    /// - 实测轨迹: 基线 368B → 刀A(debug_info 侧表化) 328B → 刀B(pending_dirty
+    ///   惰性 Box) 312B;
+    /// - 已评估关闭的刀: 位域合并(Rust repr 自动打包 1B 字段, 收益 0) /
+    ///   free-recalc 链 union(历史 free_head 污染事故注释反对) /
+    ///   clean_parents+necessary_children 惰性化(热路径代价比, 归 S2-06 arena);
+    /// - 上限值 = 当前实测值, 有意扩字段时同步上调并在提交里记录理由。
+    fn node_size_within_budget() {
+        let size = std::mem::size_of::<Node>();
+        eprintln!("size_of::<Node>() = {size}");
+        assert!(
+            size <= 312,
+            "Node 尺寸超预算: {size}B (S2-03 后实测 312B, 若有意扩字段请同步上调并记录)"
+        );
+    }
 
     fn to_vec<I: IntoIterator>(iter: I) -> Vec<I::Item> {
         iter.into_iter().collect()
