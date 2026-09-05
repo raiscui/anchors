@@ -794,6 +794,11 @@ pub struct Graph2 {
     /// 已回收节点 (reuse/free/队列残留日志) 无法现算, 仅在
     /// `debug_info_sidecar_wanted()` 为真 (trace 排障模式) 时 insert 写入本表。
     /// 正常运行时本表恒空 (HashMap 惰性分配), 零内存零开销。
+    ///
+    /// 取舍声明: trace 模式下 remove/free 不清条目 — 排障会话中条目随 mount
+    /// 总数缓慢增长 (每条 ~64B 级), 且复用 slot 的旧 token 条目会残留旧身份。
+    /// 排障是短生命周期会话, 接受该有界泄漏换取"已回收节点日志可回溯"的诊断能力;
+    /// 若未来 trace 需要长跑, 再在 remove 成功路径补清理。
     debug_info_sidecar: RefCell<HashMap<u64, AnchorDebugInfo>>,
 }
 
@@ -845,7 +850,7 @@ pub struct Node {
     /// 累积 deferred dirty 的子节点 token，借用冲突恢复后统一处理。
     ///
     /// S2-03 刀B: 惰性 Box 形态 — 该列表只在"父节点被锁定期间子节点 dirty"的
-    /// 低频补偿路径才有数据, 绝大多数节点终身为 None (16B vs 原 Vec 32B);
+    /// 低频补偿路径才有数据, 绝大多数节点终身为 None (16B vs 原 RefCell<Vec> 32B);
     /// 首次 push 时才分配 (Option<Box<Vec>> 的 niche 使 None 零堆开销)。
     pub pending_dirty: RefCell<Option<Box<Vec<NodeKey>>>>,
     /// 锁期间被请求重算的标记，解锁时统一补偿入队，避免抢锁重入又不丢更新。
