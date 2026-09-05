@@ -621,6 +621,16 @@ impl<T: 'static, E: Engine> VarVOA<T, E> {
         // 惰性 mount: watch 时确保代理已 mount, 返回共享 anchor。
         self.ensure_mounted()
     }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // 动态性判据(S2 战役): anchor 未 mount ⇔ 该 VOA 处于 Val 且从未被
+    // set/watch — 管线可据此走"常量折叠"分支(跳过 watch 链建链)。
+    // 语义契约(S2 v0): 走了常量折叠的槽, 运行期 set 不生效(无链可升级);
+    // 动态化需求由上层"该项重建"语义承接(S2.2)。
+    ////////////////////////////////////////////////////////////////////////////////
+    pub fn is_dynamic(&self) -> bool {
+        self.anchor.borrow().is_some()
+    }
 }
 
 impl<E: Engine, T: 'static> AnchorInner<E> for VarEitherAnchor<T, E> {
