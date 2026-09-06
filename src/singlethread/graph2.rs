@@ -631,74 +631,82 @@ mod node_store {
             // - 将"解绑 + clear"放入独立作用域，作用域结束后 RefMut 自动释放；
             // - 再进行 dequeue 与 drop anchor，最大化降低重入借用冲突概率。
             ////////////////////////////////////////////////////////////////////////////////
+            ////////////////////////////////////////////////////////////////////////////////
+            // P2-M2: 解绑改 arena 形态 — 旧版 per-node RefCell 的 try_borrow_mut 预检
+            // (657-663 预检 + 681 兜底) 全部删除:
+            // - parent_links/children_ids 是 Graph2 级两个独立 RefCell, 各借一次全程持有,
+            //   期间无重入 (drop anchor 延后到作用域外, 见上方"关键改良"注释);
+            // - 单一借用面下解绑不存在"做到一半失败", 语义比旧版更强 (旧版失败会 gc_skipped 重试)。
+            ////////////////////////////////////////////////////////////////////////////////
             {
-                // 预检：父列表（依赖者列表）同样用 try_borrow_mut，避免外层仍持有借用导致 panic。
-                let Ok(mut self_parents) = guard.ptrs.clean_parents.try_borrow_mut() else {
-                    graph.inc_gc_skipped();
-                    return false;
-                };
-
-                // 尝试非阻塞清理必要子节点，若外部仍借用则跳过以避免 RefCell panic。
-                let Ok(mut children) = guard.ptrs.necessary_children.try_borrow_mut() else {
-                    graph.inc_gc_skipped();
-                    return false;
-                };
-
-                ////////////////////////////////////////////////////////////////////////////////
-                // 性能改良：避免为 children_snapshot 分配 Vec
-                //
-                // 说明：
-                // - 原实现会 `collect()` 一份 children_snapshot 用于两次遍历（预检/解绑）；
-                // - remove() 在 UI 高频增删时会被大量调用，这个额外分配会成为稳定常数开销；
-                // - 这里直接对 `children` 做两次迭代，避免额外分配。
-                ////////////////////////////////////////////////////////////////////////////////
-
-                // 预检：确保所有 child 的 clean_parents 都可写，避免"解绑做到一半就失败"的不一致状态。
-                for child_ptr in children.iter().copied() {
-                    let child = unsafe { guard.0.lookup_ptr(child_ptr) };
-                    if child.ptrs.clean_parents.try_borrow_mut().is_err() {
-                        graph.inc_gc_skipped();
-                        return false;
-                    }
-                }
-
-                // 执行解绑：从每个 child.clean_parents 移除当前 parent 指针，并维护 necessary_count。
-                // P2-M1: 比较形态从 NodePtr 相等改为槽 idx 相等 (同一 store 内 idx 即唯一槽身份)。
+                let graph: &super::Graph2 = unsafe { &*guard.ptrs.graph };
                 let parent_idx = ptr.idx();
-                for child_ptr in children.iter().copied() {
-                    let child = unsafe { guard.0.lookup_ptr(child_ptr) };
 
-                    // fast path：若 parent 恰好在 clean_parent0，直接清空。
-                    if child.ptrs.clean_parent0.get().points_to(parent_idx) {
-                        child.ptrs.clean_parent0.set(ParentLink::NONE);
-                    }
-                    // fast path：若 parent 恰好在 clean_parent1，直接清空。
-                    if child.ptrs.clean_parent1.get().points_to(parent_idx) {
-                        child.ptrs.clean_parent1.set(ParentLink::NONE);
-                    }
+                // 必要子节点遍历: children_ids 只读借用 + parent_links 写借用是两个
+                // 独立 RefCell, 可并存 — 保持旧版"零 snapshot 分配"的双遍历形态
+                // (解绑不重入, children 区间在循环后才置空, 边读边写安全)。
+                let children_range = guard.ptrs.necessary_children.get();
 
-                    // slow path：在 clean_parents Vec 中移除所有等于 idx 的条目（允许重复）。
-                    let Ok(mut child_parents) = child.ptrs.clean_parents.try_borrow_mut() else {
-                        // 兜底：预检已通过，这里不应失败；若失败，视为并发借用冲突，延后回收。
-                        graph.inc_gc_skipped();
-                        return false;
-                    };
-                    if !child_parents.is_empty() {
-                        child_parents.retain(|link| link.node_idx != parent_idx);
-                    }
+                // 执行解绑: 从每个 child.clean_parents 移除当前 parent 指针, 并维护 necessary_count。
+                // - inline 槽 fast path 保留;
+                // - Vec 慢路径 = 旧 retain 的区间内等价 (物理删匹配条目并保序前移,
+                //   双索引 compact 写法), 遍历序与旧版逐位同构。
+                {
+                    let mut links_arena = graph.parent_links_arena.borrow_mut();
+                    let child_slice = &graph.children_ids_arena.borrow()[children_range.start
+                        as usize
+                        ..(children_range.start + children_range.len) as usize];
+                    for child_idx in child_slice.iter().copied() {
+                        let child = unsafe { guard.0.lookup_idx_unchecked(child_idx) };
 
-                    child
-                        .necessary_count
-                        .set(child.necessary_count.get().saturating_sub(1));
+                        // fast path：若 parent 恰好在 clean_parent0/1，直接清空。
+                        if child.ptrs.clean_parent0.get().points_to(parent_idx) {
+                            child.ptrs.clean_parent0.set(ParentLink::NONE);
+                        }
+                        if child.ptrs.clean_parent1.get().points_to(parent_idx) {
+                            child.ptrs.clean_parent1.set(ParentLink::NONE);
+                        }
+
+                        // slow path：物理删区间内所有指向本 parent 的条目（允许重复）。
+                        let mut range = child.ptrs.clean_parents.get();
+                        if range.len > 0 {
+                            let s = range.start as usize;
+                            let mut write = s;
+                            for read in s..s + range.len as usize {
+                                if links_arena[read].node_idx != parent_idx {
+                                    links_arena[write] = links_arena[read];
+                                    write += 1;
+                                }
+                            }
+                            range.len = (write - s) as u32;
+                            child.ptrs.clean_parents.set(range);
+                        }
+
+                        child
+                            .necessary_count
+                            .set(child.necessary_count.get().saturating_sub(1));
+                    }
                 }
 
-                // 清空 parent 的必要子节点列表（输入边）。
-                children.clear();
+                // 清空 parent 的必要子节点区间（输入边）— len=0 但 cap 领地保留,
+                // 对齐旧 Vec clear() 保容量语义 (领地等 slot 复用吃, 或 compact 回收);
+                // 悲观计入死条目 (槽复用时回减, 长期不复用则由 compact 真正回收)。
+                let mut children_range = guard.ptrs.necessary_children.get();
+                graph
+                    .arena_dead_entries
+                    .set(graph.arena_dead_entries.get() + u64::from(children_range.cap));
+                children_range.len = 0;
+                guard.ptrs.necessary_children.set(children_range);
 
-                // 清空 parent 的父列表（被依赖者列表）。
+                // 清空 parent 的父区间（被依赖者列表; 同上 cap 保留 + 悲观计数）。
                 guard.ptrs.clean_parent0.set(ParentLink::NONE);
                 guard.ptrs.clean_parent1.set(ParentLink::NONE);
-                self_parents.clear();
+                let mut links_range = guard.ptrs.clean_parents.get();
+                graph
+                    .arena_dead_entries
+                    .set(graph.arena_dead_entries.get() + u64::from(links_range.cap));
+                links_range.len = 0;
+                guard.ptrs.clean_parents.set(links_range);
             }
 
             ////////////////////////////////////////////////////////////////////////////////
@@ -784,6 +792,19 @@ pub struct GcStatsSnapshot {
     pub epoch_depth: usize,
     /// epoch 期间被 retire 的待回收节点数量（epoch end 统一尝试回收）。
     pub retired_free: usize,
+}
+
+/// P2-M2: arena 邻接区水位快照 — 验收"长跑不无限膨胀"的观测面。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ArenaStatsSnapshot {
+    /// parent_links_arena 当前总长 (活领地 + 死领地)。
+    pub links_len: usize,
+    /// children_ids_arena 当前总长。
+    pub children_len: usize,
+    /// 悲观死条目计数 (compact 清零; 非精确值, 精确死区 = 总长 - 活领地和)。
+    pub dead: u64,
+    /// 历史 compact 次数。
+    pub compacts: u64,
 }
 
 impl GcStatsSnapshot {
@@ -899,6 +920,25 @@ pub struct Graph2 {
     /// 排障是短生命周期会话, 接受该有界泄漏换取"已回收节点日志可回溯"的诊断能力;
     /// 若未来 trace 需要长跑, 再在 remove 成功路径补清理。
     debug_info_sidecar: RefCell<HashMap<u64, AnchorDebugInfo>>,
+
+    /// P2-M2: SoA 邻接区 — clean_parents 慢路径条目的全局 bump 追加区。
+    ///
+    /// - per-node `RefCell<Vec<ParentLink>>` (Node 内 32B + 独立堆分配) →
+    ///   per-node `Cell<ArenaRange>` (12B, 指向本区连续领地);
+    /// - 领地 = [start, start+cap) 独占, 活条目 [start, start+len), len..cap 为
+    ///   NONE 填充的预留槽 (amortized 追加, 语义对齐旧 Vec 的容量倍增);
+    /// - 区间废弃 (free 置空/搬迁旧领地) 不即时回收, 由 compact_arenas
+    ///   在 stabilize 安全点按死条目阈值整体搬迁回收。
+    parent_links_arena: RefCell<Vec<ParentLink>>,
+    /// P2-M2: necessary_children 条目区 — 条目为 u32 槽 idx (旧 NodePtr 16B → 4B),
+    /// 排序键保持旧 NodePtr 位序 ((version,id) 复合, version 走 M1 key_versions
+    /// 侧表), 遍历序与旧 Vec 逐位一致。
+    children_ids_arena: RefCell<Vec<u32>>,
+    /// P2-M2: arena 废弃条目累计 (free 领地 + 搬迁旧领地 + 超容量丢弃), 是
+    /// compact 触发依据; compact 时精确重算清零。悲观计数: 槽复用复活领地时回减。
+    arena_dead_entries: Cell<u64>,
+    /// P2-M2: 历史 compact 次数 (观测面, arena_stats_snapshot 消费)。
+    arena_compacts: Cell<u64>,
 }
 
 /// epoch 的 RAII 守卫：
@@ -1105,16 +1145,46 @@ impl ParentLink {
     }
 }
 
+/// P2-M2: arena 邻接区间 — Graph2 级 bump 区内一段独占领地。
+///
+/// - 活条目 [start, start+len), 预留槽 [start+len, start+cap) (NONE/NIL 填充);
+/// - len == cap 时追加触发倍增搬迁 (新领地在 arena 尾部, 旧的整段废弃),
+///   分配次数对齐旧 per-node Vec 的容量倍增 (amortized O(1));
+/// - start/len/cap 三字段 12B, 较旧 `RefCell<Vec>` 32B 省 20B, 且堆分配
+///   从"每节点一个 Vec"变为"全图两个 arena";
+/// - u32 加法上限论证: links 侧 start+cap 上溢需 arena 累计 ~4G 条 ParentLink
+///   (~100GB), children 侧 ~4G 条 u32 (~16GB), 实际不可达; debug 构建有
+///   overflow panic 防线, 与 slot_gen 回绕论证同风格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArenaRange {
+    start: u32,
+    len: u32,
+    cap: u32,
+}
+
+impl ArenaRange {
+    /// 空区间 (无领地)。free/复用置空用; 首次追加时 lazy 分配领地。
+    const EMPTY: ArenaRange = ArenaRange {
+        start: 0,
+        len: 0,
+        cap: 0,
+    };
+}
+
 pub struct NodePtrs {
     /// 依赖者（parent）列表：
     /// - 优先用两个 inline 槽位承载最常见的 <=2 个 parent，避免频繁 Vec 分配/扩容；
-    /// - 当 parent > 2 时，再落到 `clean_parents` Vec（无序，可能重复，但 add_clean_parent 会去重）。
+    /// - 当 parent > 2 时，再落到本区间（Graph2.parent_links_arena 领地,
+    ///   无序可能重复, 但 add_clean_parent 会去重/复用 stale 槽）。
     ///
     /// P2-M1: 槽位存压缩 ParentLink (24B, node_idx=NIL_IDX 为空), 较旧
     /// Cell<Option<ParentLink>> (48B) 每槽省 24B。
     clean_parent0: Cell<ParentLink>,
     clean_parent1: Cell<ParentLink>,
-    clean_parents: RefCell<Vec<ParentLink>>,
+    /// P2-M2: 旧 `RefCell<Vec<ParentLink>>` (32B) → arena 区间 (12B)。
+    /// 读写经 graph.parent_links_arena + 本区间换算; 删除走区间内
+    /// compact (与旧 Vec::retain 保序物理删同构)。
+    clean_parents: Cell<ArenaRange>,
 
     graph: *const Graph2,
 
@@ -1158,7 +1228,11 @@ pub struct NodePtrs {
     free_prev: Cell<u32>,
 
     /// sorted in pointer order
-    necessary_children: RefCell<Vec<NodePtr>>,
+    ///
+    /// P2-M2: 旧 `RefCell<Vec<NodePtr>>` (32B, 16B 条目) → arena 区间 (12B,
+    /// u32 idx 条目)。排序键保持旧 NodePtr 位序 = (version,id) 复合键
+    /// (version 走 key_versions 侧表), 遍历序与旧 Vec 逐位一致。
+    necessary_children: Cell<ArenaRange>,
 
     handle_count: Cell<usize>,
 }
@@ -1350,25 +1424,46 @@ impl<'a> NodeGuard<'a> {
             self.ptrs.clean_parent1.set(new_link);
             return new_link.read_gen;
         }
-        // 慢路径：>2 个 parent 才会走 Vec，且尽量复用 stale 槽位。
-        let mut parents = self.ptrs.clean_parents.borrow_mut();
-        if let Some(existing) = parents.iter_mut().find(|link| link.node_idx == parent_idx) {
-            if existing.slot_gen != parent_slot_gen {
-                *existing = new_link;
-            } else if existing.epoch != current_epoch {
-                existing.epoch = current_epoch;
+        // 慢路径：>2 个 parent 才会走区间，且尽量复用 stale 槽位。
+        //
+        // P2-M2 结构 (对齐 add_necessary_child): 查找先行 — existing(同实体
+        // 去重)/reuse(stale 槽覆写) 命中时原地改写直接返回, 零 grow 零写回
+        // (re-add 已存在 parent 是 request_node 每次 poll 的常态, 前置 grow
+        // 会虚假搬迁且 Cell 指旧领地导致边视图丢失 — code-review P0 定案);
+        // 确定要追加时才 grow (搬迁换址), 函数尾部统一写回。
+        // 搜索范围严格限定活条目区 [start, start+len) — 与旧 Vec 全量搜索
+        // 一一对应 (槽位映射 Vec[i] ↔ arena[start+i]), 遍历序逐位一致。
+        let graph = unsafe { &*self.ptrs.graph };
+        let mut range = self.ptrs.clean_parents.get();
+        let mut arena = graph.parent_links_arena.borrow_mut();
+        if range.len > 0 {
+            let slice = &mut arena[range.start as usize..(range.start + range.len) as usize];
+            if let Some(existing) = slice.iter_mut().find(|link| link.node_idx == parent_idx) {
+                if existing.slot_gen != parent_slot_gen {
+                    *existing = new_link;
+                } else if existing.epoch != current_epoch {
+                    existing.epoch = current_epoch;
+                }
+                return existing.read_gen;
             }
-            existing.read_gen
-        } else if let Some(reuse_idx) = parents
-            .iter()
-            .position(|link| self.is_reusable_parent_link(*link, current_epoch))
-        {
-            parents[reuse_idx] = new_link;
-            new_link.read_gen
-        } else {
-            parents.push(new_link);
-            new_link.read_gen
+            if let Some(reuse_idx) = slice
+                .iter()
+                .position(|link| self.is_reusable_parent_link(*link, current_epoch))
+            {
+                slice[reuse_idx] = new_link;
+                return new_link.read_gen;
+            }
         }
+        // 追加: 领地满则倍增搬迁 (可能换址, 旧领地废弃), 再写 len 位置。
+        if range.len == range.cap {
+            drop(arena);
+            range = graph.grow_parent_links(range);
+            arena = graph.parent_links_arena.borrow_mut();
+        }
+        arena[(range.start + range.len) as usize] = new_link;
+        range.len += 1;
+        self.ptrs.clean_parents.set(range);
+        new_link.read_gen
     }
 
     /// 更新"child <- parent"边的版本记忆(request 判定为 Updated 时写回)。
@@ -1397,10 +1492,14 @@ impl<'a> NodeGuard<'a> {
                 return;
             }
         }
-        let mut parents = self.ptrs.clean_parents.borrow_mut();
-        for link in parents.iter_mut() {
-            if apply(link) {
-                return;
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.clean_parents.get();
+        if range.len > 0 {
+            let mut arena = graph.parent_links_arena.borrow_mut();
+            for link in arena[range.start as usize..(range.start + range.len) as usize].iter_mut() {
+                if apply(link) {
+                    return;
+                }
             }
         }
     }
@@ -1436,9 +1535,22 @@ impl<'a> NodeGuard<'a> {
         self.ptrs.clean_parent0.set(slot0);
         self.ptrs.clean_parent1.set(slot1);
 
-        let mut parents = self.ptrs.clean_parents.borrow_mut();
-        if !parents.is_empty() {
-            parents.retain(|link| link.node_idx != parent_idx);
+        // P2-M2: 旧 retain 的区间内等价 — 物理删所有匹配条目并保序前移
+        // (双索引 compact 写法), 遍历序与旧 Vec::retain 逐位同构。
+        let graph = unsafe { &*self.ptrs.graph };
+        let mut range = self.ptrs.clean_parents.get();
+        if range.len > 0 {
+            let mut arena = graph.parent_links_arena.borrow_mut();
+            let s = range.start as usize;
+            let mut write = s;
+            for read in s..s + range.len as usize {
+                if arena[read].node_idx != parent_idx {
+                    arena[write] = arena[read];
+                    write += 1;
+                }
+            }
+            range.len = (write - s) as u32;
+            self.ptrs.clean_parents.set(range);
         }
     }
 
@@ -1480,13 +1592,21 @@ impl<'a> NodeGuard<'a> {
                 out.push(parent);
             }
         }
-        let parents = self.ptrs.clean_parents.borrow();
-        out.extend(parents.iter().filter_map(|link| {
-            if link.epoch != current_epoch {
-                return None;
-            }
-            self.live_parent_from_link(*link)
-        }));
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.clean_parents.get();
+        if range.len > 0 {
+            let arena = graph.parent_links_arena.borrow();
+            out.extend(
+                arena[range.start as usize..(range.start + range.len) as usize]
+                    .iter()
+                    .filter_map(|link| {
+                        if link.epoch != current_epoch {
+                            return None;
+                        }
+                        self.live_parent_from_link(*link)
+                    }),
+            );
+        }
         if debug_parent_flow_enabled() {
             println!(
                 "CLEAN_PARENTS node={:?} count={}",
@@ -1498,6 +1618,12 @@ impl<'a> NodeGuard<'a> {
     }
 
     /// 遍历父节点，不分配临时 Vec，在线性链路上更轻量。
+    ///
+    /// P2-M2 纪律: 回调 f 执行期间 arena 处于只读借用 — 回调链禁止触发任何
+    /// 节点的 parents/children 领地写操作 (add_clean_parent /
+    /// remove_clean_parent_ptr / add/remove_necessary_child), 否则 BorrowMutError。
+    /// 当前调用图 (queue_recalc / push_pending_dirty / Anchor::dirty) 均不写
+    /// arena; 新增消费者必须维持此纪律。
     pub fn for_each_parent(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         let current_epoch = self.current_parent_epoch();
         let p0 = self.ptrs.clean_parent0.get();
@@ -1516,12 +1642,20 @@ impl<'a> NodeGuard<'a> {
                 f(parent);
             }
         }
-        for link in self.ptrs.clean_parents.borrow().iter().copied() {
-            if link.epoch != current_epoch {
-                continue;
-            }
-            if let Some(parent) = self.live_parent_from_link(link) {
-                f(parent);
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.clean_parents.get();
+        if range.len > 0 {
+            let arena = graph.parent_links_arena.borrow();
+            for link in arena[range.start as usize..(range.start + range.len) as usize]
+                .iter()
+                .copied()
+            {
+                if link.epoch != current_epoch {
+                    continue;
+                }
+                if let Some(parent) = self.live_parent_from_link(link) {
+                    f(parent);
+                }
             }
         }
     }
@@ -1563,16 +1697,27 @@ impl<'a> NodeGuard<'a> {
         {
             f(key);
         }
-        for link in self.ptrs.clean_parents.borrow().iter().copied() {
-            if link.epoch == current_epoch
-                && let Some(key) = make_key(link)
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.clean_parents.get();
+        if range.len > 0 {
+            let arena = graph.parent_links_arena.borrow();
+            for link in arena[range.start as usize..(range.start + range.len) as usize]
+                .iter()
+                .copied()
             {
-                f(key);
+                if link.epoch == current_epoch
+                    && let Some(key) = make_key(link)
+                {
+                    f(key);
+                }
             }
         }
     }
 
     /// 取出并"逻辑失效"当前父节点列表，供 mark_dirty 等热路径复用。
+    ///
+    /// P2-M2 纪律: 同 for_each_parent — 回调期间禁止触发任何 parents/children
+    /// 领地写操作 (arena 只读借用存续期)。
     pub fn drain_parents(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         let draining_epoch = self.bump_parent_epoch();
         let p0 = self.ptrs.clean_parent0.get();
@@ -1591,12 +1736,20 @@ impl<'a> NodeGuard<'a> {
                 f(parent);
             }
         }
-        for link in self.ptrs.clean_parents.borrow().iter().copied() {
-            if link.epoch != draining_epoch {
-                continue;
-            }
-            if let Some(parent) = self.live_parent_from_link(link) {
-                f(parent);
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.clean_parents.get();
+        if range.len > 0 {
+            let arena = graph.parent_links_arena.borrow();
+            for link in arena[range.start as usize..(range.start + range.len) as usize]
+                .iter()
+                .copied()
+            {
+                if link.epoch != draining_epoch {
+                    continue;
+                }
+                if let Some(parent) = self.live_parent_from_link(link) {
+                    f(parent);
+                }
             }
         }
     }
@@ -1604,13 +1757,16 @@ impl<'a> NodeGuard<'a> {
     /// 父节点数量，用于日志统计，避免 Vec 分配。
     pub fn parents_len(&self) -> usize {
         let current_epoch = self.current_parent_epoch();
-        let extra = self
-            .ptrs
-            .clean_parents
-            .borrow()
-            .iter()
-            .filter(|link| link.epoch == current_epoch)
-            .count();
+        let mut extra = 0;
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.clean_parents.get();
+        if range.len > 0 {
+            let arena = graph.parent_links_arena.borrow();
+            extra = arena[range.start as usize..(range.start + range.len) as usize]
+                .iter()
+                .filter(|link| link.epoch == current_epoch && link.is_some())
+                .count();
+        }
         extra
             + usize::from(self.ptrs.clean_parent0.get().epoch_is(current_epoch))
             + usize::from(self.ptrs.clean_parent1.get().epoch_is(current_epoch))
@@ -1629,20 +1785,58 @@ impl<'a> NodeGuard<'a> {
         res
     }
 
+    /// P2-M2: children 区间排序键 — 旧 NodePtr 位序 = (version,id) 复合键。
+    /// idx 经侧表还原完整 DefaultKey 后取 as_ffi, 与旧 `Vec<NodePtr>::binary_search`
+    /// 的 Ord 严格同序 (遍历序逐位一致的前提)。
+    #[inline]
+    fn child_sort_key(&self, idx: u32) -> u64 {
+        use slotmap::Key as _;
+        // SAFETY: 调用点均持本图 NodeGuard (store 借用前提成立), 只读侧表。
+        unsafe { self.0.lookup_idx_unchecked(idx).key }
+            .data()
+            .as_ffi()
+    }
+
     pub fn add_necessary_child(self, child: NodeGuard<'a>) {
-        let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = child.make_ptr();
-        if let Err(i) = necessary_children.binary_search(&child_ptr) {
-            necessary_children.insert(i, child_ptr);
-            child.necessary_count.set(child.necessary_count.get() + 1)
+        let graph = unsafe { &*self.ptrs.graph };
+        let child_idx = child.idx();
+        let target = self.child_sort_key(child_idx);
+        let mut range = self.ptrs.necessary_children.get();
+        let mut arena = graph.children_ids_arena.borrow_mut();
+        let slice = &arena[range.start as usize..(range.start + range.len) as usize];
+        // 保序插入: 同 key 已存在则不动 (旧语义 Err 才插入), 否则 shift 腾位。
+        let pos = match slice.binary_search_by(|&idx| self.child_sort_key(idx).cmp(&target)) {
+            Ok(_) => return,
+            Err(i) => i,
+        };
+        if range.len == range.cap {
+            // 领地满: 倍增搬迁 (保序, pos 不变) 后重新借 arena 写入。
+            drop(arena);
+            range = graph.grow_children_ids(range);
+            arena = graph.children_ids_arena.borrow_mut();
         }
+        let s = range.start as usize;
+        arena.copy_within(s + pos..s + range.len as usize, s + pos + 1);
+        arena[s + pos] = child_idx;
+        range.len += 1;
+        self.ptrs.necessary_children.set(range);
+        child.necessary_count.set(child.necessary_count.get() + 1);
     }
 
     pub fn remove_necessary_child(&self, child: NodeGuard<'a>) {
-        let mut necessary_children = self.ptrs.necessary_children.borrow_mut();
-        let child_ptr = child.make_ptr();
-        if let Ok(i) = necessary_children.binary_search(&child_ptr) {
-            necessary_children.remove(i);
+        let graph = unsafe { &*self.ptrs.graph };
+        let child_idx = child.idx();
+        let target = self.child_sort_key(child_idx);
+        let mut range = self.ptrs.necessary_children.get();
+        let mut arena = graph.children_ids_arena.borrow_mut();
+        let s = range.start as usize;
+        let slice = &arena[s..s + range.len as usize];
+        if let Ok(i) = slice.binary_search_by(|&idx| self.child_sort_key(idx).cmp(&target)) {
+            // shift 删除 (区间内 memmove, 不越界 — 领地独占), 与旧 Vec::remove 同构。
+            arena.copy_within(s + i + 1..s + range.len as usize, s + i);
+            range.len -= 1;
+            self.ptrs.necessary_children.set(range);
+            drop(arena);
             child
                 .necessary_count
                 .set(child.necessary_count.get().saturating_sub(1));
@@ -1653,41 +1847,66 @@ impl<'a> NodeGuard<'a> {
     }
 
     pub fn necessary_children(&self) -> Vec<NodeGuard<'a>> {
-        let children = self.ptrs.necessary_children.borrow();
-        children
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.necessary_children.get();
+        if range.len == 0 {
+            return Vec::new();
+        }
+        let arena = graph.children_ids_arena.borrow();
+        arena[range.start as usize..(range.start + range.len) as usize]
             .iter()
-            .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() }))
+            .map(|&idx| NodeGuard(unsafe { self.0.lookup_idx_unchecked(idx) }))
             .collect()
     }
 
     pub fn drain_necessary_children(&self) -> Vec<NodeGuard<'a>> {
         let parent_idx = self.0.idx();
-        let mut children = self.ptrs.necessary_children.borrow_mut();
-        for child in children.iter() {
-            let child_node = unsafe { self.0.lookup_ptr(*child) };
+        let graph = unsafe { &*self.ptrs.graph };
+        let range = self.ptrs.necessary_children.get();
+        // 遍历解绑: children_ids 只读借用 + parent_links 写借用是独立 RefCell,
+        // 可并存 — 解绑不重入, 自身区间在收集完后才置 len=0。
+        {
+            let mut links_arena = graph.parent_links_arena.borrow_mut();
+            let arena = graph.children_ids_arena.borrow();
+            for child_idx in arena[range.start as usize..(range.start + range.len) as usize]
+                .iter()
+                .copied()
+            {
+                let child_node = unsafe { self.0.lookup_idx_unchecked(child_idx) };
 
-            // 维护必要性计数：与 add_necessary_child 对称。
-            child_node
-                .necessary_count
-                .set(child_node.necessary_count.get().saturating_sub(1));
+                // 维护必要性计数：与 add_necessary_child 对称。
+                child_node
+                    .necessary_count
+                    .set(child_node.necessary_count.get().saturating_sub(1));
 
-            // 关键：解绑 child -> parent，避免 free list 复用槽位后误 dirty。
-            if child_node.ptrs.clean_parent0.get().points_to(parent_idx) {
-                child_node.ptrs.clean_parent0.set(ParentLink::NONE);
-            }
-            if child_node.ptrs.clean_parent1.get().points_to(parent_idx) {
-                child_node.ptrs.clean_parent1.set(ParentLink::NONE);
-            }
-            let mut child_parents = child_node.ptrs.clean_parents.borrow_mut();
-            if !child_parents.is_empty() {
-                child_parents.retain(|link| link.node_idx != parent_idx);
+                // 关键：解绑 child -> parent，避免 free list 复用槽位后误 dirty。
+                if child_node.ptrs.clean_parent0.get().points_to(parent_idx) {
+                    child_node.ptrs.clean_parent0.set(ParentLink::NONE);
+                }
+                if child_node.ptrs.clean_parent1.get().points_to(parent_idx) {
+                    child_node.ptrs.clean_parent1.set(ParentLink::NONE);
+                }
+                // 慢路径 = 旧 retain 的区间内等价 (物理删匹配条目并保序前移)。
+                let mut child_range = child_node.ptrs.clean_parents.get();
+                if child_range.len > 0 {
+                    let s = child_range.start as usize;
+                    let mut write = s;
+                    for read in s..s + child_range.len as usize {
+                        if links_arena[read].node_idx != parent_idx {
+                            links_arena[write] = links_arena[read];
+                            write += 1;
+                        }
+                    }
+                    child_range.len = (write - s) as u32;
+                    child_node.ptrs.clean_parents.set(child_range);
+                }
             }
         }
-        let collected = children
-            .iter()
-            .map(|ptr| NodeGuard(unsafe { ptr.lookup_unchecked() }))
-            .collect();
-        children.clear();
+        let collected = self.necessary_children();
+        // 清空区间 (len=0, cap 领地保留供后续重建边 — 对齐旧 Vec clear 保容量)。
+        let mut range = self.ptrs.necessary_children.get();
+        range.len = 0;
+        self.ptrs.necessary_children.set(range);
         collected
     }
 
@@ -1988,6 +2207,158 @@ impl<'gg> Graph2Guard<'gg> {
 }
 
 impl Graph2 {
+    /// P2-M2: parents 区间倍增搬迁 — len==cap 时把领地搬到 arena 尾部
+    /// (cap 倍增, 最小 4), 旧领地整段计入死条目 (compact 回收)。
+    /// 分配次数对齐旧 per-node Vec 的容量倍增, amortized O(1)。
+    ///
+    /// 尾部优化: 旧领地恰在 arena 尾缘时原地扩容 — resize 到新 cap 只在尾部
+    /// 追加 NONE, [start, start+cap) 原有内容 (含活条目) 天然保留, 零拷贝
+    /// 零废弃; churn 热点 (hub 节点反复倍增) 在尾部场景下零残留。
+    fn grow_parent_links(&self, range: ArenaRange) -> ArenaRange {
+        let mut arena = self.parent_links_arena.borrow_mut();
+        let new_cap = (range.cap * 2).max(4);
+        let old_end = range.start + range.cap;
+        if range.cap > 0 && old_end as usize == arena.len() {
+            arena.resize(range.start as usize + new_cap as usize, ParentLink::NONE);
+            return ArenaRange {
+                start: range.start,
+                len: range.len,
+                cap: new_cap,
+            };
+        }
+        let new_start = arena.len() as u32;
+        arena.resize(new_start as usize + new_cap as usize, ParentLink::NONE);
+        // 新领地在 [new_start, ..), 旧领地在 [start, start+len) — 前后两段
+        // split 开消除同 Vec 双借 (copy_from_slice 的标准解法)。
+        let (front, back) = arena.split_at_mut(new_start as usize);
+        back[..range.len as usize].copy_from_slice(
+            &front[range.start as usize..range.start as usize + range.len as usize],
+        );
+        self.arena_dead_entries
+            .set(self.arena_dead_entries.get() + u64::from(range.cap));
+        ArenaRange {
+            start: new_start,
+            len: range.len,
+            cap: new_cap,
+        }
+    }
+
+    /// P2-M2: children 区间倍增搬迁 (同 grow_parent_links; 预留槽 NIL_IDX 填充)。
+    fn grow_children_ids(&self, range: ArenaRange) -> ArenaRange {
+        let mut arena = self.children_ids_arena.borrow_mut();
+        let new_cap = (range.cap * 2).max(4);
+        let old_end = range.start + range.cap;
+        if range.cap > 0 && old_end as usize == arena.len() {
+            arena.resize(range.start as usize + new_cap as usize, NIL_IDX);
+            return ArenaRange {
+                start: range.start,
+                len: range.len,
+                cap: new_cap,
+            };
+        }
+        let new_start = arena.len() as u32;
+        arena.resize(new_start as usize + new_cap as usize, NIL_IDX);
+        let (front, back) = arena.split_at_mut(new_start as usize);
+        back[..range.len as usize].copy_from_slice(
+            &front[range.start as usize..range.start as usize + range.len as usize],
+        );
+        self.arena_dead_entries
+            .set(self.arena_dead_entries.get() + u64::from(range.cap));
+        ArenaRange {
+            start: new_start,
+            len: range.len,
+            cap: new_cap,
+        }
+    }
+
+    /// P2-M2: stabilize 安全点的 arena 清扫入口 — 阈值内为纯 Cell/len 读,
+    /// amortized 近零; 过阈值才做 O(活节点) 全图搬迁。
+    pub(crate) fn maybe_compact_arenas(&self) {
+        if self.arenas_need_compact() {
+            self.compact_arenas();
+        }
+    }
+
+    /// P2-M2: arena 死条目水位检查 — 触发条件同时要求"绝对量可观"(>8192)
+    /// 与"超过 1/4 浪费"(dead*4 > 总长), 避免小 arena 频繁全图搬迁。
+    /// 阈值实测校准自 n400 高峰形态: 50% 阈值下 1.7M 条 arena 死 867k 仍
+    /// 不触发 (dead*2 恰小于总长), RSS 双倍于必要值 — 收紧到 25%。
+    ///
+    /// 计数口径缝隙 (已知取舍): dead 只覆盖 free 领地 + grow 废弃领地,
+    /// 不含领地内预留槽 [len, cap) 与 stale 边 (epoch 失效但未删) — 这两类
+    /// 有界 (预留 ≤ 2x 活量, stale ≤ 历史 parent 峰值) 且 compact 搬迁时
+    /// 逐字节保留, 不构成无限膨胀风险。
+    fn arenas_need_compact(&self) -> bool {
+        let dead = self.arena_dead_entries.get() as usize;
+        if dead <= 8192 {
+            return false;
+        }
+        let links_len = self.parent_links_arena.borrow().len();
+        let children_len = self.children_ids_arena.borrow().len();
+        dead * 4 > links_len + children_len
+    }
+
+    /// P2-M2: arena 清扫 (compact) — 只在 stabilize 安全点调用 (无任何 arena 借用)。
+    ///
+    /// 活槽领地整段搬迁 (内容逐字节保留, 含 stale 条目 — 语义零变化);
+    /// free 槽 (anchor None) 的残留领地在此弃置 (区间置 EMPTY) — "free 后领地
+    /// 等 slot 复用"的复活窗口只维持到下一次 compact, 与旧 Vec 的
+    /// MAX_KEEP_CAPACITY 容量保留语义对齐 (arena 领地不跟槽走, 必须有回收点)。
+    /// 回收后死计数清零。
+    fn compact_arenas(&self) {
+        let mut new_links: Vec<ParentLink> = Vec::new();
+        let mut new_children: Vec<u32> = Vec::new();
+        // 领地搬迁 helper: 在目标 arena 尾部分配同尺寸领地并整段拷贝。
+        // (两份直白分支而非泛型抽象 — 两个 arena 元素类型/填充值不同, 直白更可读)
+        let mut links_arena = self.parent_links_arena.borrow_mut();
+        let mut children_arena = self.children_ids_arena.borrow_mut();
+        let nodes = &self.nodes;
+        nodes.with(|store| {
+            store.for_each_slot(|node: &Node| {
+                let is_live = unsafe { (*node.anchor.get()).is_some() };
+                if !is_live {
+                    // free 槽: 领地弃置 (即使有残留 cap)。
+                    if node.ptrs.clean_parents.get().cap > 0 {
+                        node.ptrs.clean_parents.set(ArenaRange::EMPTY);
+                    }
+                    if node.ptrs.necessary_children.get().cap > 0 {
+                        node.ptrs.necessary_children.set(ArenaRange::EMPTY);
+                    }
+                    return;
+                }
+                let mut links_range = node.ptrs.clean_parents.get();
+                if links_range.cap > 0 {
+                    let new_start = new_links.len() as u32;
+                    new_links.resize(new_links.len() + links_range.cap as usize, ParentLink::NONE);
+                    new_links[new_start as usize..new_start as usize + links_range.len as usize]
+                        .copy_from_slice(
+                            &links_arena[links_range.start as usize
+                                ..(links_range.start + links_range.len) as usize],
+                        );
+                    links_range.start = new_start;
+                    node.ptrs.clean_parents.set(links_range);
+                }
+                let mut children_range = node.ptrs.necessary_children.get();
+                if children_range.cap > 0 {
+                    let new_start = new_children.len() as u32;
+                    new_children.resize(new_children.len() + children_range.cap as usize, NIL_IDX);
+                    new_children
+                        [new_start as usize..new_start as usize + children_range.len as usize]
+                        .copy_from_slice(
+                            &children_arena[children_range.start as usize
+                                ..(children_range.start + children_range.len) as usize],
+                        );
+                    children_range.start = new_start;
+                    node.ptrs.necessary_children.set(children_range);
+                }
+            });
+        });
+        *links_arena = new_links;
+        *children_arena = new_children;
+        self.arena_dead_entries.set(0);
+        self.arena_compacts.set(self.arena_compacts.get() + 1);
+    }
+
     fn next_slot_token(&self) -> u64 {
         let current = self.token_counter.get();
         self.token_counter.set(current + 1);
@@ -2039,6 +2410,17 @@ impl Graph2 {
     #[must_use]
     pub fn anchor_pool_stats_snapshot(&self) -> AnchorPoolStatsSnapshot {
         self.anchor_pool.stats_snapshot()
+    }
+
+    /// P2-M2: arena 邻接区水位快照 (验收"长跑不无限膨胀"的观测面)。
+    #[must_use]
+    pub fn arena_stats_snapshot(&self) -> ArenaStatsSnapshot {
+        ArenaStatsSnapshot {
+            links_len: self.parent_links_arena.borrow().len(),
+            children_len: self.children_ids_arena.borrow().len(),
+            dead: self.arena_dead_entries.get(),
+            compacts: self.arena_compacts.get(),
+        }
     }
 
     fn enqueue_free_retry(&self, ptr: NodePtr) {
@@ -2209,6 +2591,11 @@ impl Graph2 {
             still_alive: Rc::new(Cell::new(true)),
             free_head: Box::new(Cell::new(NIL_IDX)),
             debug_info_sidecar: RefCell::new(HashMap::new()),
+            // P2-M2: SoA 邻接区 (lazy 增长, 空图零分配)。
+            parent_links_arena: RefCell::new(Vec::new()),
+            children_ids_arena: RefCell::new(Vec::new()),
+            arena_dead_entries: Cell::new(0),
+            arena_compacts: Cell::new(0),
         }
     }
 
@@ -2389,33 +2776,53 @@ impl Graph2 {
                 guard.ptrs.clean_parent0.set(ParentLink::NONE);
                 guard.ptrs.clean_parent1.set(ParentLink::NONE);
                 ////////////////////////////////////////////////////////////////////////////////
-                // 复用 Vec 容量,降低动态 churn 下的分配/回收风暴
+                // 复用区间领地,降低动态 churn 下的分配/回收风暴 (P2-M2)
                 //
                 // 背景：
-                // - 该节点来自 free list,这些 Vec 往往在上一轮生命周期里已经扩容过；
-                // - 若这里用 `replace(Vec::new())`,会立刻释放旧 buffer,后续又在 request/match 中重新扩容,
-                //   pprof 里常体现为 `RawVecInner::finish_grow` 热点。
+                // - 该节点来自 free list,上一轮生命周期的 arena 领地往往已倍增过;
+                // - free 时领地保留 + 悲观计入死条目 — 此处复用即"复活":
+                //   len 已是 0, cap 直接吃 (对齐旧 Vec clear() 保容量语义,
+                //   分配次数与旧版完全一致), 并把 free 时的悲观计数回减。
                 //
                 // 风险控制：
-                // - 为避免极端情况下 free list "长期持有超大 Vec buffer"导致 RSS 不可控,
-                //   对少数超大容量做阈值回收(直接丢弃 buffer)。
+                // - 为避免极端情况下 free list "长期持有超大领地"导致 arena 不可控,
+                //   对少数超大 cap 做阈值回收(置 EMPTY 弃领地, 对齐旧版丢 buffer)。
                 ////////////////////////////////////////////////////////////////////////////////
                 {
-                    let mut parents = guard.ptrs.clean_parents.borrow_mut();
-                    parents.clear();
-                    // clean_parents 通常很小,默认不做 shrink,尽量保留容量复用。
+                    let mut range = guard.ptrs.clean_parents.get();
+                    if range.len == 0 && range.cap > 0 {
+                        // 领地复活: 回减 free 时的悲观死计数 (同 children 分支)。
+                        self.arena_dead_entries.set(
+                            self.arena_dead_entries
+                                .get()
+                                .saturating_sub(u64::from(range.cap)),
+                        );
+                    }
+                    if range.len != 0 {
+                        // free 路径已清 len — 非 0 说明状态异常, 保守弃置重建。
+                        range = ArenaRange::EMPTY;
+                    }
+                    guard.ptrs.clean_parents.set(range);
                 }
                 guard.parent_epoch.set(1);
                 guard.ptrs.recalc_state.set(RecalcState::Needed);
                 guard.ptrs.free_next.set(NIL_IDX);
                 guard.ptrs.free_prev.set(NIL_IDX);
                 {
-                    const MAX_KEEP_CAPACITY: usize = 256;
-                    let mut children = guard.ptrs.necessary_children.borrow_mut();
-                    children.clear();
-                    if children.capacity() > MAX_KEEP_CAPACITY {
-                        *children = Vec::new();
+                    const MAX_KEEP_CAPACITY: u32 = 256;
+                    let mut range = guard.ptrs.necessary_children.get();
+                    if range.len == 0 && range.cap > 0 {
+                        // 领地复活: 回减 free 时的悲观死计数。
+                        self.arena_dead_entries.set(
+                            self.arena_dead_entries
+                                .get()
+                                .saturating_sub(u64::from(range.cap)),
+                        );
                     }
+                    if range.len != 0 || range.cap > MAX_KEEP_CAPACITY {
+                        range = ArenaRange::EMPTY;
+                    }
+                    guard.ptrs.necessary_children.set(range);
                 }
                 // 历史证伪注记(SLACK/方案G/方案H/方案R 对高度传播的系统性排除)
                 // 已迁移至 specs/anchors_plan_a_denumericalized_scheduling.md §1.2, 勿再尝试。
@@ -2453,7 +2860,7 @@ impl Graph2 {
                     ptrs: NodePtrs {
                         clean_parent0: Cell::new(ParentLink::NONE),
                         clean_parent1: Cell::new(ParentLink::NONE),
-                        clean_parents: RefCell::new(vec![]),
+                        clean_parents: Cell::new(ArenaRange::EMPTY),
                         graph: self,
                         // P2-M1: u32 idx 链接初始态 (NIL_IDX = None); slot_gen 从 0 起。
                         next: Cell::new(NIL_IDX),
@@ -2462,7 +2869,7 @@ impl Graph2 {
                         slot_gen: Cell::new(0),
                         free_next: Cell::new(NIL_IDX),
                         free_prev: Cell::new(NIL_IDX),
-                        necessary_children: RefCell::new(vec![]),
+                        necessary_children: Cell::new(ArenaRange::EMPTY),
                         handle_count: Cell::new(1),
                     },
                     last_ready: Cell::new(None),
@@ -2643,14 +3050,18 @@ mod test {
     use super::*;
 
     #[test]
-    /// Node 布局尺寸预算回归防线 (S2-03 立项, P2-M1 更新)。
+    /// Node 布局尺寸预算回归防线 (S2-03 立项, P2-M1/M2 更新)。
     ///
-    /// - 实测轨迹: 基线 368B → S2-03 刀A/B 312B → **P2-M1 链接 32bit 化 224B**
+    /// - 实测轨迹: 基线 368B → S2-03 刀A/B 312B → P2-M1 链接 32bit 化 224B
     ///   (四链 Cell<Option<NodePtr>>→Cell<u32> 省 48B + clean_parent0/1 压缩
-    ///   ParentLink 省 48B + parent_epoch u32 化, 含 padding 重排);
+    ///   ParentLink 省 48B + parent_epoch u32 化, 含 padding 重排) →
+    ///   **P2-M2 SoA 邻接区 184B** (clean_parents/necessary_children 双
+    ///   RefCell<Vec> 64B → Cell<ArenaRange{start,len,cap}> 24B, 领地语义
+    ///   对齐旧 Vec 容量倍增);
     /// - 已评估关闭的刀: 位域合并(Rust repr 自动打包 1B 字段, 收益 0) /
     ///   free-recalc 链 union(历史 free_head 污染事故注释反对) /
-    ///   clean_parents+necessary_children 惰性化(热路径代价比, 归 M2 SoA arena);
+    ///   clean_parents+necessary_children 惰性化(S2-03 热路径代价比, 已由
+    ///   P2-M2 arena 化取代 — 不止省指针还省分配);
     /// - read_gen 压 32 位已评估否决 (全局 generation 回绕 → 永久 stale, 见
     ///   ParentLink 注释);
     /// - 上限值 = 当前实测值, 有意扩字段时同步上调并在提交里记录理由。
@@ -2658,8 +3069,8 @@ mod test {
         let size = std::mem::size_of::<Node>();
         eprintln!("size_of::<Node>() = {size}");
         assert!(
-            size <= 224,
-            "Node 尺寸超预算: {size}B (P2-M1 后实测 224B, 若有意扩字段请同步上调并记录)"
+            size <= 184,
+            "Node 尺寸超预算: {size}B (P2-M2 后实测 184B, 若有意扩字段请同步上调并记录)"
         );
     }
 
@@ -2840,6 +3251,205 @@ mod test {
             let child = guard.get(child_token).expect("child 应当仍存在");
             let empty: Vec<NodeGuard<'_>> = vec![];
             assert_eq!(empty, to_vec(child.clean_parents()));
+        });
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // P2-M2 领地语义回归 (SoA 邻接区)
+    //
+    // 背景: 现有 112 测试曾全部漏过 "grow 尾部分支丢活条目" (code-review P0,
+    // 单节点连续扩容即触发) — 补齐四类领地语义防线:
+    // ① grow 保数据 (尾缘/搬迁两分支); ② 慢路径物理删保序; ③ children 复合序;
+    // ④ compact 搬迁后区间仍可读。
+    ////////////////////////////////////////////////////////////////////////////////
+
+    /// 构造 1 个 child 与 n 个 parent 的完整双向边, 返回 token 列表。
+    #[test]
+    /// ① grow 保数据: 7 parent (2 inline + 5 arena, 第 5 条触发 grow 且该领地
+    /// 在 arena 尾缘) — code-review P0-1 曾在此形态丢全部 arena 活条目,
+    /// parents 只剩 inline 2 + 复用槽 1 = 3。
+    fn p2m2_grow_preserves_entries_tail_case() {
+        use crate::expert::AnchorHandle as _;
+        let graph = Graph2::new(10);
+        let child_handle = graph.insert_testing();
+        // parent handle 全部保活到断言之后 (drop 会触发 free 解绑)。
+        let parent_handles: Vec<_> = (0..7).map(|_| graph.insert_testing()).collect();
+
+        graph.with(|guard| {
+            let child = guard.get(child_handle.token()).expect("child 应当存在");
+            for p in parent_handles.iter() {
+                let parent = guard.get(p.token()).expect("parent 应当存在");
+                child.add_clean_parent(parent);
+                parent.add_necessary_child(child);
+            }
+            assert_eq!(
+                child.clean_parents().len(),
+                7,
+                "grow 尾缘分支后 arena 活条目丢失"
+            );
+            assert_eq!(child.parents_len(), 7);
+        });
+    }
+
+    #[test]
+    /// ② 慢路径物理删与旧 Vec::retain 保序同构: 删 arena 中间条目后,
+    /// 剩余 parents 的顺序 = 原顺序去掉被删项 (tombstone 复用槽会给出
+    /// [A,D,C] 形态的错误序, 此测试同时防回潮)。
+    fn p2m2_remove_clean_parent_ptr_compacts_in_order() {
+        use crate::expert::AnchorHandle as _;
+        let graph = Graph2::new(10);
+        let child_handle = graph.insert_testing();
+        let parent_handles: Vec<_> = (0..7).map(|_| graph.insert_testing()).collect();
+
+        let want: Vec<u64> = parent_handles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 4) // 删除第 5 个 (arena 区间第 3 条, 中间位)
+            .map(|(_, h)| h.token().raw_token())
+            .collect();
+
+        graph.with(|guard| {
+            let child = guard.get(child_handle.token()).expect("child 应当存在");
+            for p in parent_handles.iter() {
+                let parent = guard.get(p.token()).expect("parent 应当存在");
+                child.add_clean_parent(parent);
+                parent.add_necessary_child(child);
+            }
+            let removed_idx = guard.get(parent_handles[4].token()).unwrap().idx();
+            child.remove_clean_parent_ptr(removed_idx);
+
+            let got: Vec<u64> = child
+                .clean_parents()
+                .iter()
+                .map(|p| p.key().raw_token())
+                .collect();
+            assert_eq!(got, want, "区间内物理删后剩余序与旧 retain 不同构");
+            assert_eq!(child.parents_len(), 6);
+        });
+    }
+
+    #[test]
+    /// ③ children 区间复合序 + grow 不丢条目: 单 parent 挂 7 个 children
+    /// (第 5 条触发 children grow), drain 出的集合完整且必要计数对齐。
+    fn p2m2_children_grow_preserves_entries() {
+        use crate::expert::AnchorHandle as _;
+        let graph = Graph2::new(10);
+        let parent_handle = graph.insert_testing();
+        let child_handles: Vec<_> = (0..7).map(|_| graph.insert_testing()).collect();
+
+        graph.with(|guard| {
+            let parent = guard.get(parent_handle.token()).expect("parent 应当存在");
+            for c in child_handles.iter() {
+                let child = guard.get(c.token()).expect("child 应当存在");
+                child.add_clean_parent(parent);
+                parent.add_necessary_child(child);
+            }
+            // 7 个 children 全部 drain 出 (grow 后区间完整), 每个的
+            // necessary_count 已被对称扣减。
+            let drained = parent.drain_necessary_children();
+            assert_eq!(drained.len(), 7, "children grow 后区间条目丢失");
+            for child in drained.iter() {
+                assert_eq!(child.necessary_count.get(), 0);
+            }
+            // drain 后区间为空, 复查不再有 children。
+            assert_eq!(parent.necessary_children().len(), 0);
+        });
+    }
+
+    #[test]
+    /// ⑤ grow 边界 + re-add 已存在 parent (Spec 轴 code-review P0 固化):
+    /// parent 数 = 2+2^k (6 个: 2 inline + 4 arena, cap=4) 时 len==cap,
+    /// 此时 re-add 已存在的 parent 必须原地命中 — 旧 bug 形态是 grow 前置
+    /// 且命中分支不写回 range, 导致虚假搬迁 + Cell 指旧领地, 边视图丢失。
+    /// 另一半断言: drain (epoch bump) 后逐个 re-add 全部 parent, 视图应全部恢复。
+    fn p2m2_readd_existing_at_full_capacity() {
+        use crate::expert::AnchorHandle as _;
+        let graph = Graph2::new(10);
+        let child_handle = graph.insert_testing();
+        let parent_handles: Vec<_> = (0..6).map(|_| graph.insert_testing()).collect();
+
+        graph.with(|guard| {
+            let child = guard.get(child_handle.token()).expect("child 应当存在");
+            for p in parent_handles.iter() {
+                let parent = guard.get(p.token()).expect("parent 应当存在");
+                child.add_clean_parent(parent);
+                parent.add_necessary_child(child);
+            }
+            assert_eq!(child.parents_len(), 6);
+            let links_before = graph.arena_stats_snapshot().links_len;
+
+            // len==cap 状态下 re-add 已存在 parent: 必须原地命中 (零 grow 零膨胀)。
+            for p in parent_handles.iter() {
+                let parent = guard.get(p.token()).expect("parent 应当存在");
+                child.add_clean_parent(parent);
+            }
+            assert_eq!(child.parents_len(), 6, "re-add 后边视图丢失");
+            assert_eq!(
+                graph.arena_stats_snapshot().links_len,
+                links_before,
+                "re-add 已存在 parent 触发了虚假 grow (arena 膨胀)"
+            );
+
+            // drain (逻辑失效) 后逐个 re-add: 视图应全部恢复。
+            let _ = child.drain_clean_parents();
+            assert_eq!(child.parents_len(), 0, "drain 后旧 epoch 边应全部失效");
+            for p in parent_handles.iter() {
+                let parent = guard.get(p.token()).expect("parent 应当存在");
+                child.add_clean_parent(parent);
+            }
+            assert_eq!(
+                child.parents_len(),
+                6,
+                "drain 后 re-add 全部 parent, 边视图必须完整恢复"
+            );
+        });
+    }
+
+    #[test]
+    /// ④ compact 搬迁后区间仍可读: 多轮"建边→删边"制造废弃领地后强制
+    /// compact, 活边必须原样可达。
+    fn p2m2_compact_preserves_live_entries() {
+        use crate::expert::AnchorHandle as _;
+        let graph = Graph2::new(10);
+        let child_handle = graph.insert_testing();
+        let keep_handles: Vec<_> = (0..5).map(|_| graph.insert_testing()).collect();
+        // churn 源: 反复建删的边 (制造 grow/搬迁废弃)。
+        let churn_handles: Vec<_> = (0..5).map(|_| graph.insert_testing()).collect();
+
+        graph.with(|guard| {
+            let child = guard.get(child_handle.token()).expect("child 应当存在");
+            // 保留边: 5 个 parent (2 inline + 3 arena)。
+            for p in keep_handles.iter() {
+                let parent = guard.get(p.token()).expect("parent 应当存在");
+                child.add_clean_parent(parent);
+                parent.add_necessary_child(child);
+            }
+            // churn: 交替建/删 4 轮 × 3 条边 — 让 arena 领地反复 grow 与搬迁。
+            for _round in 0..4 {
+                for p in churn_handles.iter() {
+                    let parent = guard.get(p.token()).expect("parent 应当存在");
+                    child.add_clean_parent(parent);
+                    parent.add_necessary_child(child);
+                }
+                for p in churn_handles.iter() {
+                    let parent = guard.get(p.token()).expect("parent 应当存在");
+                    parent.remove_necessary_child(child);
+                }
+            }
+            // 直接力触发 compact (绕过阈值, 单测内直接调私有方法)。
+            graph.compact_arenas();
+        });
+        // 重新进图验证 compact 后活边仍可达 (领地已换新址)。
+        graph.with(|guard| {
+            let child = guard.get(child_handle.token()).expect("child 应当存在");
+            let got: Vec<u64> = child
+                .clean_parents()
+                .iter()
+                .map(|p| p.key().raw_token())
+                .collect();
+            let want: Vec<u64> = keep_handles.iter().map(|h| h.token().raw_token()).collect();
+            assert_eq!(got, want, "compact 搬迁后活边丢失或乱序");
+            assert_eq!(child.parents_len(), 5);
         });
     }
 }

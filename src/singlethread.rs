@@ -21,8 +21,8 @@ use tracing::trace;
 pub use anchor_pool::AnchorPoolStatsSnapshot;
 pub use graph2::AnchorHandle;
 pub use graph2::EpochGuard;
-pub use graph2::GcStatsSnapshot;
 pub use graph2::NodeKey as AnchorToken;
+pub use graph2::{ArenaStatsSnapshot, GcStatsSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 失效 token 观测：用于在不崩溃的前提下，避免 warn 日志刷屏，同时保留“首个触发点”。
@@ -310,6 +310,12 @@ impl Engine {
     #[must_use]
     pub fn anchor_pool_stats(&self) -> AnchorPoolStatsSnapshot {
         self.graph.anchor_pool_stats_snapshot()
+    }
+
+    /// P2-M2: 读取 arena 邻接区水位（links/children 长度 + 死条目 + compact 次数）。
+    #[must_use]
+    pub fn arena_stats(&self) -> ArenaStatsSnapshot {
+        self.graph.arena_stats_snapshot()
     }
 
     /// 进入 anchors epoch（读窗口）。
@@ -720,6 +726,10 @@ impl Engine {
 
         // 诊断计数: stabilize 轮次直方图(未超限记实际轮数 1..8, 超限记 index 8)。
         waiting_record_rounds(rounds, pending_work);
+
+        // P2-M2: arena 邻接区清扫检查 — 安全点 (队列已收敛, 无任何 arena 借用);
+        // 阈值内是纯计数读, 过阈值才 O(活节点) 全图搬迁 (compact_arenas)。
+        self.graph.maybe_compact_arenas();
 
         if pending_work {
             // 方案 A M0 预铺: 超限不收敛时附队列残留子图, 为 M3 Kahn 死锁检测积累基线形态。
