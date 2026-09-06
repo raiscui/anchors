@@ -2108,7 +2108,7 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             match (child.last_update.get(), read_gen) {
                 (Some(a), Some(v)) if a > v => {
                     // 消费了新版本: 写回边级记忆, 下次同值比较可判 Unchanged。
-                    child.set_parent_link_read_gen(self.node.make_ptr(), Some(a));
+                    child.set_parent_link_read_gen(self.node.idx(), Some(a));
                     Poll::Updated
                 }
                 // 同轮刚更新特判: 保留旧 fast path `a == b == generation => Updated` 语义
@@ -2120,7 +2120,7 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
                 // C 的透传型 output(如 cutoff/map)重算缓存(实证: test_cutoff_simple_observed
                 // 135!=110 回归)。
                 (Some(a), None) => {
-                    child.set_parent_link_read_gen(self.node.make_ptr(), Some(a));
+                    child.set_parent_link_read_gen(self.node.idx(), Some(a));
                     Poll::Updated
                 }
                 // C 自身无时间戳(从未 Updated 过): 无版本可记, 保守读。

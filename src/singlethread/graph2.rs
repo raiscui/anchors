@@ -1,6 +1,8 @@
 use super::anchor_pool::{AnchorMemPool, AnchorPoolStatsSnapshot};
 use super::{AnchorDebugInfo, Generation, GenericAnchor};
 use super::{Engine, EngineContext};
+// P2-M1: 32bit 链接的空槽哨兵 (与 node_store 内 slotmap null idx 约定一致)。
+use node_store::NIL_IDX;
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -192,19 +194,52 @@ fn debug_info_sidecar_wanted() -> bool {
 }
 
 mod node_store {
-    use slotmap::{DefaultKey, SlotMap};
+    // P2-M1: NodeStore::remove 的 clean_parent 解绑写 NONE 哨兵 (子模块可访问父模块私有项)。
+    use super::ParentLink;
+    use slotmap::{DefaultKey, Key, KeyData, SlotMap};
     use std::cell::UnsafeCell;
     use std::hash::Hasher;
     use std::marker::PhantomData;
 
+    ////////////////////////////////////////////////////////////////////////////////
+    // P2-M1: 链接 32bit 化的哨兵与译码约定。
+    //
+    // - slotmap 1.1.1 的 KeyData 布局: idx 在 as_ffi() 低 32 位, version 在高 32 位
+    //   (version 恒为奇数 — 内部用最低位做 tag, from_ffi 的 `|1` 对奇数幂等);
+    // - 本仓不对 SlotMap 执行物理 remove (槽只进 free list 复用), 因此槽的 idx 与
+    //   version 在 NodeStore 生命周期内恒定 — idx 单独即可定位槽, version 只在
+    //   拼回 DefaultKey 时需要;
+    // - NIL_IDX 与 slotmap 自身的 null idx 约定一致 (KeyData::null() 同用 u32::MAX),
+    //   真实槽 idx 永远不会等于它, 作"空槽"哨兵零冲突。
+    //////////////////////////////////////////////////////////////////////////////////
+    /// 链接字段 (next/prev/free_next/free_prev/ParentLink.node_idx) 的"空"哨兵。
+    pub const NIL_IDX: u32 = u32::MAX;
+
+    /// 从 DefaultKey 提取槽 idx (as_ffi 低 32 位, slotmap 1.1.1 公开位布局)。
+    pub fn idx_of_key(key: DefaultKey) -> u32 {
+        (key.data().as_ffi() & 0xffff_ffff) as u32
+    }
+
+    /// 从 DefaultKey 提取 version 高 32 位 (侧表存储形态; 恒奇数)。
+    fn version_of_key(key: DefaultKey) -> u32 {
+        (key.data().as_ffi() >> 32) as u32
+    }
+
     pub struct NodeStore<T> {
         slots: UnsafeCell<SlotMap<DefaultKey, T>>,
+        /// P2-M1: idx → key version 高 32 位侧表 (4B/槽)。
+        ///
+        /// - 槽不物理删除 → version 恒定, insert 新槽时记录一次, 之后只读;
+        /// - 译码路径: `DefaultKey::from_ffi((version << 32) | idx)` 还原完整 key
+        ///   (version 恒奇数, from_ffi 的 `|1` 幂等, round-trip 严格成立 — 有单测锁死)。
+        key_versions: UnsafeCell<Vec<u32>>,
     }
 
     impl<T> NodeStore<T> {
         pub fn new() -> Self {
             Self {
                 slots: UnsafeCell::new(SlotMap::with_key()),
+                key_versions: UnsafeCell::new(Vec::new()),
             }
         }
 
@@ -238,11 +273,55 @@ mod node_store {
             unsafe {
                 let slots = &mut *(*self.graph).slots.get();
                 let key = slots.insert(node);
+                // P2-M1: 记录新槽的 version 高 32 位 (槽不物理删除, 只写这一次)。
+                let idx = idx_of_key(key) as usize;
+                let versions = &mut *(*self.graph).key_versions.get();
+                if idx >= versions.len() {
+                    versions.resize(idx + 1, 0);
+                }
+                versions[idx] = version_of_key(key);
                 NodeGuard {
                     graph: self.graph,
                     key,
                     _marker: PhantomData,
                 }
+            }
+        }
+
+        /// P2-M1: idx → 完整 DefaultKey (拼回 version 高 32 位)。
+        ///
+        /// # Panics (debug)
+        /// NIL_IDX 不是真实槽位, 哨兵误入译码在此拦截。
+        pub fn idx_to_key(&self, idx: u32) -> DefaultKey {
+            debug_assert_ne!(idx, NIL_IDX, "idx_to_key: NIL_IDX 哨兵不应进入译码");
+            let versions = unsafe { &*(*self.graph).key_versions.get() };
+            let version = versions[idx as usize];
+            debug_assert_ne!(
+                version, 0,
+                "idx_to_key: 侧表未记录该槽 (insert 路径漏记或跨 NodeStore 误用)"
+            );
+            let key_data = KeyData::from_ffi((u64::from(version) << 32) | u64::from(idx));
+            // SAFETY: KeyData 由本 store insert 时记录的 version 还原 (round-trip),
+            // 编码合法; DefaultKey 与 KeyData 同构 (new_key_type 生成的透明包装)。
+            DefaultKey::from(key_data)
+        }
+
+        /// P2-M1: 按 idx 取节点引用 (32bit 链接的译码入口, 语义同 lookup_ptr;
+        /// 引用形态消费走 lookup_idx_unchecked().node(), 本方法是三形态家族的薄封装)。
+        pub unsafe fn lookup_ptr_idx(&self, idx: u32) -> &T {
+            unsafe { self.lookup_ptr(NodePtr::new(self.graph, self.idx_to_key(idx))) }
+        }
+
+        /// P2-M1: 按 idx 译码 NodeGuard (Graph2Guard 链操作的遍历入口)。
+        ///
+        /// # Safety
+        /// idx 必须来自本 store 的 insert; 哨兵 NIL_IDX 由 idx_to_key 的 debug 断言拦截。
+        pub unsafe fn lookup_idx_unchecked(&self, idx: u32) -> NodeGuard<'a, T> {
+            let key = self.idx_to_key(idx);
+            NodeGuard {
+                graph: self.graph,
+                key,
+                _marker: PhantomData,
             }
         }
 
@@ -302,6 +381,11 @@ mod node_store {
     impl<T> NodePtr<T> {
         pub fn new(graph: *const NodeStore<T>, key: DefaultKey) -> Self {
             Self { graph, key }
+        }
+
+        /// P2-M1: 提取槽 idx (as_ffi 低 32 位, 供 32bit 链接字段存取)。
+        pub fn idx(&self) -> u32 {
+            idx_of_key(self.key)
         }
 
         pub unsafe fn lookup_unchecked<'a>(self) -> NodeGuard<'a, T> {
@@ -366,6 +450,23 @@ mod node_store {
     impl<'a, T> NodeGuard<'a, T> {
         pub fn make_ptr(&self) -> NodePtr<T> {
             NodePtr::new(self.graph, self.key)
+        }
+
+        /// P2-M1: 本节点槽 idx (32bit 链接字段的写入形态)。
+        pub fn idx(&self) -> u32 {
+            idx_of_key(self.key)
+        }
+
+        /// P2-M1: 按 idx 译码出同 store 的 NodeGuard (32bit 链接的遍历入口)。
+        ///
+        /// # Safety
+        /// idx 必须来自本 store 的 insert (侧表只记录本 store 槽位), 哨兵 NIL_IDX 会被
+        /// debug 断言拦截。
+        pub unsafe fn lookup_idx_unchecked(&self, idx: u32) -> NodeGuard<'a, T> {
+            // SAFETY: 本方法为 unsafe — 调用方保证已持有 store 借用 (与 lookup_ptr 同前提),
+            // 临时 NodeStoreGuard 仅做一次侧表读取后即弃, 不延长任何借用;
+            // NodeGuard 构造逻辑收敛在 NodeStoreGuard 版 (单一真相源, 本方法只补生命周期桥接)。
+            unsafe { (*self.graph).with_unchecked().lookup_idx_unchecked(idx) }
         }
 
         pub fn node(&self) -> &T {
@@ -562,36 +663,28 @@ mod node_store {
                 }
 
                 // 执行解绑：从每个 child.clean_parents 移除当前 parent 指针，并维护 necessary_count。
+                // P2-M1: 比较形态从 NodePtr 相等改为槽 idx 相等 (同一 store 内 idx 即唯一槽身份)。
+                let parent_idx = ptr.idx();
                 for child_ptr in children.iter().copied() {
                     let child = unsafe { guard.0.lookup_ptr(child_ptr) };
 
                     // fast path：若 parent 恰好在 clean_parent0，直接清空。
-                    if child
-                        .ptrs
-                        .clean_parent0
-                        .get()
-                        .is_some_and(|link| link.key.ptr == ptr)
-                    {
-                        child.ptrs.clean_parent0.set(None);
+                    if child.ptrs.clean_parent0.get().points_to(parent_idx) {
+                        child.ptrs.clean_parent0.set(ParentLink::NONE);
                     }
                     // fast path：若 parent 恰好在 clean_parent1，直接清空。
-                    if child
-                        .ptrs
-                        .clean_parent1
-                        .get()
-                        .is_some_and(|link| link.key.ptr == ptr)
-                    {
-                        child.ptrs.clean_parent1.set(None);
+                    if child.ptrs.clean_parent1.get().points_to(parent_idx) {
+                        child.ptrs.clean_parent1.set(ParentLink::NONE);
                     }
 
-                    // slow path：在 clean_parents Vec 中移除所有等于 ptr 的条目（允许重复）。
+                    // slow path：在 clean_parents Vec 中移除所有等于 idx 的条目（允许重复）。
                     let Ok(mut child_parents) = child.ptrs.clean_parents.try_borrow_mut() else {
                         // 兜底：预检已通过，这里不应失败；若失败，视为并发借用冲突，延后回收。
                         graph.inc_gc_skipped();
                         return false;
                     };
                     if !child_parents.is_empty() {
-                        child_parents.retain(|link| link.key.ptr != ptr);
+                        child_parents.retain(|link| link.node_idx != parent_idx);
                     }
 
                     child
@@ -603,8 +696,8 @@ mod node_store {
                 children.clear();
 
                 // 清空 parent 的父列表（被依赖者列表）。
-                guard.ptrs.clean_parent0.set(None);
-                guard.ptrs.clean_parent1.set(None);
+                guard.ptrs.clean_parent0.set(ParentLink::NONE);
+                guard.ptrs.clean_parent1.set(ParentLink::NONE);
                 self_parents.clear();
             }
 
@@ -649,14 +742,17 @@ mod node_store {
             guard.pending_recalc.set(false);
             guard.anchor_locked.set(false);
 
+            // P2-M1: free list 头插, u32 idx 形态 (译码经 NodeStore 侧表)。
+            let guard_idx = raw_guard.idx();
             let free_head = &graph.free_head;
-            if let Some(old_free) = free_head.get() {
-                let old_guard = unsafe { old_free.lookup_unchecked() };
-                old_guard.ptrs.free_prev.set(Some(ptr));
+            let old_head = free_head.get();
+            if old_head != NIL_IDX {
+                let old_guard = unsafe { raw_guard.lookup_idx_unchecked(old_head) };
+                old_guard.ptrs.free_prev.set(guard_idx);
             }
-            guard.ptrs.free_next.set(free_head.get());
-            guard.ptrs.free_prev.set(None);
-            free_head.set(Some(ptr));
+            guard.ptrs.free_next.set(old_head);
+            guard.ptrs.free_prev.set(NIL_IDX);
+            free_head.set(guard_idx);
 
             graph
                 .active_nodes
@@ -781,11 +877,14 @@ pub struct Graph2 {
     /// - 入队顺序已内含因果序(mark_dirty0 先 queue(child) 再递归 queue(parent);
     ///   request 分支一先 queue(C) 再挂 P), FIFO 即近似拓扑序;
     /// - 原型 v2/v3 打转的公因子是桶结构(min_height 扫描被高度打乱), 纯 FIFO 公平队列收敛可论证。
-    recalc_head: Cell<Option<NodePtr>>,
-    recalc_tail: Cell<Option<NodePtr>>,
+    recalc_head: Cell<u32>,
+    recalc_tail: Cell<u32>,
 
     /// pointer to head of linked list of free nodes
-    free_head: Box<Cell<Option<NodePtr>>>,
+    ///
+    /// P2-M1: 同节点链字段改 u32 idx 形态 (NIL_IDX = None), 译码统一走
+    /// NodeStore 的 idx→key 侧表。
+    free_head: Box<Cell<u32>>,
 
     /// S2-03 刀A: AnchorDebugInfo 侧表 (slot_token → info)。
     ///
@@ -825,7 +924,8 @@ impl Drop for EpochGuard {
 
 #[derive(Clone, Copy)]
 pub struct Graph2Guard<'gg> {
-    _nodes: AgGuard<'gg>,
+    /// P2-M1: 由下划线改名 — 32bit 链接译码需要直接持 NodeStoreGuard (idx→guard)。
+    nodes: AgGuard<'gg>,
     graph: &'gg Graph2,
 }
 
@@ -839,7 +939,9 @@ pub struct Node {
     /// parent 依赖 epoch：
     /// - 用于"逻辑失效"旧 parent link，而不是每次 dirty 都物理清空容器；
     /// - 当前 epoch 的 link 视为 active，旧 epoch 自动视为 stale。
-    pub parent_epoch: Cell<u64>,
+    /// - P2-M1: u64→u32 — 与 ParentLink.epoch 同型直接比较 (无截断歧义); 单节点
+    ///   bump 2^32 次 (每次伴随一轮 mark_dirty→重算) 在任何会话不可能, 回绕安全。
+    pub parent_epoch: Cell<u32>,
 
     /// tracks the generation when this Node last polled as Updated or Unchanged
     pub(super) last_ready: Cell<Option<Generation>>,
@@ -936,38 +1038,95 @@ impl NodeKey {
     }
 }
 
+/// P2-M1: ParentLink 压缩形态 (原 {key: NodeKey, epoch: u64, read_gen} 40B → 24B)。
+///
+/// - node_idx: parent 槽 idx (NodeStore 内恒定), `NIL_IDX` (=u32::MAX) 为空槽哨兵 —
+///   自管理 niche, 避免 Option 外壳 +8B tag;
+/// - slot_gen: parent 槽的复用代数 (per-slot u32 计数, 槽每被 free list 复用一次 +1)。
+///   取代原内联 NodeKey.token (全局 u64, 32bit 形态放不下) 的防悬垂职责: token 压缩
+///   低 32 位有全局计数回绕误判面, per-slot 计数只需论证"单槽 2^32 次复用不可能",
+///   远比全局论证安全;
+/// - epoch: 与 Node.parent_epoch (同步缩窄为 u32) 同型直接比较, 无截断歧义。
+///   单节点 bump 2^32 次 (每次伴随一轮 mark_dirty→重算) 在任何会话不可能发生,
+///   回绕窗口论证同 slot_gen;
+/// - read_gen: **保留 64bit** — 值域是全局 generation 计数器 (stabilize 每调用 +1,
+///   60fps GUI 连续运行约 2.3 年回绕, 高频事件流 50 天级), 压 32 位会在长跑会话产生
+///   "低 32 位碰撞 → 误判 Unchanged → 永久 stale 不自愈"的正确性风险 (P2-M1 决策: 不压)。
+///
+/// 语义保持: read_gen 的边级版本记忆语义与旧形态完全一致, 见下方原注释。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParentLink {
-    key: NodeKey,
-    epoch: u64,
+    node_idx: u32,
+    slot_gen: u32,
+    epoch: u32,
     /// 方案 A(M1)边级版本记忆: parent 在本边上"已消费"的 child 版本(None=未读过)。
     ///
     /// 语义与 Salsa 的 per-query read revision 同构:
-    /// - 新建边/parent 槽位被新实体复用(token 变化)时, 初始化为 parent.last_ready
+    /// - 新建边/parent 槽位被新实体复用(slot_gen 变化)时, 初始化为 parent.last_ready
     ///   (对齐现状节点级判定语义, 避免首读保守差异);
-    /// - 同一 parent 实体(token 不变, epoch 复活)时保留旧值 — P 曾读过 C 的某代值,
+    /// - 同一 parent 实体(slot_gen 不变, epoch 复活)时保留旧值 — P 曾读过 C 的某代值,
     ///   drain 后重 poll 若 C 未再变, 判 Unchanged 省一次重算(比现状更精确,
     ///   行为差异由 M1 验收: 全测试 + graph.json 等价覆盖);
     /// - request 判定为 Updated 时经 set_parent_link_read_gen 写回 C 当前 last_update。
     read_gen: Option<Generation>,
 }
 
+impl ParentLink {
+    /// 空槽常量 (node_idx 哨兵) — 取代旧 `Cell<Option<ParentLink>>` 的 None。
+    const NONE: ParentLink = ParentLink {
+        node_idx: NIL_IDX,
+        slot_gen: 0,
+        epoch: 0,
+        read_gen: None,
+    };
+
+    #[inline]
+    fn is_some(&self) -> bool {
+        self.node_idx != NIL_IDX
+    }
+
+    #[inline]
+    fn is_none(&self) -> bool {
+        self.node_idx == NIL_IDX
+    }
+
+    /// 是否指向给定槽 — 空槽哨兵天然不等于任何真实 idx, NIL 槽比较自然为 false
+    /// (等价旧 `Option::is_some_and(|link| link.key.ptr == ptr)`)。
+    #[inline]
+    fn points_to(&self, idx: u32) -> bool {
+        self.node_idx == idx
+    }
+
+    /// epoch 活性过滤 (parents_len 统计用) — 空槽哨兵 epoch=0 而 parent_epoch 恒 ≥ 1
+    /// (insert 初始 1, bump 遇 0 跳 1), is_some 守卫只是双保险。
+    #[inline]
+    fn epoch_is(&self, epoch: u32) -> bool {
+        self.is_some() && self.epoch == epoch
+    }
+}
+
 pub struct NodePtrs {
     /// 依赖者（parent）列表：
     /// - 优先用两个 inline 槽位承载最常见的 <=2 个 parent，避免频繁 Vec 分配/扩容；
     /// - 当 parent > 2 时，再落到 `clean_parents` Vec（无序，可能重复，但 add_clean_parent 会去重）。
-    clean_parent0: Cell<Option<ParentLink>>,
-    clean_parent1: Cell<Option<ParentLink>>,
+    ///
+    /// P2-M1: 槽位存压缩 ParentLink (24B, node_idx=NIL_IDX 为空), 较旧
+    /// Cell<Option<ParentLink>> (48B) 每槽省 24B。
+    clean_parent0: Cell<ParentLink>,
+    clean_parent1: Cell<ParentLink>,
     clean_parents: RefCell<Vec<ParentLink>>,
 
     graph: *const Graph2,
 
     /// Next node in recalc linked list for this height.
     /// If this is the last node, None.
-    next: Cell<Option<NodePtr>>,
+    ///
+    /// P2-M1: u32 idx 形态 (NIL_IDX = None) — 同 Graph2 内链接, 节点自持 graph 指针,
+    /// 槽不物理删除 → idx 即唯一槽定位, 较旧 Cell<Option<NodePtr>> (16B) 省 12B。
+    next: Cell<u32>,
     /// Prev node in recalc linked list for this height.
     /// If this is the head node, None.
-    prev: Cell<Option<NodePtr>>,
+    prev: Cell<u32>,
     /// 该节点当前所在的 recalc bucket（按高度分桶）。
     ///
     /// 设计动机（性能 + 正确性）：
@@ -982,14 +1141,21 @@ pub struct NodePtrs {
     /// - 若链表指针/状态不一致，再兜底扫描所有 bucket（极少数路径）。
     recalc_state: Cell<RecalcState>,
 
+    /// 本槽的复用代数 (P2-M1): 槽每被 free list 复用一次 +1, 供 ParentLink.slot_gen
+    /// 做"同槽不同实体"的防悬垂校验 (取代旧 ParentLink 内联 token 的职责)。
+    /// 恒定不回绕论证: 单槽 2^32 次复用在任何会话不可能发生。
+    slot_gen: Cell<u32>,
+
     /// Next node in free list (仅用于 anchors_slotmap)。
     ///
     /// 重要：free list 与 recalc queue 必须使用**不同**的指针字段。
     /// 否则当"已回收节点"意外残留在 recalc 队列里时，recalc_pop_next 会误把 free list 的 next 当成 queue next，
     /// 直接污染 free_head 链表，最终导致"活节点被复用 -> stale token -> invalid_token request"。
-    free_next: Cell<Option<NodePtr>>,
+    ///
+    /// P2-M1: 同 next/prev 的 u32 idx 形态; 只改宽度不改分立性 (union 历史事故否决)。
+    free_next: Cell<u32>,
     /// Prev node in free list (仅用于 anchors_slotmap)。
-    free_prev: Cell<Option<NodePtr>>,
+    free_prev: Cell<u32>,
 
     /// sorted in pointer order
     necessary_children: RefCell<Vec<NodePtr>>,
@@ -1063,6 +1229,12 @@ impl<'a> NodeGuard<'a> {
         self.0.make_ptr()
     }
 
+    /// P2-M1: 本节点槽 idx — 32bit 链接/ParentLink 的写入形态 (跨 crate 消费者用)。
+    #[inline]
+    pub fn idx(&self) -> u32 {
+        self.0.idx()
+    }
+
     pub fn key(self) -> NodeKey {
         NodeKey {
             ptr: self.make_ptr(),
@@ -1071,12 +1243,12 @@ impl<'a> NodeGuard<'a> {
     }
 
     #[inline]
-    fn current_parent_epoch(&self) -> u64 {
+    fn current_parent_epoch(&self) -> u32 {
         self.parent_epoch.get()
     }
 
     #[inline]
-    fn bump_parent_epoch(&self) -> u64 {
+    fn bump_parent_epoch(&self) -> u32 {
         let current = self.current_parent_epoch();
         let mut next = current.wrapping_add(1);
         if next == 0 {
@@ -1087,13 +1259,13 @@ impl<'a> NodeGuard<'a> {
     }
 
     #[inline]
-    fn is_reusable_parent_link(&self, link: ParentLink, current_epoch: u64) -> bool {
+    fn is_reusable_parent_link(&self, link: ParentLink, current_epoch: u32) -> bool {
         ////////////////////////////////////////////////////////////////////////////////
         // epoch 失效策略：
         // - link.epoch != current_epoch: 说明是上一轮 dirty 之前的旧依赖，可直接复用槽位；
-        // - live 校验失败：说明 parent 已失活（token 代际变化/anchor 为空），也可复用。
+        // - live 校验失败：说明 parent 已失活（槽复用代数变化/anchor 为空），也可复用。
         ////////////////////////////////////////////////////////////////////////////////
-        link.epoch != current_epoch || self.live_parent_from_key(link.key).is_none()
+        link.epoch != current_epoch || self.live_parent_from_link(link).is_none()
     }
 
     /// 建立或刷新"child <- parent"依赖边, 返回该边当前的 read_gen(方案 A M1 边级版本记忆)。
@@ -1115,12 +1287,15 @@ impl<'a> NodeGuard<'a> {
                 self.current_parent_epoch(),
             );
         }
-        let parent_key = parent.key();
+        // P2-M1: 压缩形态取 {node_idx, slot_gen} 取代完整 NodeKey 内联。
+        let parent_idx = parent.0.idx();
+        let parent_slot_gen = parent.ptrs.slot_gen.get();
         let current_epoch = self.current_parent_epoch();
         // 新建/复用槽位时的初始版本: 对齐现状"节点级 last_ready"判定语义。
         let initial_read_gen = parent.last_ready.get();
         let new_link = ParentLink {
-            key: parent_key,
+            node_idx: parent_idx,
+            slot_gen: parent_slot_gen,
             epoch: current_epoch,
             read_gen: initial_read_gen,
         };
@@ -1128,62 +1303,57 @@ impl<'a> NodeGuard<'a> {
         // 架构调整：parent link 不再通过"drain 物理删除"失效，而是通过 epoch 逻辑失效。
         //
         // 规则：
-        // - 同 ptr 命中：只刷新 token/epoch，不做容器改动；
+        // - 同槽命中：只刷新 slot_gen/epoch，不做容器改动；
         // - 槽位可复用（旧 epoch 或失活）时直接覆盖；
         // - Vec 慢路径也优先复用 stale 槽位，避免 churn 下无限膨胀。
         ////////////////////////////////////////////////////////////////////////////////
-        if let Some(mut p0) = self.ptrs.clean_parent0.get() {
-            if p0.key.ptr == parent_key.ptr {
-                if p0.key.token != parent_key.token {
+        let mut p0 = self.ptrs.clean_parent0.get();
+        if p0.is_some() {
+            if p0.node_idx == parent_idx {
+                if p0.slot_gen != parent_slot_gen {
                     // 槽位被新的 parent 实体复用: 版本记忆按新实体初始化。
                     p0.read_gen = initial_read_gen;
-                    p0.key = parent_key;
+                    p0.slot_gen = parent_slot_gen;
                     p0.epoch = current_epoch;
-                    self.ptrs.clean_parent0.set(Some(p0));
+                    self.ptrs.clean_parent0.set(p0);
                 } else if p0.epoch != current_epoch {
                     // 同实体 epoch 复活: 保留旧版本记忆, 只刷新 epoch。
                     p0.epoch = current_epoch;
-                    self.ptrs.clean_parent0.set(Some(p0));
+                    self.ptrs.clean_parent0.set(p0);
                 }
                 return p0.read_gen;
             }
         }
-        if let Some(mut p1) = self.ptrs.clean_parent1.get() {
-            if p1.key.ptr == parent_key.ptr {
-                if p1.key.token != parent_key.token {
+        let mut p1 = self.ptrs.clean_parent1.get();
+        if p1.is_some() {
+            if p1.node_idx == parent_idx {
+                if p1.slot_gen != parent_slot_gen {
                     p1.read_gen = initial_read_gen;
-                    p1.key = parent_key;
+                    p1.slot_gen = parent_slot_gen;
                     p1.epoch = current_epoch;
-                    self.ptrs.clean_parent1.set(Some(p1));
+                    self.ptrs.clean_parent1.set(p1);
                 } else if p1.epoch != current_epoch {
                     p1.epoch = current_epoch;
-                    self.ptrs.clean_parent1.set(Some(p1));
+                    self.ptrs.clean_parent1.set(p1);
                 }
                 return p1.read_gen;
             }
         }
 
         let slot0 = self.ptrs.clean_parent0.get();
-        if slot0.is_none()
-            || slot0.is_some_and(|link| self.is_reusable_parent_link(link, current_epoch))
-        {
-            self.ptrs.clean_parent0.set(Some(new_link));
+        if slot0.is_none() || self.is_reusable_parent_link(slot0, current_epoch) {
+            self.ptrs.clean_parent0.set(new_link);
             return new_link.read_gen;
         }
         let slot1 = self.ptrs.clean_parent1.get();
-        if slot1.is_none()
-            || slot1.is_some_and(|link| self.is_reusable_parent_link(link, current_epoch))
-        {
-            self.ptrs.clean_parent1.set(Some(new_link));
+        if slot1.is_none() || self.is_reusable_parent_link(slot1, current_epoch) {
+            self.ptrs.clean_parent1.set(new_link);
             return new_link.read_gen;
         }
         // 慢路径：>2 个 parent 才会走 Vec，且尽量复用 stale 槽位。
         let mut parents = self.ptrs.clean_parents.borrow_mut();
-        if let Some(existing) = parents
-            .iter_mut()
-            .find(|link| link.key.ptr == parent_key.ptr)
-        {
-            if existing.key.token != parent_key.token {
+        if let Some(existing) = parents.iter_mut().find(|link| link.node_idx == parent_idx) {
+            if existing.slot_gen != parent_slot_gen {
                 *existing = new_link;
             } else if existing.epoch != current_epoch {
                 existing.epoch = current_epoch;
@@ -1203,25 +1373,27 @@ impl<'a> NodeGuard<'a> {
 
     /// 更新"child <- parent"边的版本记忆(request 判定为 Updated 时写回)。
     ///
-    /// 找不到边(token 失配/已逻辑失效)时静默跳过 — 下次 add_clean_parent 会按新实体重建。
-    pub fn set_parent_link_read_gen(self, parent_ptr: NodePtr, read_gen: Option<Generation>) {
-        let mut apply = |link: &mut ParentLink| {
-            if link.key.ptr == parent_ptr {
+    /// 找不到边(槽复用代数失配/已逻辑失效)时静默跳过 — 下次 add_clean_parent 会按新实体重建。
+    pub fn set_parent_link_read_gen(self, parent_idx: u32, read_gen: Option<Generation>) {
+        let apply = |link: &mut ParentLink| {
+            if link.node_idx == parent_idx {
                 link.read_gen = read_gen;
                 true
             } else {
                 false
             }
         };
-        if let Some(mut p0) = self.ptrs.clean_parent0.get() {
+        let mut p0 = self.ptrs.clean_parent0.get();
+        if p0.is_some() {
             if apply(&mut p0) {
-                self.ptrs.clean_parent0.set(Some(p0));
+                self.ptrs.clean_parent0.set(p0);
                 return;
             }
         }
-        if let Some(mut p1) = self.ptrs.clean_parent1.get() {
+        let mut p1 = self.ptrs.clean_parent1.get();
+        if p1.is_some() {
             if apply(&mut p1) {
-                self.ptrs.clean_parent1.set(Some(p1));
+                self.ptrs.clean_parent1.set(p1);
                 return;
             }
         }
@@ -1233,7 +1405,7 @@ impl<'a> NodeGuard<'a> {
         }
     }
 
-    pub fn remove_clean_parent_ptr(&self, parent_ptr: NodePtr) {
+    pub fn remove_clean_parent_ptr(&self, parent_idx: u32) {
         ////////////////////////////////////////////////////////////////////////////////
         // 解除 child -> parent 的依赖者指针。
         //
@@ -1250,15 +1422,15 @@ impl<'a> NodeGuard<'a> {
         let mut slot0 = self.ptrs.clean_parent0.get();
         let mut slot1 = self.ptrs.clean_parent1.get();
 
-        if slot0.is_some_and(|link| link.key.ptr == parent_ptr) {
-            slot0 = None;
+        if slot0.points_to(parent_idx) {
+            slot0 = ParentLink::NONE;
         }
-        if slot1.is_some_and(|link| link.key.ptr == parent_ptr) {
-            slot1 = None;
+        if slot1.points_to(parent_idx) {
+            slot1 = ParentLink::NONE;
         }
         if slot0.is_none() {
             slot0 = slot1;
-            slot1 = None;
+            slot1 = ParentLink::NONE;
         }
 
         self.ptrs.clean_parent0.set(slot0);
@@ -1266,20 +1438,20 @@ impl<'a> NodeGuard<'a> {
 
         let mut parents = self.ptrs.clean_parents.borrow_mut();
         if !parents.is_empty() {
-            parents.retain(|link| link.key.ptr != parent_ptr);
+            parents.retain(|link| link.node_idx != parent_idx);
         }
     }
 
     #[inline]
-    fn live_parent_from_key(&self, parent_key: NodeKey) -> Option<NodeGuard<'a>> {
+    fn live_parent_from_link(&self, link: ParentLink) -> Option<NodeGuard<'a>> {
         ////////////////////////////////////////////////////////////////////////////////
-        // 关键：clean_parents 存的是 NodeKey（包含 token），必须校验 token 才能避免：
+        // 关键：压缩 ParentLink 存 {node_idx, slot_gen}，必须校验 slot_gen 才能：
         // - 节点 free 后进入 free list
-        // - 槽位被复用后 slot_token 增长
-        // - child 仍持有旧 parent 指针，导致 dirty 误投递到新节点
+        // - 槽位被复用后 slot_gen 增长
+        // - child 仍持有旧 parent link，导致 dirty 误投递到新节点
         ////////////////////////////////////////////////////////////////////////////////
-        let parent = NodeGuard(unsafe { parent_key.ptr.lookup_unchecked() });
-        if parent.slot_token.get() != parent_key.token {
+        let parent = NodeGuard(unsafe { self.0.lookup_idx_unchecked(link.node_idx) });
+        if parent.ptrs.slot_gen.get() != link.slot_gen {
             return None;
         }
         // anchor 已置空的节点不应再参与 dirty 传播/重算入队。
@@ -1292,16 +1464,18 @@ impl<'a> NodeGuard<'a> {
     pub fn clean_parents(&self) -> Vec<NodeGuard<'a>> {
         let current_epoch = self.current_parent_epoch();
         let mut out = Vec::new();
-        if let Some(p0) = self.ptrs.clean_parent0.get() {
+        let p0 = self.ptrs.clean_parent0.get();
+        if p0.is_some() {
             if p0.epoch == current_epoch
-                && let Some(parent) = self.live_parent_from_key(p0.key)
+                && let Some(parent) = self.live_parent_from_link(p0)
             {
                 out.push(parent);
             }
         }
-        if let Some(p1) = self.ptrs.clean_parent1.get() {
+        let p1 = self.ptrs.clean_parent1.get();
+        if p1.is_some() {
             if p1.epoch == current_epoch
-                && let Some(parent) = self.live_parent_from_key(p1.key)
+                && let Some(parent) = self.live_parent_from_link(p1)
             {
                 out.push(parent);
             }
@@ -1311,7 +1485,7 @@ impl<'a> NodeGuard<'a> {
             if link.epoch != current_epoch {
                 return None;
             }
-            self.live_parent_from_key(link.key)
+            self.live_parent_from_link(*link)
         }));
         if debug_parent_flow_enabled() {
             println!(
@@ -1326,16 +1500,18 @@ impl<'a> NodeGuard<'a> {
     /// 遍历父节点，不分配临时 Vec，在线性链路上更轻量。
     pub fn for_each_parent(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         let current_epoch = self.current_parent_epoch();
-        if let Some(p0) = self.ptrs.clean_parent0.get() {
+        let p0 = self.ptrs.clean_parent0.get();
+        if p0.is_some() {
             if p0.epoch == current_epoch
-                && let Some(parent) = self.live_parent_from_key(p0.key)
+                && let Some(parent) = self.live_parent_from_link(p0)
             {
                 f(parent);
             }
         }
-        if let Some(p1) = self.ptrs.clean_parent1.get() {
+        let p1 = self.ptrs.clean_parent1.get();
+        if p1.is_some() {
             if p1.epoch == current_epoch
-                && let Some(parent) = self.live_parent_from_key(p1.key)
+                && let Some(parent) = self.live_parent_from_link(p1)
             {
                 f(parent);
             }
@@ -1344,33 +1520,54 @@ impl<'a> NodeGuard<'a> {
             if link.epoch != current_epoch {
                 continue;
             }
-            if let Some(parent) = self.live_parent_from_key(link.key) {
+            if let Some(parent) = self.live_parent_from_link(link) {
                 f(parent);
             }
         }
     }
 
-    /// 遍历"当前 epoch 下"的父节点 key（不做活性校验）。
+    /// 遍历"当前 epoch 下"的父节点 key（不做 anchor 活性校验, 但做槽代数校验）。
     ///
     /// 适用场景：
     /// - `set_min_height` 这类"稍后会在处理阶段再次做 token/anchor 校验"的路径；
     /// - 这样可以避免在遍历阶段就做一次 `lookup_unchecked + token/anchor` 检查，
     ///   进而减少重复校验造成的常数开销。
+    ///
+    /// P2-M1 语义修正: 压缩 link 不再内联 token, key 的 token 在此现取。为避免
+    /// "槽复用后旧边产出现实体的新鲜 key"(原快照 token 会自然失配形成 stale 兜底),
+    /// 现取前先做 slot_gen 校验 — 失配边跳过, 语义比旧快照兜底更强(不会误报活边)。
     pub fn for_each_parent_key(&self, mut f: impl FnMut(NodeKey)) {
         let current_epoch = self.current_parent_epoch();
-        if let Some(p0) = self.ptrs.clean_parent0.get() {
-            if p0.epoch == current_epoch {
-                f(p0.key);
+        // P2-M1: 惰性重建完整 NodeKey — link 只存 idx, 现取时校验槽代数防复用误报。
+        let make_key = |link: ParentLink| -> Option<NodeKey> {
+            let guard = unsafe { self.0.lookup_idx_unchecked(link.node_idx) };
+            if guard.ptrs.slot_gen.get() != link.slot_gen {
+                return None;
             }
+            Some(NodeKey {
+                ptr: guard.make_ptr(),
+                token: guard.slot_token.get(),
+            })
+        };
+        let p0 = self.ptrs.clean_parent0.get();
+        if p0.is_some()
+            && p0.epoch == current_epoch
+            && let Some(key) = make_key(p0)
+        {
+            f(key);
         }
-        if let Some(p1) = self.ptrs.clean_parent1.get() {
-            if p1.epoch == current_epoch {
-                f(p1.key);
-            }
+        let p1 = self.ptrs.clean_parent1.get();
+        if p1.is_some()
+            && p1.epoch == current_epoch
+            && let Some(key) = make_key(p1)
+        {
+            f(key);
         }
         for link in self.ptrs.clean_parents.borrow().iter().copied() {
-            if link.epoch == current_epoch {
-                f(link.key);
+            if link.epoch == current_epoch
+                && let Some(key) = make_key(link)
+            {
+                f(key);
             }
         }
     }
@@ -1378,16 +1575,18 @@ impl<'a> NodeGuard<'a> {
     /// 取出并"逻辑失效"当前父节点列表，供 mark_dirty 等热路径复用。
     pub fn drain_parents(&self, mut f: impl FnMut(NodeGuard<'a>)) {
         let draining_epoch = self.bump_parent_epoch();
-        if let Some(p0) = self.ptrs.clean_parent0.get() {
+        let p0 = self.ptrs.clean_parent0.get();
+        if p0.is_some() {
             if p0.epoch == draining_epoch
-                && let Some(parent) = self.live_parent_from_key(p0.key)
+                && let Some(parent) = self.live_parent_from_link(p0)
             {
                 f(parent);
             }
         }
-        if let Some(p1) = self.ptrs.clean_parent1.get() {
+        let p1 = self.ptrs.clean_parent1.get();
+        if p1.is_some() {
             if p1.epoch == draining_epoch
-                && let Some(parent) = self.live_parent_from_key(p1.key)
+                && let Some(parent) = self.live_parent_from_link(p1)
             {
                 f(parent);
             }
@@ -1396,7 +1595,7 @@ impl<'a> NodeGuard<'a> {
             if link.epoch != draining_epoch {
                 continue;
             }
-            if let Some(parent) = self.live_parent_from_key(link.key) {
+            if let Some(parent) = self.live_parent_from_link(link) {
                 f(parent);
             }
         }
@@ -1413,18 +1612,8 @@ impl<'a> NodeGuard<'a> {
             .filter(|link| link.epoch == current_epoch)
             .count();
         extra
-            + usize::from(
-                self.ptrs
-                    .clean_parent0
-                    .get()
-                    .is_some_and(|link| link.epoch == current_epoch),
-            )
-            + usize::from(
-                self.ptrs
-                    .clean_parent1
-                    .get()
-                    .is_some_and(|link| link.epoch == current_epoch),
-            )
+            + usize::from(self.ptrs.clean_parent0.get().epoch_is(current_epoch))
+            + usize::from(self.ptrs.clean_parent1.get().epoch_is(current_epoch))
     }
 
     pub fn drain_clean_parents(&self) -> Vec<NodeGuard<'a>> {
@@ -1459,7 +1648,7 @@ impl<'a> NodeGuard<'a> {
                 .set(child.necessary_count.get().saturating_sub(1));
 
             // 同步解绑 child -> parent，避免产生"只删了一半边"的悬挂 parent 指针。
-            child.remove_clean_parent_ptr(self.make_ptr());
+            child.remove_clean_parent_ptr(self.0.idx());
         }
     }
 
@@ -1472,7 +1661,7 @@ impl<'a> NodeGuard<'a> {
     }
 
     pub fn drain_necessary_children(&self) -> Vec<NodeGuard<'a>> {
-        let parent_ptr = self.make_ptr();
+        let parent_idx = self.0.idx();
         let mut children = self.ptrs.necessary_children.borrow_mut();
         for child in children.iter() {
             let child_node = unsafe { self.0.lookup_ptr(*child) };
@@ -1483,25 +1672,15 @@ impl<'a> NodeGuard<'a> {
                 .set(child_node.necessary_count.get().saturating_sub(1));
 
             // 关键：解绑 child -> parent，避免 free list 复用槽位后误 dirty。
-            if child_node
-                .ptrs
-                .clean_parent0
-                .get()
-                .is_some_and(|link| link.key.ptr == parent_ptr)
-            {
-                child_node.ptrs.clean_parent0.set(None);
+            if child_node.ptrs.clean_parent0.get().points_to(parent_idx) {
+                child_node.ptrs.clean_parent0.set(ParentLink::NONE);
             }
-            if child_node
-                .ptrs
-                .clean_parent1
-                .get()
-                .is_some_and(|link| link.key.ptr == parent_ptr)
-            {
-                child_node.ptrs.clean_parent1.set(None);
+            if child_node.ptrs.clean_parent1.get().points_to(parent_idx) {
+                child_node.ptrs.clean_parent1.set(ParentLink::NONE);
             }
             let mut child_parents = child_node.ptrs.clean_parents.borrow_mut();
             if !child_parents.is_empty() {
-                child_parents.retain(|link| link.key.ptr != parent_ptr);
+                child_parents.retain(|link| link.node_idx != parent_idx);
             }
         }
         let collected = children
@@ -1559,7 +1738,7 @@ impl<'gg> Graph2Guard<'gg> {
 
     #[inline]
     pub fn has_recalc_pending(&self) -> bool {
-        self.graph.recalc_head.get().is_some()
+        self.graph.recalc_head.get() != NIL_IDX
     }
 
     #[inline]
@@ -1594,20 +1773,22 @@ impl<'gg> Graph2Guard<'gg> {
 
     /// 从 FIFO 队头弹出下一个待重算节点(方案 A M2a: 单链表版, 无高度桶)。
     pub fn recalc_pop_next(&self) -> Option<NodeGuard<'gg>> {
-        while let Some(head_ptr) = self.graph.recalc_head.get() {
-            let node = NodeGuard(unsafe { head_ptr.lookup_unchecked() });
+        while self.graph.recalc_head.get() != NIL_IDX {
+            let head_idx = self.graph.recalc_head.get();
+            let node = NodeGuard(unsafe { self.nodes.lookup_idx_unchecked(head_idx) });
             // 队头后移并维护双向链表指针。
-            self.graph.recalc_head.set(node.ptrs.next.get());
-            match node.ptrs.next.get() {
-                Some(next_ptr) => {
-                    unsafe { next_ptr.lookup_unchecked() }.ptrs.prev.set(None);
-                }
-                None => {
-                    self.graph.recalc_tail.set(None);
-                }
+            let next_idx = node.ptrs.next.get();
+            self.graph.recalc_head.set(next_idx);
+            if next_idx != NIL_IDX {
+                unsafe { self.nodes.lookup_idx_unchecked(next_idx) }
+                    .ptrs
+                    .prev
+                    .set(NIL_IDX);
+            } else {
+                self.graph.recalc_tail.set(NIL_IDX);
             }
-            node.ptrs.prev.set(None);
-            node.ptrs.next.set(None);
+            node.ptrs.prev.set(NIL_IDX);
+            node.ptrs.next.set(NIL_IDX);
             node.ptrs.recalc_state.set(RecalcState::Ready);
             // ┌─────────────────────────────────────────────────────────────┐
             // │ 队列可能残留"已回收节点"（anchor 已置空、handle_count 归零）。│
@@ -1655,12 +1836,12 @@ impl<'gg> Graph2Guard<'gg> {
         let mut cur = self.graph.recalc_head.get();
         // 防御上限: 链表若异常成环, 本函数不能跟着死循环。
         let mut steps = 0usize;
-        while let Some(ptr) = cur {
+        while cur != NIL_IDX {
             steps += 1;
             if steps > 10_000 {
                 break;
             }
-            let node = NodeGuard(unsafe { ptr.lookup_unchecked() });
+            let node = NodeGuard(unsafe { self.nodes.lookup_idx_unchecked(cur) });
             if out.len() < limit && unsafe { (*node.anchor.get()).is_some() } {
                 out.push(format!(
                     "token={} state={:?} dependents={} debug={}",
@@ -1759,20 +1940,20 @@ impl<'gg> Graph2Guard<'gg> {
         }
         node.ptrs.recalc_state.set(RecalcState::Pending);
         // FIFO 尾插: prev 指向旧尾, 旧尾(若有)的 next 指向本节点。
-        node.ptrs.prev.set(self.graph.recalc_tail.get());
-        node.ptrs.next.set(None);
-        match self.graph.recalc_tail.get() {
-            Some(tail_ptr) => {
-                unsafe { tail_ptr.lookup_unchecked() }
-                    .ptrs
-                    .next
-                    .set(Some(node.make_ptr()));
-            }
-            None => {
-                self.graph.recalc_head.set(Some(node.make_ptr()));
-            }
+        // P2-M1: u32 idx 链接形态 (NIL_IDX = None), 译码经 NodeStore 侧表。
+        let node_idx = node.0.idx();
+        let old_tail = self.graph.recalc_tail.get();
+        node.ptrs.prev.set(old_tail);
+        node.ptrs.next.set(NIL_IDX);
+        if old_tail != NIL_IDX {
+            unsafe { node.0.lookup_idx_unchecked(old_tail) }
+                .ptrs
+                .next
+                .set(node_idx);
+        } else {
+            self.graph.recalc_head.set(node_idx);
         }
-        self.graph.recalc_tail.set(Some(node.make_ptr()));
+        self.graph.recalc_tail.set(node_idx);
     }
 
     /// 强制入队：无视 Pending/locked 状态，先摘旧队列再入队（主要用于解锁后补偿重算）。
@@ -2023,20 +2204,17 @@ impl Graph2 {
             free_attempts: Cell::new(0),
             free_succeeded: Cell::new(0),
             last_deleted_token: Cell::new(None),
-            recalc_head: Cell::new(None),
-            recalc_tail: Cell::new(None),
+            recalc_head: Cell::new(NIL_IDX),
+            recalc_tail: Cell::new(NIL_IDX),
             still_alive: Rc::new(Cell::new(true)),
-            free_head: Box::new(Cell::new(None)),
+            free_head: Box::new(Cell::new(NIL_IDX)),
             debug_info_sidecar: RefCell::new(HashMap::new()),
         }
     }
 
     pub fn with<F: for<'any> FnOnce(Graph2Guard<'any>) -> R, R>(&self, func: F) -> R {
         let nodes = unsafe { self.nodes.with_unchecked() };
-        func(Graph2Guard {
-            _nodes: nodes,
-            graph: self,
-        })
+        func(Graph2Guard { nodes, graph: self })
     }
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -2139,19 +2317,28 @@ impl Graph2 {
     {
         let anchor = self.alloc_anchor_ptr(inner);
         self.nodes.with(|nodes| {
-            let guard = if let Some(free_head) = self.free_head.get() {
-                let guard = NodeGuard(unsafe { free_head.lookup_unchecked() });
+            let guard = if self.free_head.get() != NIL_IDX {
+                let free_head_idx = self.free_head.get();
+                let guard = NodeGuard(unsafe { nodes.lookup_idx_unchecked(free_head_idx) });
                 // 从 free list 取出一个空槽位。
                 //
                 // anchors_slotmap 下：free list 使用专用指针字段（free_next/free_prev），
                 // 避免和 recalc 队列（next/prev）互相污染导致"活节点被误复用"。
+                // P2-M1: u32 idx 链接形态。
                 {
-                    self.free_head.set(guard.ptrs.free_next.get());
-                    if let Some(next_ptr) = guard.ptrs.free_next.get() {
-                        let next_node = unsafe { nodes.lookup_ptr(next_ptr) };
-                        next_node.ptrs.free_prev.set(None);
+                    let next_idx = guard.ptrs.free_next.get();
+                    self.free_head.set(next_idx);
+                    if next_idx != NIL_IDX {
+                        let next_node = unsafe { nodes.lookup_idx_unchecked(next_idx) };
+                        next_node.ptrs.free_prev.set(NIL_IDX);
                     }
                 }
+                // P2-M1: 槽复用代数 +1 — 所有旧 ParentLink 的 slot_gen 校验从此失配,
+                // 取代旧"slot_token 增长"的内联防悬垂职责 (token 本体仍递增, 对外 API 不变)。
+                guard
+                    .ptrs
+                    .slot_gen
+                    .set(guard.ptrs.slot_gen.get().wrapping_add(1));
                 guard.observed.set(false);
                     guard.necessary_count.set(0);
                 ////////////////////////////////////////////////////////////////////////////////
@@ -2199,8 +2386,8 @@ impl Graph2 {
                         guard.slot_token.set(self.next_slot_token());
                     }
                 }
-                guard.ptrs.clean_parent0.set(None);
-                guard.ptrs.clean_parent1.set(None);
+                guard.ptrs.clean_parent0.set(ParentLink::NONE);
+                guard.ptrs.clean_parent1.set(ParentLink::NONE);
                 ////////////////////////////////////////////////////////////////////////////////
                 // 复用 Vec 容量,降低动态 churn 下的分配/回收风暴
                 //
@@ -2220,8 +2407,8 @@ impl Graph2 {
                 }
                 guard.parent_epoch.set(1);
                 guard.ptrs.recalc_state.set(RecalcState::Needed);
-                guard.ptrs.free_next.set(None);
-                guard.ptrs.free_prev.set(None);
+                guard.ptrs.free_next.set(NIL_IDX);
+                guard.ptrs.free_prev.set(NIL_IDX);
                 {
                     const MAX_KEEP_CAPACITY: usize = 256;
                     let mut children = guard.ptrs.necessary_children.borrow_mut();
@@ -2233,8 +2420,8 @@ impl Graph2 {
                 // 历史证伪注记(SLACK/方案G/方案H/方案R 对高度传播的系统性排除)
                 // 已迁移至 specs/anchors_plan_a_denumericalized_scheduling.md §1.2, 勿再尝试。
                 guard.ptrs.handle_count.set(1);
-                guard.ptrs.prev.set(None);
-                guard.ptrs.next.set(None);
+                guard.ptrs.prev.set(NIL_IDX);
+                guard.ptrs.next.set(NIL_IDX);
                 guard.last_ready.set(None);
                 guard.last_update.set(None);
                 guard.recalc_retry.set(0);
@@ -2264,15 +2451,17 @@ impl Graph2 {
                     slot_token: Cell::new(self.next_slot_token()),
                     parent_epoch: Cell::new(1),
                     ptrs: NodePtrs {
-                        clean_parent0: Cell::new(None),
-                        clean_parent1: Cell::new(None),
+                        clean_parent0: Cell::new(ParentLink::NONE),
+                        clean_parent1: Cell::new(ParentLink::NONE),
                         clean_parents: RefCell::new(vec![]),
                         graph: self,
-                        next: Cell::new(None),
-                        prev: Cell::new(None),
+                        // P2-M1: u32 idx 链接初始态 (NIL_IDX = None); slot_gen 从 0 起。
+                        next: Cell::new(NIL_IDX),
+                        prev: Cell::new(NIL_IDX),
                         recalc_state: Cell::new(RecalcState::Needed),
-                        free_next: Cell::new(None),
-                        free_prev: Cell::new(None),
+                        slot_gen: Cell::new(0),
+                        free_next: Cell::new(NIL_IDX),
+                        free_prev: Cell::new(NIL_IDX),
                         necessary_children: RefCell::new(vec![]),
                         handle_count: Cell::new(1),
                     },
@@ -2334,8 +2523,8 @@ fn dequeue_calc(graph: &Graph2, node: NodeGuard<'_>) {
         );
     }
     node.ptrs.recalc_state.set(RecalcState::Ready);
-    node.ptrs.prev.set(None);
-    node.ptrs.next.set(None);
+    node.ptrs.prev.set(NIL_IDX);
+    node.ptrs.next.set(NIL_IDX);
 }
 
 fn dequeue_calc_by_ptr(graph: &Graph2, target_ptr: NodePtr) -> bool {
@@ -2347,50 +2536,52 @@ fn dequeue_calc_by_ptr(graph: &Graph2, target_ptr: NodePtr) -> bool {
     //   在极端重入/借用冲突修复路径里，可能出现 state 与链表指针短暂不一致。
     // - 因此先做"是否可能在队列里"的快速判定(有 prev/next 链接或 state=Pending),
     //   再做头/前/后三向一致性校验, 全部通过才摘除 — 与原多桶版同风格。
+    // - P2-M1: 指针比较改槽 idx 比较 (同一 store 内 idx 即唯一槽身份), 译码走侧表。
     // ─────────────────────────────────────────────────────────────
     let target = unsafe { target_ptr.lookup_unchecked() };
-    let has_link = target.ptrs.prev.get().is_some() || target.ptrs.next.get().is_some();
+    let target_idx = target_ptr.idx();
+    let has_link = target.ptrs.prev.get() != NIL_IDX || target.ptrs.next.get() != NIL_IDX;
     if !has_link && target.ptrs.recalc_state.get() != RecalcState::Pending {
         return false;
     }
 
-    let prev_ptr = target.ptrs.prev.get();
-    let next_ptr = target.ptrs.next.get();
+    let prev_idx = target.ptrs.prev.get();
+    let next_idx = target.ptrs.next.get();
 
-    let head_matches = prev_ptr.is_some() || graph.recalc_head.get() == Some(target_ptr);
-    let prev_matches = prev_ptr.is_none()
-        || unsafe { prev_ptr.unwrap().lookup_unchecked() }
+    let head_matches = prev_idx != NIL_IDX || graph.recalc_head.get() == target_idx;
+    let prev_matches = prev_idx == NIL_IDX
+        || unsafe { target.lookup_idx_unchecked(prev_idx) }
             .ptrs
             .next
             .get()
-            == Some(target_ptr);
-    let next_matches = next_ptr.is_none()
-        || unsafe { next_ptr.unwrap().lookup_unchecked() }
+            == target_idx;
+    let next_matches = next_idx == NIL_IDX
+        || unsafe { target.lookup_idx_unchecked(next_idx) }
             .ptrs
             .prev
             .get()
-            == Some(target_ptr);
+            == target_idx;
 
     if head_matches && prev_matches && next_matches {
-        if let Some(prev_ptr) = prev_ptr {
-            unsafe { prev_ptr.lookup_unchecked() }
+        if prev_idx != NIL_IDX {
+            unsafe { target.lookup_idx_unchecked(prev_idx) }
                 .ptrs
                 .next
-                .set(next_ptr);
+                .set(next_idx);
         } else {
-            graph.recalc_head.set(next_ptr);
+            graph.recalc_head.set(next_idx);
         }
-        if let Some(next_ptr) = next_ptr {
-            unsafe { next_ptr.lookup_unchecked() }
+        if next_idx != NIL_IDX {
+            unsafe { target.lookup_idx_unchecked(next_idx) }
                 .ptrs
                 .prev
-                .set(prev_ptr);
+                .set(prev_idx);
         } else {
-            graph.recalc_tail.set(prev_ptr);
+            graph.recalc_tail.set(prev_idx);
         }
 
-        target.ptrs.prev.set(None);
-        target.ptrs.next.set(None);
+        target.ptrs.prev.set(NIL_IDX);
+        target.ptrs.next.set(NIL_IDX);
         target.ptrs.recalc_state.set(RecalcState::Ready);
         return true;
     }
@@ -2452,21 +2643,79 @@ mod test {
     use super::*;
 
     #[test]
-    /// S2-03 回归防线: Node 布局尺寸预算。
+    /// Node 布局尺寸预算回归防线 (S2-03 立项, P2-M1 更新)。
     ///
-    /// - 实测轨迹: 基线 368B → 刀A(debug_info 侧表化) 328B → 刀B(pending_dirty
-    ///   惰性 Box) 312B;
+    /// - 实测轨迹: 基线 368B → S2-03 刀A/B 312B → **P2-M1 链接 32bit 化 224B**
+    ///   (四链 Cell<Option<NodePtr>>→Cell<u32> 省 48B + clean_parent0/1 压缩
+    ///   ParentLink 省 48B + parent_epoch u32 化, 含 padding 重排);
     /// - 已评估关闭的刀: 位域合并(Rust repr 自动打包 1B 字段, 收益 0) /
     ///   free-recalc 链 union(历史 free_head 污染事故注释反对) /
-    ///   clean_parents+necessary_children 惰性化(热路径代价比, 归 S2-06 arena);
+    ///   clean_parents+necessary_children 惰性化(热路径代价比, 归 M2 SoA arena);
+    /// - read_gen 压 32 位已评估否决 (全局 generation 回绕 → 永久 stale, 见
+    ///   ParentLink 注释);
     /// - 上限值 = 当前实测值, 有意扩字段时同步上调并在提交里记录理由。
     fn node_size_within_budget() {
         let size = std::mem::size_of::<Node>();
         eprintln!("size_of::<Node>() = {size}");
         assert!(
-            size <= 312,
-            "Node 尺寸超预算: {size}B (S2-03 后实测 312B, 若有意扩字段请同步上调并记录)"
+            size <= 224,
+            "Node 尺寸超预算: {size}B (P2-M1 后实测 224B, 若有意扩字段请同步上调并记录)"
         );
+    }
+
+    #[test]
+    /// P2-M1: idx/version 编解码 round-trip — 锁死对 slotmap 1.1.1 位布局的依赖。
+    ///
+    /// 译码基建 (idx_to_key) 假设 "idx 在 as_ffi 低 32 位, version 在高 32 位且恒奇数
+    /// (from_ffi 的 `|1` 幂等)"。若未来升级 slotmap 改变位布局, 本测试第一时间爆红
+    /// 拦截, 避免侧表译码静默产出错误 key。
+    fn p2m1_idx_version_roundtrip() {
+        use slotmap::Key as _;
+        let store = ag::NodeStore::<u8>::new();
+        store.with(|ns| {
+            let mut prev_bits = 0u64;
+            for i in 0..64u8 {
+                let guard = ns.insert(i);
+                // NodeGuard.key 是 pub(super), 本测试位于 graph2 模块树内可直接取。
+                let key = guard.key;
+                let bits = key.data().as_ffi();
+                // idx 应位于低 32 位且单调递增 (本仓无物理删除, 分配序连续)。
+                assert_eq!(u64::from(ag::idx_of_key(key)), bits & 0xffff_ffff);
+                assert!(bits > prev_bits);
+                prev_bits = bits;
+                // round-trip: 侧表存的 version 高 32 位 + idx 应能还原出等值 key。
+                let decoded = ns.idx_to_key(ag::idx_of_key(key));
+                assert_eq!(decoded, key);
+                // SAFETY: idx 来自刚 insert 的 key, store 借用由 with 闭包持有。
+                assert_eq!(unsafe { ns.lookup_ptr_idx(ag::idx_of_key(key)) }, &i);
+                // 哨兵不与任何真实 idx 冲突: 分配序连续且远小于 u32::MAX
+                // (slotmap 自身 null 约定同为 u32::MAX, 真实槽永不占用)。
+                assert!(ag::idx_of_key(key) < u32::MAX);
+            }
+        });
+    }
+
+    /// P2-M1: ParentLink 空槽哨兵语义 (等价旧 Option::None 的消费链)。
+    #[test]
+    fn p2m1_parent_link_none_sentinel() {
+        let none = ParentLink::NONE;
+        assert!(none.is_none());
+        assert!(!none.is_some());
+        // NIL 哨兵不等于任何真实槽 idx, points_to 恒 false (旧 is_some_and 语义)。
+        assert!(!none.points_to(0));
+        assert!(!none.points_to(42));
+        assert!(!none.epoch_is(0));
+        let some = ParentLink {
+            node_idx: 42,
+            slot_gen: 3,
+            epoch: 7,
+            read_gen: None,
+        };
+        assert!(some.is_some());
+        assert!(some.points_to(42));
+        assert!(!some.points_to(41));
+        assert!(some.epoch_is(7));
+        assert!(!some.epoch_is(6));
     }
 
     fn to_vec<I: IntoIterator>(iter: I) -> Vec<I::Item> {
