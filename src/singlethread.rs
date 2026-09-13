@@ -1167,6 +1167,7 @@ impl Engine {
             }
             Poll::Pending => handle_waiting(Poll::Pending),
             Poll::Updated => {
+                WAITING_STATS.poll_updated_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENTS") {
                     let parents = node.clean_parents();
                     println!(
@@ -1182,6 +1183,7 @@ impl Engine {
                 true
             }
             Poll::Updated => {
+                WAITING_STATS.poll_updated_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if emg_debug_env::bool_lenient("ANCHORS_DEBUG_PARENTS") {
                     let parents = node.clean_parents();
                     println!(
@@ -1197,6 +1199,7 @@ impl Engine {
                 true
             }
             Poll::Unchanged => {
+                WAITING_STATS.poll_unchanged_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // 方案 A M2b: 值未变也必须放行挂起在本节点上的 Waiting 依赖者
                 // (它们等的是"完成"而非"值变"; 不发 dirty, 依赖者 re-poll 时用
                 // read_gen 判定自然得出 Unchanged)。
@@ -1602,6 +1605,11 @@ pub struct WaitingStatsSnapshot {
     pub recalc_pops: u64,
     /// 9 槽直方图: index 0..7 = 收敛于 1..8 轮, index 8 = 8 轮超限。
     pub stabilize_rounds: [u64; 9],
+    pub poll_updated_n: u64,
+    pub poll_unchanged_n: u64,
+    pub req_updated: u64,
+    pub req_unchanged: u64,
+    pub req_not_ready: u64,
 }
 
 struct WaitingStats {
@@ -1611,6 +1619,16 @@ struct WaitingStats {
     wake_by_child_ready: std::sync::atomic::AtomicU64,
     recalc_pops: std::sync::atomic::AtomicU64,
     stabilize_rounds: [std::sync::atomic::AtomicU64; 9],
+    // S2 调查(2026-09-12)沉淀: poll 结果与 request 判定分布。
+// - poll_updated_n/poll_unchanged_n: 区分"真产出"与"必要值计算后未变"(SAC 本质成本);
+// - req_*: request_node 判定分布(not_ready 高 = park 往返活动面)。
+// 用途: 调度侧任何改动的行为面观测(n400 参考值见 docs/perf 与
+// .scratch/engine-optimization/research/s209-s2-evaluation-set-investigation.md)。
+    poll_updated_n: std::sync::atomic::AtomicU64,
+    poll_unchanged_n: std::sync::atomic::AtomicU64,
+    req_updated: std::sync::atomic::AtomicU64,
+    req_unchanged: std::sync::atomic::AtomicU64,
+    req_not_ready: std::sync::atomic::AtomicU64,
 }
 static WAITING_STATS: WaitingStats = WaitingStats {
     pending_branch: std::sync::atomic::AtomicU64::new(0),
@@ -1619,6 +1637,11 @@ static WAITING_STATS: WaitingStats = WaitingStats {
     wake_by_child_ready: std::sync::atomic::AtomicU64::new(0),
     recalc_pops: std::sync::atomic::AtomicU64::new(0),
     stabilize_rounds: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
+    poll_updated_n: std::sync::atomic::AtomicU64::new(0),
+    poll_unchanged_n: std::sync::atomic::AtomicU64::new(0),
+    req_updated: std::sync::atomic::AtomicU64::new(0),
+    req_unchanged: std::sync::atomic::AtomicU64::new(0),
+    req_not_ready: std::sync::atomic::AtomicU64::new(0),
 };
 
 #[inline]
@@ -1688,6 +1711,11 @@ pub fn waiting_stats_snapshot() -> WaitingStatsSnapshot {
         wake_by_child_ready: WAITING_STATS.wake_by_child_ready.load(Relaxed),
         recalc_pops: WAITING_STATS.recalc_pops.load(Relaxed),
         stabilize_rounds,
+        poll_updated_n: WAITING_STATS.poll_updated_n.load(Relaxed),
+        poll_unchanged_n: WAITING_STATS.poll_unchanged_n.load(Relaxed),
+        req_updated: WAITING_STATS.req_updated.load(Relaxed),
+        req_unchanged: WAITING_STATS.req_unchanged.load(Relaxed),
+        req_not_ready: WAITING_STATS.req_not_ready.load(Relaxed),
     }
 }
 
@@ -2083,6 +2111,7 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
         let self_is_necessary = Engine::check_observed_raw(self.node) != ObservedState::Unnecessary;
 
         if graph2::recalc_state(child) != RecalcState::Ready {
+            WAITING_STATS.req_not_ready.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             child.add_clean_parent(self.node);
             self.pending_on_anchor_get = true;
             self.graph.queue_recalc(child);
@@ -2118,13 +2147,17 @@ impl<'eng, 'gg> EngineContextMut<'eng, 'gg> {
             match (child.last_update.get(), read_gen) {
                 (Some(a), Some(v)) if a > v => {
                     // 消费了新版本: 写回边级记忆, 下次同值比较可判 Unchanged。
+                    WAITING_STATS.req_updated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     child.set_parent_link_read_gen(self.node.idx(), Some(a));
                     Poll::Updated
                 }
                 // 同轮刚更新特判: 保留旧 fast path `a == b == generation => Updated` 语义
                 // (C 在本轮 stabilize 内刚 Updated, poll 应看到新值)。
                 (Some(a), Some(v)) if a == v && v == self.engine.generation => Poll::Updated,
-                (Some(_), Some(_)) => Poll::Unchanged,
+                (Some(_), Some(_)) => {
+                    WAITING_STATS.req_unchanged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Poll::Unchanged
+                }
                 // 边无版本记忆(P 从未完成过, read_gen=None)且 C 已有时间戳: 首读,
                 // 必须写回版本 — 否则本边每次 request 都判 Updated, 会让 P 反复用
                 // C 的透传型 output(如 cutoff/map)重算缓存(实证: test_cutoff_simple_observed
