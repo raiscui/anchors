@@ -828,6 +828,73 @@ mod tests {
         singlethread::{Engine, Var},
     };
 
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // [plugs VOA 原型验证 PoC] 骨架刀二期成败点(2026-09-15, 支线 __plugs_voa):
+    //
+    // 验证 emg::Node plugs VOA 化的两个核心问题:
+    // - Q1 节点账本: Val-born 不 watch 不 set / 只 set(T5 纯数据面) 是否恒 0 节点;
+    //   watch 才 ensure_mounted(+1)。
+    // - Q2 升级语义: set-before-watch 的值累积, 首次 watch 构造代理即读最新值;
+    //   set-after-watch 走 mark_dirty, 既有消费者重算跟上。
+    // ═══════════════════════════════════════════════════════════════════════
+    #[test]
+    fn plugs_voa_poc_node_ledger_and_upgrade_semantics() {
+        let mut engine = Engine::new();
+        let base = engine.metrics_snapshot().active_nodes;
+
+        // ── Q1a: Val-born 只 set(T5 纯数据面) — 零节点 ──
+        let set_only: Vec<VarVOA<Vec<u32>, Engine>> =
+            (0..50).map(|i| VarVOA::new(vec![i])).collect();
+        for (i, v) in set_only.iter().enumerate() {
+            v.set(vec![i as u32, 99]); // 未 mount: 值累积在 inner.val, 不物化
+        }
+        let after_set = engine.metrics_snapshot().active_nodes;
+        assert_eq!(
+            base, after_set,
+            "Q1a: 未 watch 的 VOA set 走纯数据面, 应零新节点(50 个 set-only VOA)"
+        );
+
+        // ── Q1b: set 之后的读(get)同样零节点(数据面读) ──
+        for (i, v) in set_only.iter().enumerate() {
+            // get() 返回 Rc<ValOrAnchor<T>> — Val 分支即数据面真值
+            // (Node plugs 的 contains fast path 同款读法)。
+            let ValOrAnchor::Val(val) = &*v.get() else {
+                panic!("未 mount 的 VOA 数据面读应为 Val 分支");
+            };
+            assert_eq!(val[0], i as u32, "数据面读应见最新累积值");
+            assert_eq!(val[1], 99);
+        }
+        assert_eq!(
+            engine.metrics_snapshot().active_nodes, base,
+            "Q1b: get 不物化"
+        );
+
+        // ── Q1c: watch 才物化(每 VOA +1 代理节点) ──
+        let watched: Vec<_> = set_only.iter().take(20).map(|v| v.watch()).collect();
+        let after_watch = engine.metrics_snapshot().active_nodes;
+        assert_eq!(
+            after_watch - base, 20,
+            "Q1c: watch 的 ensure_mounted 每 VOA 恰 +1 节点(其余 30 个仍 0)"
+        );
+        drop(watched);
+
+        // ── Q2a: set-before-watch 的值累积 → 首次消费读到最新值 ──
+        let late = VarVOA::new(vec![1u32]);
+        late.set(vec![7]); // 未 watch 先写(数据面)
+        let consumer = late.watch().map(|v: &Vec<u32>| v[0] * 10);
+        assert_eq!(
+            engine.get(&consumer), 70,
+            "Q2a: watch 时 ensure_mounted 用最新累积值构造, 消费者首评即正确"
+        );
+
+        // ── Q2b: set-after-watch 的 mark_dirty → 既有消费者重算 ──
+        late.set(vec![8]);
+        assert_eq!(
+            engine.get(&consumer), 80,
+            "Q2b: 已 mount 后 set 走 mark_dirty, 消费者跟上新值"
+        );
+    }
     #[test]
     // 惰性 mount 的引擎归属语义变化: Val-born 延迟 mount 后, anchor 归属引擎 =
     // 首次 set/watch 时的当前引擎(原为构造时引擎)。
